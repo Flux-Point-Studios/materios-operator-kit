@@ -47,8 +47,6 @@ Send the FPS team:
 The FPS team will:
 1. Add your address to the on-chain attestation committee
 2. Fund your account with MATRA (needed to submit transactions)
-3. Provision an API key for you on the blob gateway
-4. Send you back your **API key**
 
 ### Step 4: Configure the daemon
 
@@ -56,11 +54,11 @@ Edit `docker-compose.yml` and fill in the required fields:
 
 ```yaml
 SIGNER_URI: "your twenty four word mnemonic phrase goes here ..."
-BLOB_GATEWAY_API_KEY: "your_api_key_from_fps_team"        # optional for heartbeat-only operation
-LOCATOR_REGISTRY_API_KEY: "your_api_key_from_fps_team"    # same key
+BLOB_GATEWAY_API_KEY: ""        # optional — higher rate limits if set, not required
+LOCATOR_REGISTRY_API_KEY: ""    # optional — reads are public, not required
 ```
 
-> **Note**: The API key is optional for heartbeat-only operation — the sr25519 signature proves your identity. If your daemon also verifies/uploads blobs, you still need the API key for blob gateway access.
+> **Note**: API keys are optional. Your sr25519 signature authenticates heartbeats and blob uploads. API keys provide higher rate limits but are not required for any operation.
 
 ### Step 5: Start the daemon
 
@@ -130,7 +128,7 @@ Your Machine                          FPS Infrastructure
 ## Security Model
 
 - Your **mnemonic never leaves your machine**. The daemon signs transactions and heartbeats locally.
-- **API keys** are optional for heartbeats and used for rate-limiting blob uploads. Your on-chain identity comes from your sr25519 key. Heartbeats are authenticated purely by sr25519 signature — no API key needed.
+- **API keys** are optional for all operations. Your on-chain identity comes from your sr25519 key. Heartbeats and blob uploads are authenticated by sr25519 signature. API keys provide higher rate limits when provisioned.
 - **Heartbeat signatures** are publicly verifiable. Anyone can confirm your daemon is alive by checking the signature against your on-chain public key. FPS cannot forge heartbeats for you.
 - **Attestation transactions** are on-chain. Anyone can verify committee activity independently.
 
@@ -181,7 +179,7 @@ Or run it persistently by adding a second service to your `docker-compose.yml`:
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `docker compose pull` fails with 401 | GHCR image not accessible | Make sure you can reach `ghcr.io`. If using a firewall, allow outbound HTTPS to `ghcr.io` |
-| Heartbeat not appearing on explorer | API key incorrect or not provisioned | Verify with FPS team that your key is active |
+| Heartbeat not appearing on explorer | sr25519 key not registered on-chain | Verify with FPS team that your SS58 address is in the committee |
 | `substrate_connected: false` in status | Can't reach RPC endpoint | Check that `wss://materios.fluxpointstudios.com/rpc` is reachable from your network |
 | High finality gap (>10) | Chain-wide issue, not your daemon | Check the explorer dashboard — if all validators show high gap, it's a chain stall |
 | `No locator found` in logs | Blob not yet uploaded for a receipt | Normal during brief windows — daemon retries automatically |

@@ -14,8 +14,8 @@ services:
     environment:
       ## ─── REQUIRED: fill these in ───────────────────────────────────
       SIGNER_URI: ""                  # Your 24-word BIP39 mnemonic
-      BLOB_GATEWAY_API_KEY: ""        # Optional for heartbeats (sig is auth). Required for blob uploads.
-      LOCATOR_REGISTRY_API_KEY: ""    # Same as BLOB_GATEWAY_API_KEY
+      BLOB_GATEWAY_API_KEY: ""        # Optional — sig-based auth works without it. Higher rate limits if set.
+      LOCATOR_REGISTRY_API_KEY: ""    # Optional — locator and chunk reads are now public.
 
       ## ─── Public endpoints (do not change) ──────────────────────────
       MATERIOS_RPC_URL: "wss://materios.fluxpointstudios.com/rpc"
