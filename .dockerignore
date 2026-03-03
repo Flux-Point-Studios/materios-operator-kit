@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.dockerignore
+README.md
+docker-compose.yml
+generate_key.py

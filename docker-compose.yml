@@ -1,0 +1,51 @@
+## Materios Cert Daemon — External Operator
+##
+## See README.md for full setup instructions.
+##
+## Quick start:
+##   1. Fill in SIGNER_URI and BLOB_GATEWAY_API_KEY below
+##   2. docker compose up -d
+##   3. Verify at https://materios.fluxpointstudios.com/explorer/#/committee
+
+services:
+  cert-daemon:
+    image: ghcr.io/flux-point-studios/materios-operator-kit:latest
+    restart: unless-stopped
+    environment:
+      ## ─── REQUIRED: fill these in ───────────────────────────────────
+      SIGNER_URI: ""                  # Your 24-word BIP39 mnemonic
+      BLOB_GATEWAY_API_KEY: ""        # API key from FPS team
+      LOCATOR_REGISTRY_API_KEY: ""    # Same value as BLOB_GATEWAY_API_KEY
+
+      ## ─── Public endpoints (do not change) ──────────────────────────
+      MATERIOS_RPC_URL: "wss://materios.fluxpointstudios.com/rpc"
+      BLOB_GATEWAY_URL: "https://materios.fluxpointstudios.com/blobs"
+      LOCATOR_REGISTRY_URL: "https://materios.fluxpointstudios.com/blobs"
+      HEARTBEAT_URL: "https://materios.fluxpointstudios.com/blobs"
+      HEARTBEAT_INTERVAL: "30"
+
+      ## ─── External daemons do NOT checkpoint to Cardano L1 ──────────
+      CHECKPOINT_ENABLED: "false"
+
+      ## ─── Standard config (defaults are fine) ───────────────────────
+      CHAIN_ID: "8f6e531be80341a12a0ae1b04484770fcaa797bb49dcc1cc9e79788f770a41b3"
+      POLL_INTERVAL: "12"
+      POLL_INTERVAL_FAST: "3"
+      POLL_INTERVAL_IDLE: "12"
+      DATA_DIR: "/data"
+      BLOB_LOCAL_DIR: "/data/materios-blobs"
+      CERT_STORE_DIR: "/data/certs"
+      STATE_FILE: "/data/daemon-state.json"
+      HEALTH_PORT: "8080"
+      MAX_BLOB_FETCH_RETRIES: "3"
+      BLOB_FETCH_TIMEOUT: "30"
+      FINALITY_CONFIRMATIONS: "4"
+      MAX_LEAF_WAIT_SECONDS: "90"
+
+    volumes:
+      - cert-daemon-data:/data
+    ports:
+      - "8080:8080"   # Local health/status endpoint
+
+volumes:
+  cert-daemon-data:
