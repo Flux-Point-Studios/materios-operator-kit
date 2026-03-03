@@ -113,9 +113,10 @@ class HeartbeatSender:
             url = f"{self.config.heartbeat_url}/heartbeats"
             headers = {
                 "Content-Type": "application/json",
-                "x-api-key": self.config.blob_gateway_api_key,
                 "x-heartbeat-sig": sig_hex,
             }
+            if self.config.blob_gateway_api_key:
+                headers["x-api-key"] = self.config.blob_gateway_api_key
 
             resp = requests.post(url, json=payload, headers=headers, timeout=5)
 

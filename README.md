@@ -52,13 +52,15 @@ The FPS team will:
 
 ### Step 4: Configure the daemon
 
-Edit `docker-compose.yml` and fill in the two required fields:
+Edit `docker-compose.yml` and fill in the required fields:
 
 ```yaml
 SIGNER_URI: "your twenty four word mnemonic phrase goes here ..."
-BLOB_GATEWAY_API_KEY: "your_api_key_from_fps_team"
-LOCATOR_REGISTRY_API_KEY: "your_api_key_from_fps_team"   # same key
+BLOB_GATEWAY_API_KEY: "your_api_key_from_fps_team"        # optional for heartbeat-only operation
+LOCATOR_REGISTRY_API_KEY: "your_api_key_from_fps_team"    # same key
 ```
+
+> **Note**: The API key is optional for heartbeat-only operation — the sr25519 signature proves your identity. If your daemon also verifies/uploads blobs, you still need the API key for blob gateway access.
 
 ### Step 5: Start the daemon
 
@@ -128,7 +130,7 @@ Your Machine                          FPS Infrastructure
 ## Security Model
 
 - Your **mnemonic never leaves your machine**. The daemon signs transactions and heartbeats locally.
-- **API keys** are for rate-limiting only — they don't authenticate your identity. Your on-chain identity comes from your sr25519 key.
+- **API keys** are optional for heartbeats and used for rate-limiting blob uploads. Your on-chain identity comes from your sr25519 key. Heartbeats are authenticated purely by sr25519 signature — no API key needed.
 - **Heartbeat signatures** are publicly verifiable. Anyone can confirm your daemon is alive by checking the signature against your on-chain public key. FPS cannot forge heartbeats for you.
 - **Attestation transactions** are on-chain. Anyone can verify committee activity independently.
 
