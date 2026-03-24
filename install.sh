@@ -20,11 +20,11 @@ set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
 OPERATOR_DIR="$HOME/materios-operator"
-NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:latest"
+NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v105"
 DAEMON_IMAGE="ghcr.io/flux-point-studios/materios-operator-kit:latest"
 GATEWAY_URL="https://materios.fluxpointstudios.com/blobs"
 EXPLORER_URL="https://materios.fluxpointstudios.com/explorer/#/committee"
-BOOTNODE="/ip4/54.151.99.31/tcp/30333/p2p/12D3KooWBK1KSWp7G7nE9zFzH5pm5pLUzMC5ew5R4pDSNuWRCTBq"
+BOOTNODE="/ip4/5.78.94.109/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp"
 MIN_DISK_MB=51200   # 50 GB
 MIN_RAM_MB=1800     # ~2 GB
 
@@ -240,7 +240,7 @@ services:
     restart: unless-stopped
     command:
       - "--chain"
-      - "staging"
+      - "local"
       - "--base-path"
       - "/data/materios"
       - "--rpc-port"
@@ -285,7 +285,7 @@ services:
       HEARTBEAT_URL: "${GATEWAY_URL}"
       HEARTBEAT_INTERVAL: "30"
       CHECKPOINT_ENABLED: "false"
-      CHAIN_ID: "8f6e531be80341a12a0ae1b04484770fcaa797bb49dcc1cc9e79788f770a41b3"
+      CHAIN_ID: "5663079a485b93fdc9e386b862b4cf8d25499427df6b8c5f018535acfd2e5020"
       POLL_INTERVAL: "12"
       POLL_INTERVAL_FAST: "3"
       POLL_INTERVAL_IDLE: "12"
