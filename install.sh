@@ -282,8 +282,7 @@ services:
     image: ${DAEMON_IMAGE}
     restart: unless-stopped
     depends_on:
-      materios-node:
-        condition: service_healthy
+      - materios-node
     environment:
       SIGNER_URI: "${MNEMONIC}"
       BLOB_GATEWAY_API_KEY: "${API_KEY}"
@@ -332,48 +331,66 @@ echo ""
 
 NODE_READY=false
 SYNC_ATTEMPTS=0
-MAX_SYNC_WAIT=180  # 15 minutes in 5-second intervals
+MAX_SYNC_WAIT=120  # 10 minutes in 5-second intervals
 HIGHEST=0
 CURRENT=0
+HAS_PEERS=false
 
 while [ "$SYNC_ATTEMPTS" -lt "$MAX_SYNC_WAIT" ]; do
   SYNC_ATTEMPTS=$((SYNC_ATTEMPTS + 1))
 
-  # Try to get sync state via RPC
-  SYNC_RESPONSE=$(curl -sS --max-time 5 -X POST http://localhost:9944 \
+  # First check if node RPC is up at all
+  HEALTH_RESPONSE=$(curl -sS --max-time 5 -X POST http://localhost:9944 \
     -H "Content-Type: application/json" \
-    -d '{"jsonrpc":"2.0","id":1,"method":"system_syncState","params":[]}' 2>/dev/null || echo "")
+    -d '{"jsonrpc":"2.0","id":1,"method":"system_health","params":[]}' 2>/dev/null || echo "")
 
-  if [ -n "$SYNC_RESPONSE" ]; then
-    CURRENT=$(echo "$SYNC_RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('result',{}).get('currentBlock',0))" 2>/dev/null || echo "0")
-    HIGHEST=$(echo "$SYNC_RESPONSE" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('result',{}).get('highestBlock',0))" 2>/dev/null || echo "0")
+  if [ -n "$HEALTH_RESPONSE" ] && echo "$HEALTH_RESPONSE" | grep -q "peers"; then
+    PEERS=$(echo "$HEALTH_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('peers',0))" 2>/dev/null || echo "0")
+    SYNCING=$(echo "$HEALTH_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('result',{}).get('isSyncing',True))" 2>/dev/null || echo "True")
 
-    if [ "$HIGHEST" -gt 0 ] 2>/dev/null; then
-      GAP=$((HIGHEST - CURRENT))
-      if [ "$GAP" -le 5 ]; then
+    if [ "$HAS_PEERS" = false ] && [ "$PEERS" -gt 0 ] 2>/dev/null; then
+      HAS_PEERS=true
+      echo ""
+      ok "Connected to $PEERS peer(s)"
+    fi
+
+    # If we have peers and not syncing, we're done
+    if [ "$SYNCING" = "False" ] && [ "$PEERS" -gt 0 ] 2>/dev/null; then
+      # Double check with block number
+      BLOCK_RESPONSE=$(curl -sS --max-time 5 -X POST http://localhost:9944 \
+        -H "Content-Type: application/json" \
+        -d '{"jsonrpc":"2.0","id":1,"method":"chain_getHeader","params":[]}' 2>/dev/null || echo "")
+      BLOCK=$(echo "$BLOCK_RESPONSE" | python3 -c "import sys,json; h=json.load(sys.stdin).get('result',{}); print(int(h.get('number','0x0'),16))" 2>/dev/null || echo "0")
+      if [ "$BLOCK" -gt 0 ] 2>/dev/null; then
         echo ""
-        ok "Node synced! Block $CURRENT / $HIGHEST"
+        ok "Node synced! Block $BLOCK, $PEERS peer(s)"
         NODE_READY=true
         break
-      else
-        # Show progress every 30 seconds
-        if [ $((SYNC_ATTEMPTS % 6)) -eq 0 ]; then
-          echo -e "\r  Syncing: block $CURRENT / $HIGHEST (${GAP} blocks remaining)    "
-        fi
       fi
+    fi
+
+    # Show progress
+    if [ $((SYNC_ATTEMPTS % 6)) -eq 0 ]; then
+      if [ "$SYNCING" = "True" ]; then
+        echo -ne "\r  Syncing... peers=$PEERS    "
+      else
+        echo -ne "\r  Waiting for peers... ($PEERS connected)    "
+      fi
+    fi
+  else
+    if [ $((SYNC_ATTEMPTS % 6)) -eq 0 ]; then
+      printf "."
     fi
   fi
 
   sleep 5
-  if [ $((SYNC_ATTEMPTS % 6)) -eq 0 ] && [ "$HIGHEST" = "0" ] 2>/dev/null; then
-    printf "."
-  fi
 done
 
 echo ""
 if [ "$NODE_READY" != true ]; then
-  warn "Node is still syncing. Session keys will be generated once sync completes."
-  warn "Re-run this step later: cd $OPERATOR_DIR && bash generate-session-keys.sh"
+  warn "Node sync timed out. It may still be starting up."
+  warn "Check status:  docker logs materios-operator-materios-node-1 --tail 20"
+  warn "Generate keys: cd $OPERATOR_DIR && bash generate-session-keys.sh"
 fi
 
 # ── Step 10: Generate session keys via author_rotateKeys ─────────────────────
