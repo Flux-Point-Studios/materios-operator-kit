@@ -332,6 +332,8 @@ echo ""
 NODE_READY=false
 SYNC_ATTEMPTS=0
 MAX_SYNC_WAIT=180  # 15 minutes in 5-second intervals
+HIGHEST=0
+CURRENT=0
 
 while [ "$SYNC_ATTEMPTS" -lt "$MAX_SYNC_WAIT" ]; do
   SYNC_ATTEMPTS=$((SYNC_ATTEMPTS + 1))
