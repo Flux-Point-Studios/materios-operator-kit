@@ -20,7 +20,11 @@ set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
 OPERATOR_DIR="$HOME/materios-operator"
-NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v105"
+# Select image tag based on architecture
+case "$(uname -m)" in
+  arm64|aarch64) NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v105-arm64" ;;
+  *)             NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v105" ;;
+esac
 DAEMON_IMAGE="ghcr.io/flux-point-studios/materios-operator-kit:latest"
 GATEWAY_URL="https://materios.fluxpointstudios.com/blobs"
 EXPLORER_URL="https://materios.fluxpointstudios.com/explorer/#/committee"
