@@ -272,11 +272,11 @@ services:
       - "30333:30333"        # P2P — must be reachable from internet
       - "127.0.0.1:9944:9944"  # RPC — localhost only for security
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:9944/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf -X POST http://localhost:9944 -H 'Content-Type: application/json' -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"system_health\",\"params\":[]}' | grep -q peers || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 60s
+      retries: 10
+      start_period: 120s
 
   cert-daemon:
     image: ${DAEMON_IMAGE}
