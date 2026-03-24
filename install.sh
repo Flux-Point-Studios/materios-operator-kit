@@ -160,7 +160,9 @@ ok "Daemon image pulled"
 # ── Step 4: Generate keypair inside throwaway container ──────────────────────
 info "Generating sr25519 keypair..."
 
-KEYGEN_OUTPUT=$(docker run --rm "$DAEMON_IMAGE" python -c "
+KEYGEN_OUTPUT=$(docker run --rm python:3.12-slim sh -c "
+pip install -q substrate-interface mnemonic 2>/dev/null
+python3 -c \"
 from substrateinterface import Keypair
 from mnemonic import Mnemonic
 import json
@@ -174,6 +176,7 @@ print(json.dumps({
     'ss58': keypair.ss58_address,
     'public_key': '0x' + keypair.public_key.hex()
 }))
+\"
 ") || fail "Key generation failed. Check Docker."
 
 # Parse with python3 first, fall back to jq
