@@ -246,6 +246,7 @@ services:
   materios-node:
     image: ${NODE_IMAGE}
     restart: unless-stopped
+    user: "0:0"
     command:
       - "--chain"
       - "local"
