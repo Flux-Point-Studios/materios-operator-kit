@@ -92,11 +92,12 @@ fi
 # Docker daemon running
 docker info >/dev/null 2>&1 || fail "Docker daemon is not running. Start it with: sudo systemctl start docker"
 
-# Architecture — node image is amd64 only
+# Architecture — node image supports amd64 and arm64
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64|amd64) ok "Architecture: $ARCH" ;;
-  *) fail "Unsupported architecture: $ARCH. The Materios node image requires x86_64 (amd64)." ;;
+  arm64|aarch64) ok "Architecture: $ARCH (ARM64)" ;;
+  *) fail "Unsupported architecture: $ARCH. The Materios node image requires x86_64 or arm64." ;;
 esac
 
 # Disk space
