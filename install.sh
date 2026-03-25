@@ -161,6 +161,18 @@ else
   fail "Cannot reach Materios gateway at ${GATEWAY_URL}. Check your internet connection."
 fi
 
+# Fetch chain info (genesis, bootnodes) from gateway
+CHAIN_INFO=$(curl -sS --max-time 10 "${GATEWAY_URL}/chain-info" 2>/dev/null || echo "")
+if [ -n "$CHAIN_INFO" ] && echo "$CHAIN_INFO" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+  CHAIN_GENESIS=$(echo "$CHAIN_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin).get('genesis',''))" 2>/dev/null)
+  CHAIN_GENESIS_CLEAN=$(echo "$CHAIN_GENESIS" | sed 's/^0x//')
+  CHAIN_SPEC_VERSION=$(echo "$CHAIN_INFO" | python3 -c "import sys,json; print(json.load(sys.stdin).get('spec_version',0))" 2>/dev/null)
+  ok "Chain info: genesis=${CHAIN_GENESIS_CLEAN:0:16}... spec_version=${CHAIN_SPEC_VERSION}"
+else
+  warn "Could not fetch chain info from gateway. Using default genesis."
+  CHAIN_GENESIS_CLEAN="cd21697e39adaf1feed978c1ee15914ae7719b6a9aaed2e4b26cb78b1ebf3b64"
+fi
+
 # Port 30333 — warn if something is already bound (validators only)
 if [ "$MODE" = "validator" ]; then
   if ss -tlnp 2>/dev/null | grep -q ':30333 '; then
@@ -301,7 +313,7 @@ services:
       HEARTBEAT_URL: "${GATEWAY_URL}"
       HEARTBEAT_INTERVAL: "30"
       CHECKPOINT_ENABLED: "false"
-      CHAIN_ID: "5663079a485b93fdc9e386b862b4cf8d25499427df6b8c5f018535acfd2e5020"
+      CHAIN_ID: "${CHAIN_GENESIS_CLEAN}"
       POLL_INTERVAL: "12"
       POLL_INTERVAL_FAST: "3"
       POLL_INTERVAL_IDLE: "12"
@@ -382,7 +394,7 @@ services:
       HEARTBEAT_URL: "${GATEWAY_URL}"
       HEARTBEAT_INTERVAL: "30"
       CHECKPOINT_ENABLED: "false"
-      CHAIN_ID: "5663079a485b93fdc9e386b862b4cf8d25499427df6b8c5f018535acfd2e5020"
+      CHAIN_ID: "${CHAIN_GENESIS_CLEAN}"
       POLL_INTERVAL: "12"
       POLL_INTERVAL_FAST: "3"
       POLL_INTERVAL_IDLE: "12"
