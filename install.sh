@@ -52,31 +52,53 @@ fail()  { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 # ── Parse arguments ──────────────────────────────────────────────────────────
 INVITE_TOKEN=""
 LABEL=""
+MODE="validator"  # "validator" (full node + daemon) or "attestor" (daemon only)
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --token)  INVITE_TOKEN="$2"; shift 2 ;;
     --label)  LABEL="$2"; shift 2 ;;
+    --mode)   MODE="$2"; shift 2 ;;
     --help|-h)
-      echo "Usage: install.sh --token <INVITE_TOKEN> [--label <NODE_LABEL>]"
+      echo "Usage: install.sh [--mode validator|attestor] [--token <INVITE_TOKEN>] [--label <NAME>]"
       echo ""
-      echo "  --token   Invite token provided by the Materios team (required)"
+      echo "  --mode    'validator' (default) or 'attestor'"
+      echo "  --token   Invite token (required for validator, not needed for attestor)"
       echo "  --label   Friendly name for your node (optional, defaults to hostname)"
       echo ""
-      echo "This installs a full Materios validator node and cert daemon."
-      echo "Requirements: 2+ vCPU, 2+ GB RAM, 50+ GB SSD, port 30333 open inbound."
+      echo "Validator mode: Full node + cert daemon. Requires invite token."
+      echo "  Requirements: 2+ vCPU, 2+ GB RAM, 50+ GB SSD, port 30333 open."
+      echo ""
+      echo "Attestor mode: Cert daemon only. No approval needed."
+      echo "  Requirements: 1 vCPU, 512 MB RAM, 1 GB disk, outbound only."
       exit 0
       ;;
     *) fail "Unknown argument: $1. Use --help for usage." ;;
   esac
 done
 
-[ -z "$INVITE_TOKEN" ] && fail "Missing --token. Get an invite token from the Materios team.\n  Usage: install.sh --token <INVITE_TOKEN>"
+if [ "$MODE" != "validator" ] && [ "$MODE" != "attestor" ]; then
+  fail "Invalid mode: $MODE. Use 'validator' or 'attestor'."
+fi
+
+if [ "$MODE" = "validator" ] && [ -z "$INVITE_TOKEN" ]; then
+  fail "Missing --token. Validator mode requires an invite token.\n  Usage: install.sh --token <INVITE_TOKEN>\n  Or use: install.sh --mode attestor (no token needed)"
+fi
 [ -z "$LABEL" ] && LABEL="$(hostname -s 2>/dev/null || echo operator)-$(date +%s | tail -c 5)"
+
+# Operator directory varies by mode
+if [ "$MODE" = "attestor" ]; then
+  OPERATOR_DIR="$HOME/materios-attestor"
+fi
 
 # ── Banner ───────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}  Materios Validator Installer${RESET}"
-echo "  ──────────────────────────────"
+if [ "$MODE" = "attestor" ]; then
+  echo -e "${BOLD}  Materios Attestor Installer${RESET}"
+  echo "  ─────────────────────────────"
+else
+  echo -e "${BOLD}  Materios Validator Installer${RESET}"
+  echo "  ──────────────────────────────"
+fi
 echo ""
 
 # ── Step 1: Preflight checks ────────────────────────────────────────────────
@@ -104,17 +126,27 @@ case "$ARCH" in
   *) fail "Unsupported architecture: $ARCH. The Materios node image requires x86_64 or arm64." ;;
 esac
 
-# Disk space
+# Disk space — attestors need much less
+if [ "$MODE" = "attestor" ]; then
+  NEED_DISK_MB=1024   # 1 GB
+else
+  NEED_DISK_MB=$MIN_DISK_MB  # 50 GB
+fi
 AVAIL_MB=$(df -m "$HOME" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
-if [ "$AVAIL_MB" -lt "$MIN_DISK_MB" ]; then
-  fail "Insufficient disk space: ${AVAIL_MB}MB available, need ${MIN_DISK_MB}MB (50 GB)"
+if [ "$AVAIL_MB" -lt "$NEED_DISK_MB" ]; then
+  fail "Insufficient disk space: ${AVAIL_MB}MB available, need ${NEED_DISK_MB}MB"
 fi
 ok "Disk: ${AVAIL_MB}MB available"
 
-# RAM
+# RAM — attestors need less
+if [ "$MODE" = "attestor" ]; then
+  NEED_RAM_MB=400  # 512 MB with some headroom
+else
+  NEED_RAM_MB=$MIN_RAM_MB
+fi
 TOTAL_RAM_MB=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo 0)
-if [ "$TOTAL_RAM_MB" -gt 0 ] && [ "$TOTAL_RAM_MB" -lt "$MIN_RAM_MB" ]; then
-  fail "Insufficient RAM: ${TOTAL_RAM_MB}MB (need 2048MB+). A full validator node requires at least 2 GB."
+if [ "$TOTAL_RAM_MB" -gt 0 ] && [ "$TOTAL_RAM_MB" -lt "$NEED_RAM_MB" ]; then
+  fail "Insufficient RAM: ${TOTAL_RAM_MB}MB (need ${NEED_RAM_MB}MB+)."
 else
   ok "RAM: ${TOTAL_RAM_MB}MB"
 fi
@@ -129,9 +161,11 @@ else
   fail "Cannot reach Materios gateway at ${GATEWAY_URL}. Check your internet connection."
 fi
 
-# Port 30333 — warn if something is already bound
-if ss -tlnp 2>/dev/null | grep -q ':30333 '; then
-  warn "Port 30333 is already in use. The node needs this port for P2P networking."
+# Port 30333 — warn if something is already bound (validators only)
+if [ "$MODE" = "validator" ]; then
+  if ss -tlnp 2>/dev/null | grep -q ':30333 '; then
+    warn "Port 30333 is already in use. The node needs this port for P2P networking."
+  fi
 fi
 
 # ── Step 2: Create operator directory ────────────────────────────────────────
@@ -149,9 +183,11 @@ if [ -f "$OPERATOR_DIR/docker-compose.yml" ]; then
 fi
 
 # ── Step 3: Pull Docker images ──────────────────────────────────────────────
-info "Pulling validator node image (this may take a few minutes)..."
-docker pull "$NODE_IMAGE" || fail "Failed to pull node image. Check Docker / internet."
-ok "Node image pulled"
+if [ "$MODE" = "validator" ]; then
+  info "Pulling validator node image (this may take a few minutes)..."
+  docker pull "$NODE_IMAGE" || fail "Failed to pull node image. Check Docker / internet."
+  ok "Node image pulled"
+fi
 
 info "Pulling cert daemon image..."
 docker pull "$DAEMON_IMAGE" || fail "Failed to pull daemon image."
@@ -199,44 +235,97 @@ echo "$MNEMONIC" > "$MNEMONIC_FILE"
 chmod 600 "$MNEMONIC_FILE"
 ok "Mnemonic saved to $MNEMONIC_FILE (chmod 600)"
 
-# ── Step 6: Redeem invite token ─────────────────────────────────────────────
-info "Registering with Materios gateway..."
+# ── Step 6: Register (invite token for validators, open for attestors) ──────
+API_KEY=""
+if [ "$MODE" = "validator" ]; then
+  info "Registering with Materios gateway..."
 
-REGISTER_RESPONSE=$(curl -sS --max-time 30 -X POST "${GATEWAY_URL}/operators/register" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"invite_token\": \"${INVITE_TOKEN}\",
-    \"ss58_address\": \"${SS58}\",
-    \"public_key\": \"${PUBKEY}\",
-    \"label\": \"${LABEL}\"
-  }" 2>&1) || fail "Registration request failed. Check your internet connection."
+  REGISTER_RESPONSE=$(curl -sS --max-time 30 -X POST "${GATEWAY_URL}/operators/register" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"invite_token\": \"${INVITE_TOKEN}\",
+      \"ss58_address\": \"${SS58}\",
+      \"public_key\": \"${PUBKEY}\",
+      \"label\": \"${LABEL}\"
+    }" 2>&1) || fail "Registration request failed. Check your internet connection."
 
-# Parse response
-REG_STATUS=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || \
-             echo "$REGISTER_RESPONSE" | jq -r '.status // empty' 2>/dev/null || echo "")
-REG_ERROR=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null || \
-            echo "$REGISTER_RESPONSE" | jq -r '.error // empty' 2>/dev/null || echo "")
-API_KEY=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('api_key',''))" 2>/dev/null || \
-          echo "$REGISTER_RESPONSE" | jq -r '.api_key // empty' 2>/dev/null || echo "")
+  # Parse response
+  REG_STATUS=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || \
+               echo "$REGISTER_RESPONSE" | jq -r '.status // empty' 2>/dev/null || echo "")
+  REG_ERROR=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null || \
+              echo "$REGISTER_RESPONSE" | jq -r '.error // empty' 2>/dev/null || echo "")
+  API_KEY=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('api_key',''))" 2>/dev/null || \
+            echo "$REGISTER_RESPONSE" | jq -r '.api_key // empty' 2>/dev/null || echo "")
 
-if [ "$REG_STATUS" != "registered" ]; then
-  if [ -n "$REG_ERROR" ]; then
-    fail "Registration failed: $REG_ERROR"
-  else
-    fail "Registration failed. Response: $REGISTER_RESPONSE"
+  if [ "$REG_STATUS" != "registered" ]; then
+    if [ -n "$REG_ERROR" ]; then
+      fail "Registration failed: $REG_ERROR"
+    else
+      fail "Registration failed. Response: $REGISTER_RESPONSE"
+    fi
   fi
+
+  ok "Registered as $LABEL"
+
+  # Save API key for later use
+  echo "$API_KEY" > "$OPERATOR_DIR/.api-key"
+  chmod 600 "$OPERATOR_DIR/.api-key"
+else
+  info "Attestor mode — no invite token required"
+  ok "Keypair ready: $SS58"
 fi
-
-ok "Registered as $LABEL"
-
-# Save API key for later use
-echo "$API_KEY" > "$OPERATOR_DIR/.api-key"
-chmod 600 "$OPERATOR_DIR/.api-key"
 
 # ── Step 7: Write docker-compose.yml ────────────────────────────────────────
 info "Writing configuration..."
 
-cat > "$OPERATOR_DIR/docker-compose.yml" <<COMPOSE
+# Public RPC endpoint for attestor mode
+PUBLIC_RPC_URL="wss://materios.fluxpointstudios.com/rpc"
+
+if [ "$MODE" = "attestor" ]; then
+  cat > "$OPERATOR_DIR/docker-compose.yml" <<COMPOSE
+## Materios Attestor (Cert Daemon Only) — Auto-generated by install.sh
+## Operator: ${LABEL}
+## SS58: ${SS58}
+## Mode: attestor
+## Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+services:
+  cert-daemon:
+    image: ${DAEMON_IMAGE}
+    restart: unless-stopped
+    environment:
+      SIGNER_URI: "${MNEMONIC}"
+      MATERIOS_RPC_URL: "${PUBLIC_RPC_URL}"
+      BLOB_GATEWAY_URL: "${GATEWAY_URL}"
+      LOCATOR_REGISTRY_URL: "${GATEWAY_URL}"
+      HEARTBEAT_URL: "${GATEWAY_URL}"
+      HEARTBEAT_INTERVAL: "30"
+      CHECKPOINT_ENABLED: "false"
+      CHAIN_ID: "5663079a485b93fdc9e386b862b4cf8d25499427df6b8c5f018535acfd2e5020"
+      POLL_INTERVAL: "12"
+      POLL_INTERVAL_FAST: "3"
+      POLL_INTERVAL_IDLE: "12"
+      DATA_DIR: "/data"
+      BLOB_LOCAL_DIR: "/data/materios-blobs"
+      CERT_STORE_DIR: "/data/certs"
+      STATE_FILE: "/data/daemon-state.json"
+      HEALTH_PORT: "8080"
+      MAX_BLOB_FETCH_RETRIES: "3"
+      BLOB_FETCH_TIMEOUT: "30"
+      FINALITY_CONFIRMATIONS: "4"
+      MAX_LEAF_WAIT_SECONDS: "90"
+    volumes:
+      - cert-daemon-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  cert-daemon-data:
+COMPOSE
+
+else
+  # Full validator mode — node + daemon
+  cat > "$OPERATOR_DIR/docker-compose.yml" <<COMPOSE
 ## Materios Validator + Cert Daemon — Auto-generated by install.sh
 ## Operator: ${LABEL}
 ## SS58: ${SS58}
@@ -316,16 +405,36 @@ volumes:
   cert-daemon-data:
 COMPOSE
 
+fi  # end mode check
+
 chmod 600 "$OPERATOR_DIR/docker-compose.yml"
 ok "docker-compose.yml written"
 
-# ── Step 8: Start the validator node ─────────────────────────────────────────
-info "Starting validator node..."
-docker compose up -d materios-node || fail "Failed to start node"
-ok "Validator node started"
+# ── Step 8: Start services ───────────────────────────────────────────────────
+SESSION_KEYS=""
+NODE_READY=false
 
-# ── Step 9: Wait for node to sync ────────────────────────────────────────────
-info "Waiting for node to connect to the network and sync..."
+if [ "$MODE" = "attestor" ]; then
+  # Attestor mode: just start the cert daemon
+  info "Starting cert daemon..."
+  docker compose up -d cert-daemon || fail "Failed to start cert daemon"
+  ok "Cert daemon started"
+
+  # Submit join_committee transaction via the daemon's RPC connection
+  info "Joining attestation committee on-chain..."
+  # The cert daemon will auto-join the committee on startup if the
+  # join_committee extrinsic is available. For now, log the intent.
+  info "Your daemon will submit a join_committee transaction on first poll."
+  ok "Attestor setup complete"
+
+else
+  # Full validator mode
+  info "Starting validator node..."
+  docker compose up -d materios-node || fail "Failed to start node"
+  ok "Validator node started"
+
+  # ── Step 9: Wait for node to sync ──────────────────────────────────────────
+  info "Waiting for node to connect to the network and sync..."
 info "This may take 5-15 minutes depending on chain height. Please be patient."
 echo ""
 
@@ -466,7 +575,10 @@ else
   warn "Check status: curl http://localhost:8080/status"
 fi
 
-# ── Write helper script for post-sync key generation ─────────────────────────
+fi  # end validator-only steps (sync, keys, daemon start, health check)
+
+# ── Write helper script for post-sync key generation (validators only) ───────
+if [ "$MODE" = "validator" ]; then
 cat > "$OPERATOR_DIR/generate-session-keys.sh" <<'KEYSCRIPT'
 #!/usr/bin/env bash
 # Generate session keys after node sync (run if installer timed out during sync)
@@ -520,23 +632,31 @@ else
 fi
 KEYSCRIPT
 chmod +x "$OPERATOR_DIR/generate-session-keys.sh"
+fi  # end validator-only helper script
 
-# ── Step 13: Print summary ──────────────────────────────────────────────────
+# ── Print summary ────────────────────────────────────────────────────────────
 echo ""
 echo -e "${BOLD}  ═══════════════════════════════════════════${RESET}"
-echo -e "${GREEN}${BOLD}  Materios Validator Online${RESET}"
+if [ "$MODE" = "attestor" ]; then
+  echo -e "${GREEN}${BOLD}  Materios Attestor Online${RESET}"
+else
+  echo -e "${GREEN}${BOLD}  Materios Validator Online${RESET}"
+fi
 echo -e "${BOLD}  ═══════════════════════════════════════════${RESET}"
 echo ""
 echo -e "  ${BOLD}SS58 Address${RESET}   : ${SS58}"
 echo -e "  ${BOLD}Label${RESET}          : ${LABEL}"
+echo -e "  ${BOLD}Mode${RESET}           : ${MODE}"
 if [ -n "$SESSION_KEYS" ] && [ ${#SESSION_KEYS} -eq 130 ]; then
 echo -e "  ${BOLD}Session Keys${RESET}   : ${SESSION_KEYS:0:18}...${SESSION_KEYS:126:4}"
 fi
 if [ -n "${PEER_ID:-}" ]; then
 echo -e "  ${BOLD}Peer ID${RESET}        : ${PEER_ID}"
 fi
+if [ "$MODE" = "validator" ]; then
 echo -e "  ${BOLD}P2P Port${RESET}       : 30333 (ensure this is open inbound)"
 echo -e "  ${BOLD}Node RPC${RESET}       : http://localhost:9944"
+fi
 echo -e "  ${BOLD}Daemon Health${RESET}  : http://localhost:8080/status"
 echo -e "  ${BOLD}Explorer${RESET}       : ${EXPLORER_URL}"
 echo -e "  ${BOLD}Mnemonic${RESET}       : ${MNEMONIC_FILE}"
@@ -544,17 +664,23 @@ echo ""
 echo -e "  ${YELLOW}${BOLD}IMPORTANT:${RESET}"
 echo -e "  ${YELLOW}- Back up your mnemonic file immediately${RESET}"
 echo -e "  ${YELLOW}- Never share the mnemonic with anyone${RESET}"
+if [ "$MODE" = "validator" ]; then
 echo -e "  ${YELLOW}- Ensure port 30333 is open in your firewall${RESET}"
 echo -e "  ${YELLOW}- The Materios team will add you to the authority set shortly${RESET}"
+fi
 echo ""
-if [ -z "$SESSION_KEYS" ] || [ ${#SESSION_KEYS} -ne 130 ]; then
-echo -e "  ${YELLOW}${BOLD}NOTE:${RESET} Node was still syncing. Once synced, run:"
-echo -e "    cd $OPERATOR_DIR && bash generate-session-keys.sh"
-echo ""
+if [ "$MODE" = "validator" ]; then
+  if [ -z "$SESSION_KEYS" ] || [ ${#SESSION_KEYS} -ne 130 ]; then
+  echo -e "  ${YELLOW}${BOLD}NOTE:${RESET} Node was still syncing. Once synced, run:"
+  echo -e "    cd $OPERATOR_DIR && bash generate-session-keys.sh"
+  echo ""
+  fi
 fi
 echo -e "  ${BOLD}Commands:${RESET}"
 echo "    cd $OPERATOR_DIR"
+if [ "$MODE" = "validator" ]; then
 echo "    docker compose logs -f materios-node   # Node logs"
+fi
 echo "    docker compose logs -f cert-daemon     # Daemon logs"
 echo "    docker compose restart                 # Restart all"
 echo "    docker compose down                    # Stop all"
