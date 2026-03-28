@@ -432,11 +432,18 @@ if [ "$MODE" = "attestor" ]; then
   docker compose up -d cert-daemon || fail "Failed to start cert daemon"
   ok "Cert daemon started"
 
-  # Submit join_committee transaction via the daemon's RPC connection
-  info "Joining attestation committee on-chain..."
-  # The cert daemon will auto-join the committee on startup if the
-  # join_committee extrinsic is available. For now, log the intent.
-  info "Your daemon will submit a join_committee transaction on first poll."
+  # Request MATRA faucet drip so the daemon can pay fees for join_committee
+  info "Requesting MATRA faucet drip for fee payment..."
+  FAUCET_RESP=$(curl -sS --max-time 15 -X POST "${GATEWAY_URL}/faucet/drip" \
+    -H "Content-Type: application/json" \
+    -d "{\"address\": \"${SS58}\"}" 2>/dev/null || echo "")
+  FAUCET_OK=$(echo "$FAUCET_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null || echo "")
+  if [ "$FAUCET_OK" = "True" ]; then
+    ok "MATRA received — daemon will auto-join the attestation committee"
+  else
+    FAUCET_ERR=$(echo "$FAUCET_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))" 2>/dev/null || echo "request failed")
+    warn "Faucet drip: $FAUCET_ERR (daemon will retry on startup)"
+  fi
   ok "Attestor setup complete"
 
 else
