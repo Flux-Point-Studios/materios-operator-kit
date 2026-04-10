@@ -8,9 +8,19 @@
 ##   3. Verify at https://materios.fluxpointstudios.com/explorer/#/committee
 
 services:
+  fix-permissions:
+    image: ghcr.io/flux-point-studios/materios-operator-kit:latest
+    user: root
+    entrypoint: ["/bin/sh", "-c", "chown -R certd:certd /data && echo 'Permissions fixed'"]
+    volumes:
+      - cert-daemon-data:/data
+
   cert-daemon:
     image: ghcr.io/flux-point-studios/materios-operator-kit:latest
     restart: unless-stopped
+    depends_on:
+      fix-permissions:
+        condition: service_completed_successfully
     environment:
       ## ─── REQUIRED: fill these in ───────────────────────────────────
       SIGNER_URI: ""                  # Your 24-word BIP39 mnemonic

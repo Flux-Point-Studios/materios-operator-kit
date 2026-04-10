@@ -12,7 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY daemon/ ./daemon/
 
-RUN useradd -r -s /bin/false certd
+RUN useradd -r -s /bin/false certd \
+    && mkdir -p /data/materios-blobs /data/certs \
+    && chown -R certd:certd /data
 USER certd
 
 EXPOSE 8080
