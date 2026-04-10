@@ -214,6 +214,111 @@ class CertDaemon:
         for rid in to_remove:
             self.pending.pop(rid, None)
 
+    async def _ensure_committee_membership(self):
+        """Auto-join the on-chain attestation committee if not already a member."""
+        try:
+            my_address = self.client.keypair.ss58_address
+            committee = self.client.substrate.query("OrinqReceipts", "CommitteeMembers")
+
+            my_pubkey = self.client.keypair.public_key.hex()
+            is_member = False
+            for member in committee or []:
+                member_str = str(member)
+                try:
+                    from substrateinterface.utils.ss58 import ss58_decode
+                    if ss58_decode(member_str) == my_pubkey:
+                        is_member = True
+                        break
+                except Exception:
+                    if member_str == my_address:
+                        is_member = True
+                        break
+
+            if is_member:
+                logger.info(f"Already in attestation committee as {my_address}")
+                return
+
+            logger.info(f"Not in committee — calling join_committee as {my_address}")
+            call = self.client.substrate.compose_call(
+                call_module="OrinqReceipts",
+                call_function="join_committee",
+                call_params={},
+            )
+            extrinsic = self.client.substrate.create_signed_extrinsic(
+                call=call, keypair=self.client.keypair,
+            )
+            receipt = self.client.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
+
+            if receipt.is_success:
+                logger.info("Successfully joined attestation committee!")
+                await self.send_discord(f"Joined attestation committee as `{my_address[:16]}...`", "info")
+            else:
+                error = receipt.error_message or "unknown error"
+                logger.warning(f"join_committee failed: {error}")
+                if "pay" in str(error).lower() or "fee" in str(error).lower():
+                    await self._request_faucet_drip(my_address)
+        except Exception as e:
+            logger.warning(f"Committee membership check failed: {e}")
+
+    async def _request_faucet_drip(self, address: str):
+        """Request a MATRA airdrop from the gateway faucet to pay for join_committee."""
+        gateway_url = self.config.blob_base_url
+        if not gateway_url:
+            return
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{gateway_url}/faucet/drip",
+                    json={"address": address},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    data = await resp.json()
+                    if resp.status == 200:
+                        logger.info(f"Faucet drip received: {data.get('amount')} MATRA")
+                        await asyncio.sleep(30)
+                        await self._ensure_committee_membership()
+                    else:
+                        logger.warning(f"Faucet request failed: {data.get('error', resp.status)}")
+        except Exception as e:
+            logger.warning(f"Faucet request error: {e}")
+
+    async def _ensure_gateway_registration(self):
+        """Self-register on the blob gateway so heartbeats are accepted."""
+        gateway_url = self.config.blob_base_url
+        if not gateway_url:
+            return
+        my_address = self.client.keypair.ss58_address
+        my_pubkey = "0x" + self.client.keypair.public_key.hex()
+        label = os.environ.get("OPERATOR_LABEL", f"attestor-{my_address[:8]}")
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Check if already registered
+                async with session.get(
+                    f"{gateway_url}/operators/status/{my_address}",
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("registered"):
+                            logger.info(f"Already registered on gateway as {my_address}")
+                            return
+
+                # Self-register via faucet endpoint (creates registration + operator entry)
+                async with session.post(
+                    f"{gateway_url}/faucet/drip",
+                    json={"address": my_address},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    data = await resp.json()
+                    if resp.status == 200:
+                        logger.info(f"Gateway registration via faucet: {data}")
+                    elif resp.status == 409:
+                        logger.info("Already registered on gateway (409)")
+                    else:
+                        logger.warning(f"Gateway registration failed: {resp.status} {data}")
+        except Exception as e:
+            logger.warning(f"Gateway registration check failed: {e}")
+
     async def run(self):
         await self.send_discord("Daemon starting up", "info")
         self.load_state()
@@ -223,6 +328,11 @@ class CertDaemon:
             return
 
         health_server.update_metrics(substrate_connected=True)
+
+        # Auto-register on gateway and auto-join committee
+        await self._ensure_gateway_registration()
+        await self._ensure_committee_membership()
+
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
 
         while self._running:
