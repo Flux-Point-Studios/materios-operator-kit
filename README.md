@@ -142,18 +142,82 @@ docker compose down
 
 Your data (heartbeat sequence counter, state) is persisted in the `cert-daemon-data` Docker volume. Restarting picks up where you left off.
 
-## Optional: Run Your Own Watchtower
+## Optional: Daemon Health Watchdog
 
-Monitor committee health independently with your own Discord alerts. The watchtower only reads the **public** heartbeat endpoint — no API key needed.
+Get alerted when your daemon goes down, loses RPC connection, or falls behind. The watchdog checks your daemon's local health endpoint and sends alerts via Discord, email, or stdout.
+
+### Quick start (Discord)
+
+1. Create a Discord webhook: Server Settings → Integrations → Webhooks → New Webhook
+2. Run the watchdog alongside your daemon:
 
 ```bash
-docker compose run --rm \
-  -e BLOB_GATEWAY_URL=https://materios.fluxpointstudios.com/blobs \
-  -e DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK \
-  cert-daemon python -m daemon.watchtower
+ALERT_METHOD=discord \
+DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN" \
+OPERATOR_LABEL="my-attestor" \
+./watchdog.sh &
 ```
 
-Or run it persistently by adding a second service to your `docker-compose.yml`:
+### What it checks (every 60s)
+
+| Check | Alert level | Condition |
+|-------|------------|-----------|
+| Container running | CRIT | `docker compose ps` shows no running containers |
+| Health endpoint | CRIT | `http://localhost:8080/status` unreachable |
+| RPC connection | WARN | `connected: false` in status response |
+| Finality gap | WARN | Gap > 10 blocks (configurable) |
+| Poll freshness | WARN | Last poll > 120s ago (daemon stuck) |
+| Recovery | OK | Issues resolved — sends green "recovered" alert |
+
+### Run as a Docker service
+
+Add to your `docker-compose.yml`:
+
+```yaml
+  watchdog:
+    image: alpine:3.19
+    restart: unless-stopped
+    depends_on:
+      - cert-daemon
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl python3 bash && /watchdog/watchdog.sh"]
+    environment:
+      ALERT_METHOD: "discord"
+      DISCORD_WEBHOOK_URL: "https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN"
+      OPERATOR_LABEL: "my-attestor"
+      HEALTH_URL: "http://cert-daemon:8080/status"
+      CHECK_INTERVAL: "60"
+    volumes:
+      - ./watchdog.sh:/watchdog/watchdog.sh:ro
+```
+
+### Email alerts
+
+```bash
+ALERT_METHOD=email \
+ALERT_EMAIL="you@example.com" \
+OPERATOR_LABEL="my-attestor" \
+./watchdog.sh &
+```
+
+Requires `sendmail` or `msmtp` on the host.
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALERT_METHOD` | `stdout` | `discord`, `email`, or `stdout` |
+| `DISCORD_WEBHOOK_URL` | — | Discord webhook URL |
+| `ALERT_EMAIL` | — | Email recipient |
+| `HEALTH_URL` | `http://localhost:8080/status` | Daemon status endpoint |
+| `CHECK_INTERVAL` | `60` | Seconds between checks |
+| `MAX_FINALITY_GAP` | `10` | Alert if finality gap exceeds this |
+| `MAX_POLL_AGE_SECONDS` | `120` | Alert if daemon hasn't polled in this many seconds |
+| `ALERT_COOLDOWN` | `300` | Don't repeat same alert within this window |
+| `OPERATOR_LABEL` | `my-attestor` | Label shown in alerts |
+
+## Optional: Committee Watchtower
+
+Monitor the overall committee health (all members, not just yours). Reads the **public** heartbeat endpoint — no API key needed.
 
 ```yaml
   watchtower:
