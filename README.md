@@ -34,21 +34,14 @@ This prints three values:
 | Value | What to do with it |
 |-------|-------------------|
 | **Mnemonic** (24 words) | Save securely. This is your private key. Never share it. |
-| **SS58 Address** | Send to FPS team. This is your public identity on-chain. |
-| **Public Key hex** | Send to FPS team alongside the SS58 address. |
+| **SS58 Address** | Your public identity on-chain. Keep it handy. |
+| **Public Key hex** | Your public key. Keep it handy. |
 
-### Step 3: Register with FPS
+### Step 3: Configure the daemon
 
-Send the FPS team:
-- Your **SS58 Address**
-- Your **Public Key hex**
-- Your preferred **label** (e.g. "MyOrg-Validator")
-
-The FPS team will:
-1. Add your address to the on-chain attestation committee
-2. Fund your account with MATRA (needed to submit transactions)
-
-### Step 4: Configure the daemon
+> **No registration required.** The daemon automatically joins the attestation committee on startup by submitting a `join_committee` extrinsic. If your account doesn't have enough MATRA to pay the transaction fee, the daemon auto-requests a faucet drip first.
+>
+> **Optional:** Send your SS58 address and public key hex to the FPS team if you want higher gateway rate limits or a provisioned API key. This is not required to participate.
 
 Edit `docker-compose.yml` and fill in the required fields:
 
@@ -60,7 +53,7 @@ LOCATOR_REGISTRY_API_KEY: ""    # optional — reads are public, not required
 
 > **Note**: API keys are optional. Your sr25519 signature authenticates heartbeats and blob uploads. API keys provide higher rate limits but are not required for any operation.
 
-### Step 5: Start the daemon
+### Step 4: Start the daemon
 
 ```bash
 docker compose up -d
@@ -78,7 +71,7 @@ INFO  Polling for new receipts...
 INFO  Heartbeat sent (seq=1, best_block=58100)
 ```
 
-### Step 6: Verify
+### Step 5: Verify
 
 **Check the public explorer:**
 
@@ -179,12 +172,12 @@ Or run it persistently by adding a second service to your `docker-compose.yml`:
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `docker compose pull` fails with 401 | GHCR image not accessible | Make sure you can reach `ghcr.io`. If using a firewall, allow outbound HTTPS to `ghcr.io` |
-| Heartbeat not appearing on explorer | sr25519 key not registered on-chain | Verify with FPS team that your SS58 address is in the committee |
+| Heartbeat not appearing on explorer | Daemon hasn't joined committee yet | Check logs for `join_committee` success; if faucet drip failed, retry or ask FPS team |
 | `substrate_connected: false` in status | Can't reach RPC endpoint | Check that `wss://materios.fluxpointstudios.com/rpc` is reachable from your network |
 | High finality gap (>10) | Chain-wide issue, not your daemon | Check the explorer dashboard — if all validators show high gap, it's a chain stall |
 | `No locator found` in logs | Blob not yet uploaded for a receipt | Normal during brief windows — daemon retries automatically |
 | Attestation tx fails with "Priority too low" | Nonce collision (rare) | Daemon auto-recovers on next poll cycle |
-| Account balance too low | MATRA depleted from transaction fees | Ask FPS team to top up your account |
+| Account balance too low | MATRA depleted from transaction fees | Daemon auto-requests a faucet drip; if faucet is dry, ask FPS team |
 
 ## FAQ
 
