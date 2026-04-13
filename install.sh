@@ -27,7 +27,7 @@ case "$(uname -m)" in
 esac
 DAEMON_IMAGE="ghcr.io/flux-point-studios/materios-operator-kit:latest"
 GATEWAY_URL="https://materios.fluxpointstudios.com/blobs"
-EXPLORER_URL="https://materios.fluxpointstudios.com/explorer/#/committee"
+EXPLORER_URL="https://fluxpointstudios.com/materios/explorer#committee"
 BOOTNODE="/ip4/5.78.94.109/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp"
 MIN_DISK_MB=51200   # 50 GB
 MIN_RAM_MB=1800     # ~2 GB
@@ -115,8 +115,14 @@ else
   fail "Docker Compose v2 not found. Install it: https://docs.docker.com/compose/install/"
 fi
 
-# Docker daemon running
-docker info >/dev/null 2>&1 || fail "Docker daemon is not running. Start it with: sudo systemctl start docker"
+# Docker daemon running and accessible
+if ! docker info >/dev/null 2>&1; then
+  if command -v docker >/dev/null 2>&1; then
+    fail "Cannot connect to the Docker daemon. Either:\n  1. Run this script with sudo: curl ... | sudo bash -s -- ...\n  2. Add your user to the docker group: sudo usermod -aG docker \$USER && newgrp docker\n  3. Start Docker if it's not running: sudo systemctl start docker"
+  else
+    fail "Docker is not installed. Install it from https://docs.docker.com/get-docker/"
+  fi
+fi
 
 # Architecture — node image supports amd64 and arm64
 ARCH=$(uname -m)
