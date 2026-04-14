@@ -14,11 +14,22 @@ class LocatorRegistry:
     def __init__(self, config: DaemonConfig):
         self.config = config
 
-    async def resolve(self, receipt_id: str) -> Optional[BlobManifest]:
-        """Resolve a receipt_id to its blob manifest. Try HTTP first, then local filesystem."""
+    async def resolve(self, receipt_id: str, content_hash: str = "") -> Optional[BlobManifest]:
+        """Resolve a receipt_id to its blob manifest.
+
+        Resolution order:
+        1. HTTP locator by receipt_id (fast, uses file index)
+        2. HTTP locator by content_hash (resilient, bypasses index)
+        3. Local filesystem (fallback for co-located blobs)
+        """
         manifest = await self._resolve_http(receipt_id)
         if manifest:
             return manifest
+        # Fallback: resolve directly by content_hash (no index needed)
+        if content_hash:
+            manifest = await self._resolve_by_content_hash(content_hash, receipt_id)
+            if manifest:
+                return manifest
         return self._resolve_local(receipt_id)
 
     async def _resolve_http(self, receipt_id: str) -> Optional[BlobManifest]:
@@ -44,9 +55,39 @@ class LocatorRegistry:
             logger.warning(f"HTTP locator lookup failed for {receipt_id}: {e}")
             return None
 
+    async def _resolve_by_content_hash(self, content_hash: str, receipt_id: str) -> Optional[BlobManifest]:
+        """Resolve blob directly by content_hash, bypassing the receipt-id index."""
+        if not self.config.blob_base_url:
+            return None
+        clean_hash = content_hash.replace("0x", "")
+        url = f"{self.config.blob_base_url}/locators/by-content/0x{clean_hash}"
+        headers = {}
+        api_key = os.environ.get("LOCATOR_REGISTRY_API_KEY", "") or getattr(self.config, "locator_registry_api_key", "")
+        if api_key:
+            headers["x-api-key"] = api_key
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10), headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        data["receipt_id"] = receipt_id  # inject receipt_id for manifest
+                        return self._parse_manifest(receipt_id, data)
+                    return None
+        except Exception as e:
+            logger.debug(f"Content-hash locator lookup failed for {content_hash}: {e}")
+            return None
+
     def _resolve_local(self, receipt_id: str) -> Optional[BlobManifest]:
         clean_id = receipt_id.removeprefix("0x")
-        manifest_dir = os.path.join(self.config.blob_local_dir, clean_id)
+        # Validate receipt_id is hex-only to prevent directory traversal
+        if not all(c in "0123456789abcdefABCDEF" for c in clean_id):
+            logger.warning(f"Invalid receipt_id characters: {receipt_id}")
+            return None
+        manifest_dir = os.path.normpath(os.path.join(self.config.blob_local_dir, clean_id))
+        # Ensure resolved path stays within blob_local_dir
+        if not manifest_dir.startswith(os.path.normpath(self.config.blob_local_dir)):
+            logger.warning(f"Path traversal blocked for receipt_id: {receipt_id}")
+            return None
         manifest_path = os.path.join(manifest_dir, "manifest.json")
         if not os.path.exists(manifest_path):
             return None
@@ -62,10 +103,14 @@ class LocatorRegistry:
         chunks = []
         for i, chunk_data in enumerate(data.get("chunks", [])):
             url = chunk_data.get("url", "")
-            if not url and "path" in chunk_data:
+            if not url and "path" in chunk_data and manifest_dir:
                 # Support SDK-generated manifests that use relative 'path' instead of 'url'
                 rel_path = chunk_data["path"]
-                abs_path = os.path.join(manifest_dir, rel_path) if manifest_dir else rel_path
+                abs_path = os.path.normpath(os.path.join(manifest_dir, rel_path))
+                # Block path traversal — chunk must resolve within manifest_dir
+                if not abs_path.startswith(os.path.normpath(manifest_dir)):
+                    logger.warning(f"Path traversal blocked in chunk path: {rel_path}")
+                    continue
                 url = f"file://{abs_path}"
             chunks.append(ChunkInfo(
                 index=i,

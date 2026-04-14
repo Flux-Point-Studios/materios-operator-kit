@@ -83,7 +83,12 @@ class BlobVerifier:
     async def _fetch_chunk(self, session: aiohttp.ClientSession, url: str) -> Optional[bytes]:
         # Support file:// URLs for local chunk reading (used by chaos drills and local tests)
         if url.startswith("file://"):
-            path = url[7:]
+            path = os.path.normpath(url[7:])
+            # Block path traversal — file:// reads must stay within blob_local_dir
+            allowed_dir = os.path.normpath(self.config.blob_local_dir)
+            if not path.startswith(allowed_dir):
+                logger.warning(f"Path traversal blocked in file:// URL: {path}")
+                return None
             try:
                 with open(path, "rb") as f:
                     return f.read()

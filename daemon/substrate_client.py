@@ -29,7 +29,7 @@ class SubstrateClient:
 
     def connect(self) -> bool:
         try:
-            self.substrate = SubstrateInterface(url=self.config.rpc_url)
+            self.substrate = SubstrateInterface(url=self.config.rpc_url, config={'strict_scale_decode': False})
             logger.info(f"Connected to {self.config.rpc_url}, chain: {self.substrate.chain}")
             return True
         except Exception as e:

@@ -44,6 +44,8 @@ class DaemonConfig:
     cv_max_crystal_rate: float = 0.15   # crystals per meter of track
     cv_max_event_rate: float = 0.25     # (near_miss + slides) per meter
     cv_score_margin: float = 1.1        # 10% tolerance over theoretical max
+    # Schema registry
+    schema_registry_path: str = ""  # SCHEMA_REGISTRY_PATH — empty = use default (schemas/registry.json)
     # Heartbeat
     heartbeat_url: str = ""  # HEARTBEAT_URL — empty = disabled
     heartbeat_interval: int = 30  # HEARTBEAT_INTERVAL, seconds
@@ -90,6 +92,7 @@ class DaemonConfig:
             cv_max_crystal_rate=float(os.environ.get("CV_MAX_CRYSTAL_RATE", cls.cv_max_crystal_rate)),
             cv_max_event_rate=float(os.environ.get("CV_MAX_EVENT_RATE", cls.cv_max_event_rate)),
             cv_score_margin=float(os.environ.get("CV_SCORE_MARGIN", cls.cv_score_margin)),
+            schema_registry_path=os.environ.get("SCHEMA_REGISTRY_PATH", cls.schema_registry_path),
             heartbeat_url=os.environ.get("HEARTBEAT_URL", cls.heartbeat_url),
             heartbeat_interval=int(os.environ.get("HEARTBEAT_INTERVAL", cls.heartbeat_interval)),
         )
