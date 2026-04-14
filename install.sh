@@ -22,11 +22,12 @@ set -euo pipefail
 OPERATOR_DIR="$HOME/materios-operator"
 # Select image tag based on architecture
 case "$(uname -m)" in
-  arm64|aarch64) NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v105-arm64" ;;
-  *)             NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v105" ;;
+  arm64|aarch64) NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v109-arm64" ;;
+  *)             NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v109" ;;
 esac
 DAEMON_IMAGE="ghcr.io/flux-point-studios/materios-operator-kit:latest"
 GATEWAY_URL="https://materios.fluxpointstudios.com/blobs"
+CHAIN_SPEC_URL="https://fluxpointstudios.com/materios/chain-spec-raw.json"
 EXPLORER_URL="https://fluxpointstudios.com/materios/explorer#committee"
 BOOTNODE="/ip4/5.78.94.109/tcp/30333/p2p/12D3KooWEyoppNCUx8Yx66oV9fJnriXwCcXwDDUA2kj6vnc6iDEp"
 MIN_DISK_MB=51200   # 50 GB
@@ -81,7 +82,7 @@ if [ "$MODE" != "validator" ] && [ "$MODE" != "attestor" ]; then
 fi
 
 if [ "$MODE" = "validator" ] && [ -z "$INVITE_TOKEN" ]; then
-  fail "Missing --token. Validator mode requires an invite token.\n  Usage: install.sh --token <INVITE_TOKEN>\n  Or use: install.sh --mode attestor (no token needed)"
+  info "No --token provided. Will use permissionless registration (faucet auto-register)."
 fi
 [ -z "$LABEL" ] && LABEL="$(hostname -s 2>/dev/null || echo operator)-$(date +%s | tail -c 5)"
 
@@ -253,11 +254,10 @@ echo "$MNEMONIC" > "$MNEMONIC_FILE"
 chmod 600 "$MNEMONIC_FILE"
 ok "Mnemonic saved to $MNEMONIC_FILE (chmod 600)"
 
-# ── Step 6: Register (invite token for validators, open for attestors) ──────
+# ── Step 6: Register with gateway ──────────────────────────────────────────
 API_KEY=""
-if [ "$MODE" = "validator" ]; then
-  info "Registering with Materios gateway..."
-
+if [ -n "$INVITE_TOKEN" ]; then
+  info "Registering with invite token..."
   REGISTER_RESPONSE=$(curl -sS --max-time 30 -X POST "${GATEWAY_URL}/operators/register" \
     -H "Content-Type: application/json" \
     -d "{
@@ -265,32 +265,33 @@ if [ "$MODE" = "validator" ]; then
       \"ss58_address\": \"${SS58}\",
       \"public_key\": \"${PUBKEY}\",
       \"label\": \"${LABEL}\"
-    }" 2>&1) || fail "Registration request failed. Check your internet connection."
+    }" 2>&1) || fail "Registration request failed."
 
-  # Parse response
-  REG_STATUS=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || \
-               echo "$REGISTER_RESPONSE" | jq -r '.status // empty' 2>/dev/null || echo "")
-  REG_ERROR=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('error',''))" 2>/dev/null || \
-              echo "$REGISTER_RESPONSE" | jq -r '.error // empty' 2>/dev/null || echo "")
-  API_KEY=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('api_key',''))" 2>/dev/null || \
-            echo "$REGISTER_RESPONSE" | jq -r '.api_key // empty' 2>/dev/null || echo "")
+  REG_STATUS=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || echo "")
+  API_KEY=$(echo "$REGISTER_RESPONSE" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('api_key',''))" 2>/dev/null || echo "")
 
-  if [ "$REG_STATUS" != "registered" ]; then
-    if [ -n "$REG_ERROR" ]; then
-      fail "Registration failed: $REG_ERROR"
-    else
-      fail "Registration failed. Response: $REGISTER_RESPONSE"
-    fi
+  if [ "$REG_STATUS" = "registered" ]; then
+    ok "Registered as $LABEL"
+    echo "$API_KEY" > "$OPERATOR_DIR/.api-key"
+    chmod 600 "$OPERATOR_DIR/.api-key"
+  else
+    warn "Token registration failed. Will use permissionless faucet registration instead."
   fi
+fi
 
-  ok "Registered as $LABEL"
-
-  # Save API key for later use
-  echo "$API_KEY" > "$OPERATOR_DIR/.api-key"
-  chmod 600 "$OPERATOR_DIR/.api-key"
-else
-  info "Attestor mode — no invite token required"
-  ok "Keypair ready: $SS58"
+# Request faucet drip (auto-registers in gateway + provides tMATRA for fees)
+if [ -z "$API_KEY" ]; then
+  info "Requesting faucet drip (auto-registers with gateway)..."
+  FAUCET_RESP=$(curl -sS --max-time 15 -X POST "${GATEWAY_URL}/faucet/drip" \
+    -H "Content-Type: application/json" \
+    -d "{\"address\": \"${SS58}\"}" 2>/dev/null || echo "")
+  FAUCET_OK=$(echo "$FAUCET_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null || echo "")
+  if [ "$FAUCET_OK" = "True" ]; then
+    ok "Registered via faucet. tMATRA received — MOTRA will auto-generate."
+  else
+    FAUCET_ERR=$(echo "$FAUCET_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null || echo "request failed")
+    warn "Faucet: $FAUCET_ERR (daemon will retry on startup)"
+  fi
 fi
 
 # ── Step 7: Write docker-compose.yml ────────────────────────────────────────
@@ -342,6 +343,11 @@ volumes:
 COMPOSE
 
 else
+  # Download chain spec
+  info "Downloading chain spec..."
+  curl -sSL -o "$OPERATOR_DIR/chain-spec-raw.json" "$CHAIN_SPEC_URL" || fail "Failed to download chain spec"
+  ok "Chain spec downloaded ($(wc -c < "$OPERATOR_DIR/chain-spec-raw.json") bytes)"
+
   # Full validator mode — node + daemon
   cat > "$OPERATOR_DIR/docker-compose.yml" <<COMPOSE
 ## Materios Validator + Cert Daemon — Auto-generated by install.sh
@@ -356,7 +362,7 @@ services:
     user: "0:0"
     command:
       - "--chain"
-      - "local"
+      - "/chain-spec/chain-spec-raw.json"
       - "--base-path"
       - "/data/materios"
       - "--rpc-port"
@@ -375,6 +381,7 @@ services:
       - "${BOOTNODE}"
     volumes:
       - node-data:/data/materios
+      - ./chain-spec-raw.json:/chain-spec/chain-spec-raw.json:ro
     ports:
       - "30333:30333"        # P2P — must be reachable from internet
       - "127.0.0.1:9944:9944"  # RPC — localhost only for security
@@ -436,21 +443,7 @@ if [ "$MODE" = "attestor" ]; then
   # Attestor mode: just start the cert daemon
   info "Starting cert daemon..."
   docker compose up -d cert-daemon || fail "Failed to start cert daemon"
-  ok "Cert daemon started"
-
-  # Request MATRA faucet drip so the daemon can pay fees for join_committee
-  info "Requesting MATRA faucet drip for fee payment..."
-  FAUCET_RESP=$(curl -sS --max-time 15 -X POST "${GATEWAY_URL}/faucet/drip" \
-    -H "Content-Type: application/json" \
-    -d "{\"address\": \"${SS58}\"}" 2>/dev/null || echo "")
-  FAUCET_OK=$(echo "$FAUCET_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null || echo "")
-  if [ "$FAUCET_OK" = "True" ]; then
-    ok "MATRA received — daemon will auto-join the attestation committee"
-  else
-    FAUCET_ERR=$(echo "$FAUCET_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))" 2>/dev/null || echo "request failed")
-    warn "Faucet drip: $FAUCET_ERR (daemon will retry on startup)"
-  fi
-  ok "Attestor setup complete"
+  ok "Cert daemon started — will auto-join attestation committee"
 
 else
   # Full validator mode
