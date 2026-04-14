@@ -37,7 +37,22 @@ class HeartbeatSender:
         self._load_seq()
 
     def _load_seq(self):
-        """Load persisted seq counter for crash recovery."""
+        """Load seq counter — prefer gateway's last_seq over stale local file."""
+        # First try to get the authoritative seq from the gateway
+        try:
+            url = f"{self.config.heartbeat_url}/heartbeats/seq/{self.keypair.ss58_address}"
+            resp = requests.get(url, timeout=5)
+            if resp.status_code == 200:
+                gateway_seq = resp.json().get("last_seq", 0)
+                if gateway_seq > 0:
+                    self._seq = gateway_seq
+                    self._save_seq()
+                    logger.info(f"Loaded heartbeat seq={self._seq} from gateway (authoritative)")
+                    return
+        except Exception as e:
+            logger.warning(f"Failed to query gateway for seq: {e}")
+
+        # Fallback: load from local file
         try:
             if self._seq_file.exists():
                 data = json.loads(self._seq_file.read_text())

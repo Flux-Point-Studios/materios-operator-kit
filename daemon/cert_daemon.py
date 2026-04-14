@@ -114,8 +114,9 @@ class CertDaemon:
             logger.info(f"Cert already stored for {receipt_id}, skipping")
             return
 
-        # Resolve blob locations
-        manifest = await self.locator.resolve(receipt_id)
+        # Resolve blob locations (try receipt_id first, then content_hash fallback)
+        content_hash_hex = receipt.content_hash.hex() if isinstance(receipt.content_hash, bytes) else str(receipt.content_hash)
+        manifest = await self.locator.resolve(receipt_id, content_hash=content_hash_hex)
         if manifest is None:
             logger.info(f"No locator found for {receipt_id}, adding to pending")
             if receipt_id not in self.pending:
@@ -197,7 +198,8 @@ class CertDaemon:
         now = time.time()
         to_remove = []
         for receipt_id, pending in list(self.pending.items()):
-            manifest = await self.locator.resolve(receipt_id)
+            content_hash_hex = pending.receipt.content_hash.hex() if isinstance(pending.receipt.content_hash, bytes) else str(pending.receipt.content_hash)
+            manifest = await self.locator.resolve(receipt_id, content_hash=content_hash_hex)
             if manifest is None:
                 pending.retries += 1
                 if now - pending.first_seen > self.config.pending_alert_seconds and pending.retries % 60 == 0:
@@ -215,11 +217,12 @@ class CertDaemon:
             self.pending.pop(rid, None)
 
     async def _ensure_committee_membership(self):
-        """Auto-join the on-chain attestation committee if not already a member."""
+        """Check if this daemon's signer is in the attestation committee. If not, join."""
         try:
             my_address = self.client.keypair.ss58_address
             committee = self.client.substrate.query("OrinqReceipts", "CommitteeMembers")
 
+            # Check if we're already a member (handle different SS58 prefixes)
             my_pubkey = self.client.keypair.public_key.hex()
             is_member = False
             for member in committee or []:
@@ -245,18 +248,21 @@ class CertDaemon:
                 call_params={},
             )
             extrinsic = self.client.substrate.create_signed_extrinsic(
-                call=call, keypair=self.client.keypair,
+                call=call,
+                keypair=self.client.keypair,
             )
             receipt = self.client.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
 
             if receipt.is_success:
-                logger.info("Successfully joined attestation committee!")
+                logger.info(f"Successfully joined attestation committee!")
                 await self.send_discord(f"Joined attestation committee as `{my_address[:16]}...`", "info")
             else:
                 error = receipt.error_message or "unknown error"
                 logger.warning(f"join_committee failed: {error}")
+                # Common failure: can't pay fees (no MOTRA). Request faucet drip.
                 if "pay" in str(error).lower() or "fee" in str(error).lower():
                     await self._request_faucet_drip(my_address)
+
         except Exception as e:
             logger.warning(f"Committee membership check failed: {e}")
 
@@ -275,49 +281,13 @@ class CertDaemon:
                     data = await resp.json()
                     if resp.status == 200:
                         logger.info(f"Faucet drip received: {data.get('amount')} MATRA")
+                        # Wait for MOTRA to generate, then retry join
                         await asyncio.sleep(30)
                         await self._ensure_committee_membership()
                     else:
                         logger.warning(f"Faucet request failed: {data.get('error', resp.status)}")
         except Exception as e:
             logger.warning(f"Faucet request error: {e}")
-
-    async def _ensure_gateway_registration(self):
-        """Self-register on the blob gateway so heartbeats are accepted."""
-        gateway_url = self.config.blob_base_url
-        if not gateway_url:
-            return
-        my_address = self.client.keypair.ss58_address
-        my_pubkey = "0x" + self.client.keypair.public_key.hex()
-        label = os.environ.get("OPERATOR_LABEL", f"attestor-{my_address[:8]}")
-        try:
-            async with aiohttp.ClientSession() as session:
-                # Check if already registered
-                async with session.get(
-                    f"{gateway_url}/operators/status/{my_address}",
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("registered"):
-                            logger.info(f"Already registered on gateway as {my_address}")
-                            return
-
-                # Self-register via faucet endpoint (creates registration + operator entry)
-                async with session.post(
-                    f"{gateway_url}/faucet/drip",
-                    json={"address": my_address},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    data = await resp.json()
-                    if resp.status == 200:
-                        logger.info(f"Gateway registration via faucet: {data}")
-                    elif resp.status == 409:
-                        logger.info("Already registered on gateway (409)")
-                    else:
-                        logger.warning(f"Gateway registration failed: {resp.status} {data}")
-        except Exception as e:
-            logger.warning(f"Gateway registration check failed: {e}")
 
     async def run(self):
         await self.send_discord("Daemon starting up", "info")
@@ -329,8 +299,7 @@ class CertDaemon:
 
         health_server.update_metrics(substrate_connected=True)
 
-        # Auto-register on gateway and auto-join committee
-        await self._ensure_gateway_registration()
+        # Auto-join the attestation committee if not already a member
         await self._ensure_committee_membership()
 
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
@@ -365,6 +334,13 @@ class CertDaemon:
                     self.last_processed_block = head
                     self.save_state()
                     logger.info(f"First run, starting from block {head}")
+                elif head - self.last_processed_block > 1000:
+                    # If more than 1000 blocks behind, skip ahead to near head
+                    # Historical blocks don't need re-attestation
+                    old = self.last_processed_block
+                    self.last_processed_block = head - 10
+                    self.save_state()
+                    logger.info(f"Skipping ahead: {old} -> {self.last_processed_block} (was {head - old} blocks behind)")
 
                 for block_num in range(self.last_processed_block + 1, head + 1):
                     if not self._running:
