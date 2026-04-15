@@ -301,12 +301,18 @@ class CertDaemon:
 
         # Auto-join the attestation committee if not already a member
         await self._ensure_committee_membership()
+        self._last_committee_check = time.time()
 
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
 
         while self._running:
             notifications = []  # defined outside try so adaptive sleep can see it
             try:
+                # Retry committee join every 60s if initial attempt failed
+                if time.time() - self._last_committee_check > 60:
+                    self._last_committee_check = time.time()
+                    await self._ensure_committee_membership()
+
                 # Drain push notifications from gateway
                 notifications = drain_notifications()
                 now_ts = time.time()
@@ -334,13 +340,6 @@ class CertDaemon:
                     self.last_processed_block = head
                     self.save_state()
                     logger.info(f"First run, starting from block {head}")
-                elif head - self.last_processed_block > 1000:
-                    # If more than 1000 blocks behind, skip ahead to near head
-                    # Historical blocks don't need re-attestation
-                    old = self.last_processed_block
-                    self.last_processed_block = head - 10
-                    self.save_state()
-                    logger.info(f"Skipping ahead: {old} -> {self.last_processed_block} (was {head - old} blocks behind)")
 
                 for block_num in range(self.last_processed_block + 1, head + 1):
                     if not self._running:
@@ -400,4 +399,3 @@ class CertDaemon:
             await asyncio.sleep(interval)
 
         await self.send_discord("Daemon shutting down", "info")
-# Built 20260414T165135
