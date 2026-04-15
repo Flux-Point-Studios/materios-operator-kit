@@ -37,22 +37,7 @@ class HeartbeatSender:
         self._load_seq()
 
     def _load_seq(self):
-        """Load seq counter — prefer gateway's last_seq over stale local file."""
-        # First try to get the authoritative seq from the gateway
-        try:
-            url = f"{self.config.heartbeat_url}/heartbeats/seq/{self.keypair.ss58_address}"
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                gateway_seq = resp.json().get("last_seq", 0)
-                if gateway_seq > 0:
-                    self._seq = gateway_seq
-                    self._save_seq()
-                    logger.info(f"Loaded heartbeat seq={self._seq} from gateway (authoritative)")
-                    return
-        except Exception as e:
-            logger.warning(f"Failed to query gateway for seq: {e}")
-
-        # Fallback: load from local file
+        """Load persisted seq counter for crash recovery."""
         try:
             if self._seq_file.exists():
                 data = json.loads(self._seq_file.read_text())
@@ -137,6 +122,17 @@ class HeartbeatSender:
 
             if resp.status_code == 200:
                 logger.debug(f"Heartbeat sent: seq={seq} block={best_block}")
+            elif resp.status_code == 409:
+                # Seq desync — auto-resync from gateway and retry next cycle
+                try:
+                    body = resp.json()
+                    gateway_seq = body.get("last_seq", 0)
+                    if gateway_seq > self._seq:
+                        logger.info(f"Heartbeat seq desync: local={self._seq}, gateway={gateway_seq}. Auto-resyncing.")
+                        self._seq = gateway_seq
+                except Exception:
+                    # Fallback: query the gateway seq endpoint
+                    self._load_seq()
             else:
                 logger.warning(f"Heartbeat rejected: {resp.status_code} {resp.text[:200]}")
 
