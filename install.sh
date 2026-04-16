@@ -21,16 +21,12 @@ set -euo pipefail
 # ── Constants ────────────────────────────────────────────────────────────────
 OPERATOR_DIR="$HOME/materios-operator"
 # Select image tag based on architecture
-case "$(uname -m)" in
-  arm64|aarch64) NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v109-arm64" ;;
-  *)             NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v109" ;;
-esac
+NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v3"
 DAEMON_IMAGE="ghcr.io/flux-point-studios/materios-operator-kit:latest"
 GATEWAY_URL="https://materios.fluxpointstudios.com/preprod-blobs"
-CHAIN_SPEC_URL="https://fluxpointstudios.com/materios/chain-spec-preprod-raw.json"
+CHAIN_SPEC_URL="https://materios.fluxpointstudios.com/chain-spec-v3-raw.json"
 EXPLORER_URL="https://fluxpointstudios.com/materios/explorer#committee"
-BOOTNODE="/ip4/166.70.250.197/tcp/30333/p2p/12D3KooWNjyk4sAGCVeKk2qNABVzznJSLUKaKpTETzE8kfEzVKmd"
-BOOTNODE2="/ip4/192.168.0.132/tcp/30333/p2p/12D3KooWPC1HMQGwB6c29PBeZcUkWzSR24frpfFEs6JUs96KgWNF"
+BOOTNODE="/ip4/166.70.250.197/tcp/30333/p2p/12D3KooWPueKoxRAirTTKH4Y2qQAsJDegWMjS4k89Z7izCbZKgkM"
 MIN_DISK_MB=51200   # 50 GB
 MIN_RAM_MB=1800     # ~2 GB
 
@@ -178,7 +174,7 @@ if [ -n "$CHAIN_INFO" ] && echo "$CHAIN_INFO" | python3 -c "import sys,json; jso
   ok "Chain info: genesis=${CHAIN_GENESIS_CLEAN:0:16}... spec_version=${CHAIN_SPEC_VERSION}"
 else
   warn "Could not fetch chain info from gateway. Using default genesis."
-  CHAIN_GENESIS_CLEAN="cd21697e39adaf1feed978c1ee15914ae7719b6a9aaed2e4b26cb78b1ebf3b64"
+  CHAIN_GENESIS_CLEAN="105fed4310b56550d3646a13d7a6f4b69ab82f1c1269a6c732948a2a260b1360"
 fi
 
 # Port 30333 — warn if something is already bound (validators only)
@@ -380,8 +376,6 @@ services:
       - "--validator"
       - "--bootnodes"
       - "${BOOTNODE}"
-      - "--bootnodes"
-      - "${BOOTNODE2}"
     volumes:
       - node-data:/data/materios
       - ./chain-spec-raw.json:/chain-spec/chain-spec-raw.json:ro
