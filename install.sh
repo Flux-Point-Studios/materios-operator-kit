@@ -206,14 +206,21 @@ if [ -f "$OPERATOR_DIR/docker-compose.yml" ]; then
 fi
 
 # ── Step 3: Pull Docker images ──────────────────────────────────────────────
+# Image is currently x86_64 only; Apple Silicon must pull explicitly and runs
+# under Rosetta (see `platform: linux/amd64` in the compose file below).
+PULL_PLATFORM=""
+if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
+  PULL_PLATFORM="--platform linux/amd64"
+fi
+
 if [ "$MODE" = "validator" ]; then
   info "Pulling validator node image (this may take a few minutes)..."
-  docker pull "$NODE_IMAGE" || fail "Failed to pull node image. Check Docker / internet."
+  docker pull $PULL_PLATFORM "$NODE_IMAGE" || fail "Failed to pull node image. Check Docker / internet."
   ok "Node image pulled"
 fi
 
 info "Pulling cert daemon image..."
-docker pull "$DAEMON_IMAGE" || fail "Failed to pull daemon image."
+docker pull $PULL_PLATFORM "$DAEMON_IMAGE" || fail "Failed to pull daemon image."
 ok "Daemon image pulled"
 
 # ── Step 4: Generate (or reuse) sr25519 keypair ─────────────────────────────
