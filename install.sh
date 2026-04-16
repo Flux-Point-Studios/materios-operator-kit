@@ -193,9 +193,16 @@ cd "$OPERATOR_DIR"
 if [ -f "$OPERATOR_DIR/docker-compose.yml" ]; then
   warn "Existing installation found at $OPERATOR_DIR"
   if docker compose ps --status running 2>/dev/null | grep -q materios-node; then
-    fail "Node is already running. Stop it first with: cd $OPERATOR_DIR && docker compose down"
+    info "Stopping running containers..."
+    docker compose down 2>&1 | tail -3 || true
   fi
-  warn "Overwriting configuration (existing data volumes preserved)"
+  # Wipe stale cert-daemon state (daemon-state.json holds last_processed_block from
+  # the old chain; without this, heartbeats keep reporting the dead chain's block
+  # height even after switching to a new genesis). Blobs + certs are keyed by hash
+  # so losing them is harmless — they'll be re-fetched as needed.
+  info "Clearing stale data volumes to prevent heartbeats from reporting old chain state..."
+  docker compose down -v 2>&1 | tail -3 || true
+  ok "Previous volumes cleared"
 fi
 
 # ── Step 3: Pull Docker images ──────────────────────────────────────────────
@@ -209,10 +216,39 @@ info "Pulling cert daemon image..."
 docker pull "$DAEMON_IMAGE" || fail "Failed to pull daemon image."
 ok "Daemon image pulled"
 
-# ── Step 4: Generate keypair inside throwaway container ──────────────────────
-info "Generating sr25519 keypair..."
+# ── Step 4: Generate (or reuse) sr25519 keypair ─────────────────────────────
+MNEMONIC_FILE="$OPERATOR_DIR/.secret-mnemonic"
 
-KEYGEN_OUTPUT=$(docker run --rm python:3.12-slim sh -c "
+parse_json() {
+  local field="$1"
+  echo "$KEYGEN_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['${field}'])" 2>/dev/null || \
+  echo "$KEYGEN_OUTPUT" | jq -r ".${field}" 2>/dev/null || echo ""
+}
+
+if [ -s "$MNEMONIC_FILE" ]; then
+  # Reuse existing mnemonic so re-installs preserve operator identity across chain resets.
+  info "Reusing existing mnemonic from $MNEMONIC_FILE..."
+  EXISTING_MNEMONIC=$(cat "$MNEMONIC_FILE")
+  KEYGEN_OUTPUT=$(docker run --rm -e M="$EXISTING_MNEMONIC" python:3.12-slim sh -c "
+pip install -q substrate-interface 2>/dev/null
+python3 -c \"
+import os, json
+from substrateinterface import Keypair
+keypair = Keypair.create_from_mnemonic(os.environ['M'])
+print(json.dumps({
+    'mnemonic': os.environ['M'],
+    'ss58': keypair.ss58_address,
+    'public_key': '0x' + keypair.public_key.hex()
+}))
+\"
+") || fail "Could not derive keypair from existing mnemonic."
+  MNEMONIC=$(parse_json mnemonic)
+  SS58=$(parse_json ss58)
+  PUBKEY=$(parse_json public_key)
+  ok "Keypair (reused): $SS58"
+else
+  info "Generating sr25519 keypair..."
+  KEYGEN_OUTPUT=$(docker run --rm python:3.12-slim sh -c "
 pip install -q substrate-interface mnemonic 2>/dev/null
 python3 -c \"
 from substrateinterface import Keypair
@@ -230,26 +266,17 @@ print(json.dumps({
 }))
 \"
 ") || fail "Key generation failed. Check Docker."
+  MNEMONIC=$(parse_json mnemonic)
+  SS58=$(parse_json ss58)
+  PUBKEY=$(parse_json public_key)
+  [ -z "$MNEMONIC" ] || [ -z "$SS58" ] && fail "Key generation produced empty output"
+  ok "Keypair generated: $SS58"
 
-# Parse with python3 first, fall back to jq
-parse_json() {
-  local field="$1"
-  echo "$KEYGEN_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['${field}'])" 2>/dev/null || \
-  echo "$KEYGEN_OUTPUT" | jq -r ".${field}" 2>/dev/null || echo ""
-}
-
-MNEMONIC=$(parse_json mnemonic)
-SS58=$(parse_json ss58)
-PUBKEY=$(parse_json public_key)
-
-[ -z "$MNEMONIC" ] || [ -z "$SS58" ] && fail "Key generation produced empty output"
-ok "Keypair generated: $SS58"
-
-# ── Step 5: Save mnemonic securely ──────────────────────────────────────────
-MNEMONIC_FILE="$OPERATOR_DIR/.secret-mnemonic"
-echo "$MNEMONIC" > "$MNEMONIC_FILE"
-chmod 600 "$MNEMONIC_FILE"
-ok "Mnemonic saved to $MNEMONIC_FILE (chmod 600)"
+  # ── Step 5: Save mnemonic securely ────────────────────────────────────────
+  echo "$MNEMONIC" > "$MNEMONIC_FILE"
+  chmod 600 "$MNEMONIC_FILE"
+  ok "Mnemonic saved to $MNEMONIC_FILE (chmod 600)"
+fi
 
 # ── Step 6: Register with gateway ──────────────────────────────────────────
 API_KEY=""
@@ -355,6 +382,7 @@ else
 services:
   materios-node:
     image: ${NODE_IMAGE}
+    platform: linux/amd64   # required on Apple Silicon — image is x86_64 only (runs under Rosetta)
     restart: unless-stopped
     user: "0:0"
     command:
