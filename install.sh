@@ -20,6 +20,10 @@ set -euo pipefail
 
 # ── Constants ────────────────────────────────────────────────────────────────
 OPERATOR_DIR="$HOME/materios-operator"
+# Validator mode requires access to a cardano-db-sync Postgres for the
+# mainchain-follower. Operators can override this by exporting
+# DB_SYNC_POSTGRES_CONNECTION_STRING before running the installer.
+DB_SYNC_POSTGRES_CONNECTION_STRING="${DB_SYNC_POSTGRES_CONNECTION_STRING:-}"
 # Select image tag based on architecture
 NODE_IMAGE="ghcr.io/flux-point-studios/materios-node:v3"
 DAEMON_IMAGE="ghcr.io/flux-point-studios/materios-operator-kit:latest"
@@ -80,6 +84,37 @@ fi
 
 if [ "$MODE" = "validator" ] && [ -z "$INVITE_TOKEN" ]; then
   info "No --token provided. Will use permissionless registration (faucet auto-register)."
+fi
+
+if [ "$MODE" = "validator" ] && [ -z "$DB_SYNC_POSTGRES_CONNECTION_STRING" ]; then
+  echo ""
+  echo "  ────────────────────────────────────────────────────────────────"
+  echo "  ${BOLD}Validator mode requires a cardano-db-sync Postgres endpoint.${RESET}"
+  echo "  ────────────────────────────────────────────────────────────────"
+  echo ""
+  echo "  Materios v3 validators read committee candidates and the"
+  echo "  D-parameter from Cardano preprod on-chain state via"
+  echo "  cardano-db-sync. Without this, the node crashes on startup."
+  echo ""
+  echo "  ${BOLD}Your options:${RESET}"
+  echo ""
+  echo "    1) Run your own Cardano preprod stack (cardano-node +"
+  echo "       cardano-db-sync + Postgres), then re-run the installer:"
+  echo ""
+  echo "         export DB_SYNC_POSTGRES_CONNECTION_STRING=\\"
+  echo "           'postgres://user:pass@host:5432/cexplorer'"
+  echo "         curl -sSL <install url> | bash"
+  echo ""
+  echo "       Snippet: https://github.com/Flux-Point-Studios/materios-operator-kit#db-sync"
+  echo ""
+  echo "    2) Run the lighter attestor-only mode instead (no full node,"
+  echo "       no Cardano stack required — just the cert-daemon talking"
+  echo "       to our public RPC):"
+  echo ""
+  echo "         curl -sSL <install url> | bash -s -- --mode attestor"
+  echo ""
+  echo "  ────────────────────────────────────────────────────────────────"
+  fail "Aborting. Set DB_SYNC_POSTGRES_CONNECTION_STRING or switch to --mode attestor."
 fi
 [ -z "$LABEL" ] && LABEL="$(hostname -s 2>/dev/null || echo operator)-$(date +%s | tail -c 5)"
 
@@ -225,12 +260,37 @@ ok "Daemon image pulled"
 
 # ── Step 4: Generate (or reuse) sr25519 keypair ─────────────────────────────
 MNEMONIC_FILE="$OPERATOR_DIR/.secret-mnemonic"
+OLD_COMPOSE="$OPERATOR_DIR/docker-compose.yml"
 
 parse_json() {
   local field="$1"
   echo "$KEYGEN_OUTPUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['${field}'])" 2>/dev/null || \
   echo "$KEYGEN_OUTPUT" | jq -r ".${field}" 2>/dev/null || echo ""
 }
+
+# Pre-today installers stored the mnemonic inline as SIGNER_URI in the generated
+# compose file, not in a dedicated file. If the canonical file is missing but an
+# old compose is present, extract the mnemonic from there so we preserve identity.
+if [ ! -s "$MNEMONIC_FILE" ] && [ -f "$OLD_COMPOSE" ]; then
+  RECOVERED=$(OLD_COMPOSE="$OLD_COMPOSE" python3 - <<'PY' 2>/dev/null || true
+import re, os, pathlib
+p = pathlib.Path(os.environ['OLD_COMPOSE'])
+text = p.read_text()
+m = re.search(r'SIGNER_URI:\s*"([^"]+)"', text)
+if m:
+    phrase = m.group(1).strip()
+    # sanity check: BIP39 phrases are 12/15/18/21/24 space-separated words
+    words = phrase.split()
+    if len(words) in (12, 15, 18, 21, 24):
+        print(phrase)
+PY
+)
+  if [ -n "$RECOVERED" ]; then
+    info "Recovered existing mnemonic from previous docker-compose.yml (preserving operator identity)."
+    echo "$RECOVERED" > "$MNEMONIC_FILE"
+    chmod 600 "$MNEMONIC_FILE"
+  fi
+fi
 
 if [ -s "$MNEMONIC_FILE" ]; then
   # Reuse existing mnemonic so re-installs preserve operator identity across chain resets.
@@ -252,6 +312,7 @@ print(json.dumps({
   MNEMONIC=$(parse_json mnemonic)
   SS58=$(parse_json ss58)
   PUBKEY=$(parse_json public_key)
+  PUBKEY_CLEAN="${PUBKEY#0x}"
   ok "Keypair (reused): $SS58"
 else
   info "Generating sr25519 keypair..."
@@ -276,6 +337,7 @@ print(json.dumps({
   MNEMONIC=$(parse_json mnemonic)
   SS58=$(parse_json ss58)
   PUBKEY=$(parse_json public_key)
+  PUBKEY_CLEAN="${PUBKEY#0x}"
   [ -z "$MNEMONIC" ] || [ -z "$SS58" ] && fail "Key generation produced empty output"
   ok "Keypair generated: $SS58"
 
@@ -412,6 +474,27 @@ services:
       - "--unsafe-force-node-key-generation"   # auto-generate persistent libp2p identity on first run
       - "--bootnodes"
       - "${BOOTNODE}"
+    environment:
+      # Mainchain-follower (Cardano preprod) — REQUIRED for v3 validator mode.
+      # Without a reachable cardano-db-sync Postgres, the node will crash on
+      # startup with "missing field db_sync_postgres_connection_string".
+      # Set DB_SYNC_POSTGRES_CONNECTION_STRING before running install.sh (see
+      # https://github.com/Flux-Point-Studios/materios-operator-kit#db-sync).
+      DB_SYNC_POSTGRES_CONNECTION_STRING: "${DB_SYNC_POSTGRES_CONNECTION_STRING}"
+      # Cardano preprod mainchain epoch config (Shelley genesis 2022-06-01).
+      MC__FIRST_EPOCH_TIMESTAMP_MILLIS: "1654041600000"
+      MC__EPOCH_DURATION_MILLIS: "432000000"
+      MC__FIRST_EPOCH_NUMBER: "0"
+      MC__FIRST_SLOT_NUMBER: "0"
+      CARDANO_SECURITY_PARAMETER: "2160"
+      CARDANO_ACTIVE_SLOTS_COEFF: "0.05"
+      BLOCK_STABILITY_MARGIN: "0"
+      # Operator-specific + chain-wide partner-chain identity.
+      SIDECHAIN_BLOCK_BENEFICIARY: "${PUBKEY_CLEAN}"
+      PARTNER_CHAIN_GENESIS_UTXO: "0bacdb7e50ba61a1f9e28007a4f9543fa0e8e31ce10027b2f1dda8ab3438d388#0"
+      COMMITTEE_CANDIDATE_ADDRESS: "addr_test1wzr6en3y43437qps5wscegufxw0euspmy0c3976mjm95j0cwuvezm"
+      D_PARAMETER_POLICY_ID: "0x7f57bb675447c65ba0d68270a6b9b93aecc8dfdacaa3aa8cd081f9f3"
+      PERMISSIONED_CANDIDATES_POLICY_ID: "0x70cd1c6fbbbd7b1e855f589abd842f433ec0d7b46c7a9e437194e931"
     volumes:
       - node-data:/data/materios
       - ./chain-spec-raw.json:/chain-spec/chain-spec-raw.json:ro
