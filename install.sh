@@ -409,6 +409,7 @@ services:
       - "--name"
       - "${LABEL}"
       - "--validator"
+      - "--unsafe-force-node-key-generation"   # auto-generate persistent libp2p identity on first run
       - "--bootnodes"
       - "${BOOTNODE}"
     volumes:
