@@ -240,6 +240,25 @@ if [ -f "$OPERATOR_DIR/docker-compose.yml" ]; then
   ok "Previous volumes cleared"
 fi
 
+# Catch LEGACY installs from other directories. An operator who previously ran
+# validator mode at $HOME/materios-operator and now runs attestor mode at
+# $HOME/materios-attestor (or vice-versa) would otherwise leave the old
+# materios-node / cert-daemon containers running in the background — they'll
+# keep crashing with stale config (e.g. "missing field db_sync_postgres_connection_string"
+# if the operator never set that env var on the old install). Scan all
+# containers on the host for the well-known names and stop them.
+LEGACY_CONTAINERS=$(docker ps -a --format '{{.Names}}' 2>/dev/null | \
+  grep -E '^(materios-[a-z0-9_-]+-)?(materios-node|cert-daemon)(-[0-9]+)?$' | \
+  grep -v "^$(basename "$OPERATOR_DIR")-" || true)
+if [ -n "$LEGACY_CONTAINERS" ]; then
+  warn "Found legacy Materios containers from a prior install (different directory):"
+  echo "$LEGACY_CONTAINERS" | sed 's/^/    /'
+  info "Stopping and removing them to avoid conflicting state..."
+  echo "$LEGACY_CONTAINERS" | xargs -r docker stop 2>/dev/null | sed 's/^/    stopped: /' || true
+  echo "$LEGACY_CONTAINERS" | xargs -r docker rm 2>/dev/null | sed 's/^/    removed: /' || true
+  ok "Legacy containers cleaned up"
+fi
+
 # ── Step 3: Pull Docker images ──────────────────────────────────────────────
 # Image is currently x86_64 only; Apple Silicon must pull explicitly and runs
 # under Rosetta (see `platform: linux/amd64` in the compose file below).
