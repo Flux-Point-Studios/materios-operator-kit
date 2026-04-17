@@ -209,7 +209,7 @@ if [ -n "$CHAIN_INFO" ] && echo "$CHAIN_INFO" | python3 -c "import sys,json; jso
   ok "Chain info: genesis=${CHAIN_GENESIS_CLEAN:0:16}... spec_version=${CHAIN_SPEC_VERSION}"
 else
   warn "Could not fetch chain info from gateway. Using default genesis."
-  CHAIN_GENESIS_CLEAN="105fed4310b56550d3646a13d7a6f4b69ab82f1c1269a6c732948a2a260b1360"
+  CHAIN_GENESIS_CLEAN="37a6bbe4be1a81995d9edb706cea9a7daa16f4777c85aa2fc7db107cc486dcde"
 fi
 
 # Port 30333 — warn if something is already bound (validators only)
