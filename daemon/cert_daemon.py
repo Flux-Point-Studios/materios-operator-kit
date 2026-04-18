@@ -90,6 +90,16 @@ class CertDaemon:
                 logger.warning(f"Failed to remove checkpoint state: {e}")
         self._live_chain_genesis = live
 
+        # If CHAIN_ID env was left empty (our preprod compose through 2026-04-17
+        # shipped like this), auto-populate from the live RPC so checkpoint
+        # leaves bind to the right chain. Strip 0x so bytes.fromhex accepts it.
+        if not self.config.chain_id:
+            self.config.chain_id = live.removeprefix("0x")
+            logger.info(
+                f"CHAIN_ID env was empty; auto-populated from live RPC: "
+                f"{self.config.chain_id[:16]}..."
+            )
+
     def save_state(self):
         try:
             state = {
