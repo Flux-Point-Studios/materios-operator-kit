@@ -63,12 +63,31 @@ class CertDaemon:
         on the network), wipe local state so we don't report stale
         `last_processed_block` values in heartbeats or re-process dead blocks.
         Safe to wipe — blobs+certs are hash-keyed and re-fetch on demand.
+
+        Retries the RPC a few times before giving up. If we return without a
+        `_live_chain_genesis` attribute set, the caller should re-invoke this
+        before processing any receipts (v5-reset lesson: on initial call the
+        substrate client may have connected but not yet initialized metadata,
+        causing get_genesis_hash to raise; old code silently accepted that and
+        left stale state in place, preventing self-heal).
         """
-        try:
-            live = self.client.get_genesis_hash()
-        except Exception as e:
-            logger.warning(f"Could not query live chain genesis: {e}; leaving state untouched")
-            return
+        live = None
+        for attempt in range(6):
+            try:
+                live = self.client.get_genesis_hash()
+                break
+            except Exception as e:
+                if attempt < 5:
+                    logger.info(
+                        f"RPC not ready for genesis check (attempt {attempt+1}/6): {e}; retrying in 3s"
+                    )
+                    time.sleep(3)
+                else:
+                    logger.warning(
+                        f"Could not query live chain genesis after 6 attempts: {e}; "
+                        f"state check deferred until poll loop can confirm live genesis"
+                    )
+                    return
         stored = getattr(self, "_stored_chain_genesis", "") or ""
         if stored and stored != live:
             logger.warning(
@@ -371,6 +390,14 @@ class CertDaemon:
                 if time.time() - self._last_committee_check > 60:
                     self._last_committee_check = time.time()
                     await self._ensure_committee_membership()
+
+                # If the startup genesis check deferred (RPC not ready), retry
+                # it here on every poll tick until we've confirmed live genesis.
+                # Without this, a daemon that started while substrate was still
+                # connecting (or that survived a chain reset mid-run) would
+                # process against stale `_stored_chain_genesis` forever.
+                if not getattr(self, "_live_chain_genesis", None):
+                    self.verify_chain_genesis_or_wipe()
 
                 # Drain push notifications from gateway
                 notifications = drain_notifications()
