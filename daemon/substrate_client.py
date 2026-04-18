@@ -50,6 +50,12 @@ class SubstrateClient:
         header = self.substrate.get_block_header()
         return header["header"]["number"]
 
+    def get_genesis_hash(self) -> str:
+        """Return the chain's genesis hash (0x-prefixed lowercase hex). Used to
+        detect that we're pointed at a different chain than we were last run
+        (e.g. a chain reset) and self-heal stale daemon state."""
+        return self.substrate.get_block_hash(0)
+
     def get_block_events(self, block_number: int) -> list:
         block_hash = self.substrate.get_block_hash(block_number)
         events = self.substrate.get_events(block_hash=block_hash)

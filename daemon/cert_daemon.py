@@ -46,13 +46,57 @@ class CertDaemon:
                 with open(self.config.state_file) as f:
                     state = json.load(f)
                 self.last_processed_block = state.get("last_processed_block", 0)
-                logger.info(f"Loaded state: last_processed_block={self.last_processed_block}")
+                self._stored_chain_genesis = state.get("chain_genesis", "")
+                logger.info(
+                    f"Loaded state: last_processed_block={self.last_processed_block} "
+                    f"chain_genesis={self._stored_chain_genesis[:16] or '(none)'}"
+                )
             except Exception as e:
                 logger.warning(f"Failed to load state: {e}")
+                self._stored_chain_genesis = ""
+        else:
+            self._stored_chain_genesis = ""
+
+    def verify_chain_genesis_or_wipe(self):
+        """Self-healing check: compare the chain's live genesis hash against
+        whatever we had persisted. On mismatch (typical cause: a chain reset
+        on the network), wipe local state so we don't report stale
+        `last_processed_block` values in heartbeats or re-process dead blocks.
+        Safe to wipe — blobs+certs are hash-keyed and re-fetch on demand.
+        """
+        try:
+            live = self.client.get_genesis_hash()
+        except Exception as e:
+            logger.warning(f"Could not query live chain genesis: {e}; leaving state untouched")
+            return
+        stored = getattr(self, "_stored_chain_genesis", "") or ""
+        if stored and stored != live:
+            logger.warning(
+                f"Chain genesis mismatch — stored={stored[:16]}... live={live[:16]}... "
+                f"Wiping local daemon state (last_processed_block={self.last_processed_block}) "
+                f"to avoid stale reports. Typical cause: network-wide chain reset."
+            )
+            self.last_processed_block = 0
+            # Drop any pending receipts tracked against the old chain
+            self.pending.clear()
+            self._notified_ids.clear()
+            # Also clear checkpoint state so we don't try to anchor old leaves
+            try:
+                cp_state = os.path.join(self.config.data_dir, "checkpoint-state.json")
+                if os.path.exists(cp_state):
+                    os.remove(cp_state)
+                    logger.info(f"Removed stale checkpoint state: {cp_state}")
+            except Exception as e:
+                logger.warning(f"Failed to remove checkpoint state: {e}")
+        self._live_chain_genesis = live
 
     def save_state(self):
         try:
-            state = {"last_processed_block": self.last_processed_block}
+            state = {
+                "last_processed_block": self.last_processed_block,
+                "chain_genesis": getattr(self, "_live_chain_genesis", "")
+                or getattr(self, "_stored_chain_genesis", ""),
+            }
             tmp = self.config.state_file + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(state, f)
@@ -296,6 +340,11 @@ class CertDaemon:
         if not self.client.connect():
             await self.send_discord("Failed to connect to substrate node", "critical")
             return
+
+        # Self-heal across chain resets: if the chain's genesis hash differs
+        # from what we persisted last run, wipe local state so heartbeats and
+        # poll offsets don't report the dead chain's numbers.
+        self.verify_chain_genesis_or_wipe()
 
         health_server.update_metrics(substrate_connected=True)
 
