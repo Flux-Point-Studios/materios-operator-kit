@@ -260,10 +260,12 @@ if [ -n "$LEGACY_CONTAINERS" ]; then
 fi
 
 # ── Step 3: Pull Docker images ──────────────────────────────────────────────
-# Image is currently x86_64 only; Apple Silicon must pull explicitly and runs
-# under Rosetta (see `platform: linux/amd64` in the compose file below).
+# `materios-operator-kit` is published as a multi-arch manifest (linux/amd64
+# + linux/arm64) since 2026-04-18, so Docker will pick the right arch
+# automatically. The node image (`materios-node`) is still x86_64 only —
+# only validator mode on arm64 needs the `--platform` override.
 PULL_PLATFORM=""
-if [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; then
+if [ "$MODE" = "validator" ] && { [ "$ARCH" = "arm64" ] || [ "$ARCH" = "aarch64" ]; }; then
   PULL_PLATFORM="--platform linux/amd64"
 fi
 
