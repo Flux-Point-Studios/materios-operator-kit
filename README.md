@@ -125,6 +125,27 @@ Your Machine                          FPS Infrastructure
 - **Heartbeat signatures** are publicly verifiable. Anyone can confirm your daemon is alive by checking the signature against your on-chain public key. FPS cannot forge heartbeats for you.
 - **Attestation transactions** are on-chain. Anyone can verify committee activity independently.
 
+## Running multiple attestors on one host
+
+You can run more than one independent attestor on the same machine using the
+`--install-dir` flag on `install.sh`. Each attestor gets its own install
+directory, mnemonic, Compose project, and cert-daemon container.
+
+```bash
+# First attestor (uses default ~/materios-attestor)
+bash install.sh --mode attestor --label first
+
+# Second attestor in a different directory
+bash install.sh --mode attestor --label second \
+  --install-dir ~/materios-attestor-2
+```
+
+Each `--install-dir` must be distinct from every other install on the host,
+and each install must use a different `--label`. See
+[docs/RUNNING_MULTIPLE_ATTESTORS.md](docs/RUNNING_MULTIPLE_ATTESTORS.md) for
+a full walkthrough, edge cases (health-port collision, faucet drip behaviour,
+macOS `realpath` caveat), and the manual smoke-test procedure.
+
 ## Updating
 
 Pull the latest image and restart:
@@ -132,6 +153,14 @@ Pull the latest image and restart:
 ```bash
 docker compose pull
 docker compose up -d
+```
+
+Or use the one-liner. For non-default installs, pass the same `--install-dir`
+you used at install time:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Flux-Point-Studios/materios-operator-kit/main/update.sh \
+  | bash -s -- --install-dir ~/materios-attestor-2
 ```
 
 ## Stopping

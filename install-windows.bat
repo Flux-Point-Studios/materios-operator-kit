@@ -72,18 +72,33 @@ echo.
 set /p NODE_LABEL="  Choose a name for your node: "
 if "%NODE_LABEL%"=="" set NODE_LABEL=%COMPUTERNAME%
 
+REM Ask for install dir (optional - lets operators run multiple attestors on one host)
+echo.
+echo   Install directory ^(leave blank for default^).
+echo   Only set this if you're running a SECOND attestor alongside an existing one.
+echo   Default: ~/materios-operator ^(validator^) or ~/materios-attestor ^(attestor^)
+set /p INSTALL_DIR="  Install dir: "
+
 REM Run installer in WSL
 echo.
 echo   Running installer in WSL...
 echo.
 
-wsl -e bash -c "curl -sSL https://raw.githubusercontent.com/Flux-Point-Studios/materios-operator-kit/main/install.sh | bash -s -- --mode %MODE% --label %NODE_LABEL%"
+if "%INSTALL_DIR%"=="" (
+    wsl -e bash -c "curl -sSL https://raw.githubusercontent.com/Flux-Point-Studios/materios-operator-kit/main/install.sh | bash -s -- --mode %MODE% --label %NODE_LABEL%"
+) else (
+    wsl -e bash -c "curl -sSL https://raw.githubusercontent.com/Flux-Point-Studios/materios-operator-kit/main/install.sh | bash -s -- --mode %MODE% --label %NODE_LABEL% --install-dir %INSTALL_DIR%"
+)
 
 echo.
 echo   ========================================
 echo   Installation complete!
 echo.
 echo   To check your node, open WSL and run:
-echo     cd ~/materios-operator ^&^& docker compose logs -f
+if "%INSTALL_DIR%"=="" (
+    echo     cd ~/materios-operator ^&^& docker compose logs -f
+) else (
+    echo     cd %INSTALL_DIR% ^&^& docker compose logs -f
+)
 echo.
 pause

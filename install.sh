@@ -55,23 +55,36 @@ fail()  { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 INVITE_TOKEN=""
 LABEL=""
 MODE="validator"  # "validator" (full node + daemon) or "attestor" (daemon only)
+INSTALL_DIR=""     # if unset, defaults to mode-specific ~/materios-operator or ~/materios-attestor
+INSTALL_DIR_EXPLICIT=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --token)  INVITE_TOKEN="$2"; shift 2 ;;
-    --label)  LABEL="$2"; shift 2 ;;
-    --mode)   MODE="$2"; shift 2 ;;
+    --token)        INVITE_TOKEN="$2"; shift 2 ;;
+    --label)        LABEL="$2"; shift 2 ;;
+    --mode)         MODE="$2"; shift 2 ;;
+    --install-dir)  INSTALL_DIR="$2"; INSTALL_DIR_EXPLICIT=true; shift 2 ;;
     --help|-h)
-      echo "Usage: install.sh [--mode validator|attestor] [--token <INVITE_TOKEN>] [--label <NAME>]"
-      echo ""
-      echo "  --mode    'validator' (default) or 'attestor'"
-      echo "  --token   Invite token (required for validator, not needed for attestor)"
-      echo "  --label   Friendly name for your node (optional, defaults to hostname)"
-      echo ""
-      echo "Validator mode: Full node + cert daemon. Requires invite token."
-      echo "  Requirements: 2+ vCPU, 2+ GB RAM, 50+ GB SSD, port 30333 open."
-      echo ""
-      echo "Attestor mode: Cert daemon only. No approval needed."
-      echo "  Requirements: 1 vCPU, 512 MB RAM, 1 GB disk, outbound only."
+      cat <<'HELP'
+Usage: install.sh [--mode validator|attestor] [--token <INVITE_TOKEN>] [--label <NAME>] [--install-dir <PATH>]
+
+  --mode         'validator' (default) or 'attestor'
+  --token        Invite token (required for validator, not needed for attestor)
+  --label        Friendly name for your node (optional, defaults to hostname)
+  --install-dir  Where to install (default: ~/materios-operator for validator,
+                 ~/materios-attestor for attestor). Use different paths to run
+                 multiple independent attestors on the same host.
+                 Accepts absolute paths, ~/foo, or ./foo (resolved to absolute).
+                 Example:
+                   bash install.sh --mode attestor --label first
+                   bash install.sh --mode attestor --label second \
+                                   --install-dir ~/materios-attestor-2
+
+Validator mode: Full node + cert daemon. Requires invite token.
+  Requirements: 2+ vCPU, 2+ GB RAM, 50+ GB SSD, port 30333 open.
+
+Attestor mode: Cert daemon only. No approval needed.
+  Requirements: 1 vCPU, 512 MB RAM, 1 GB disk, outbound only.
+HELP
       exit 0
       ;;
     *) fail "Unknown argument: $1. Use --help for usage." ;;
@@ -118,10 +131,49 @@ if [ "$MODE" = "validator" ] && [ -z "$DB_SYNC_POSTGRES_CONNECTION_STRING" ]; th
 fi
 [ -z "$LABEL" ] && LABEL="$(hostname -s 2>/dev/null || echo operator)-$(date +%s | tail -c 5)"
 
-# Operator directory varies by mode
-if [ "$MODE" = "attestor" ]; then
+# Operator directory varies by mode (unless explicitly overridden via --install-dir)
+if [ -n "$INSTALL_DIR" ]; then
+  # Expand ~ → $HOME manually (bash does not expand ~ from non-literal values).
+  # Note: ${d#~/} doesn't work because parameter-expansion patterns also apply
+  # tilde-expansion, which returns $HOME/foo instead of foo. Use substring
+  # slicing (${d:2}) to strip the literal "~/" prefix.
+  case "$INSTALL_DIR" in
+    "~")     INSTALL_DIR="$HOME" ;;
+    "~/"*)   INSTALL_DIR="$HOME/${INSTALL_DIR:2}" ;;
+  esac
+  # Resolve to absolute path portably (GNU coreutils, BSD realpath, or python3 fallback).
+  # We cannot assume `realpath` behaves the same on macOS, and we cannot assume the
+  # target exists yet (mkdir -p runs below), so we resolve with --canonicalize-missing /
+  # os.path.abspath semantics — which give a lexical absolute path without requiring
+  # the dir to exist.
+  if command -v realpath >/dev/null 2>&1 && realpath --help 2>&1 | grep -q canonicalize-missing; then
+    INSTALL_DIR=$(realpath --canonicalize-missing "$INSTALL_DIR")
+  elif command -v python3 >/dev/null 2>&1; then
+    INSTALL_DIR=$(INSTALL_DIR="$INSTALL_DIR" python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(os.environ["INSTALL_DIR"])))')
+  else
+    # Last-resort: if it's not absolute, prepend $PWD
+    case "$INSTALL_DIR" in
+      /*) : ;;
+      *)  INSTALL_DIR="$PWD/$INSTALL_DIR" ;;
+    esac
+  fi
+  OPERATOR_DIR="$INSTALL_DIR"
+elif [ "$MODE" = "attestor" ]; then
   OPERATOR_DIR="$HOME/materios-attestor"
 fi
+
+# Derive a sanitized docker-compose project name from the install dir basename,
+# so two independent installs (e.g. ~/materios-attestor and ~/materios-attestor-2)
+# produce non-colliding container names like `materios-attestor-cert-daemon-1` vs
+# `materios-attestor-2-cert-daemon-1`. Compose's default (derived from CWD basename)
+# is the same value in the common case — setting it explicitly lets us rely on it.
+COMPOSE_PROJECT_NAME=$(basename "$OPERATOR_DIR" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_-]/-/g')
+# Compose rejects project names that don't start with a lowercase letter/number.
+case "$COMPOSE_PROJECT_NAME" in
+  [a-z0-9]*) : ;;
+  *) COMPOSE_PROJECT_NAME="m-$COMPOSE_PROJECT_NAME" ;;
+esac
+export COMPOSE_PROJECT_NAME
 
 # ── Banner ───────────────────────────────────────────────────────────────────
 echo ""
@@ -227,6 +279,27 @@ cd "$OPERATOR_DIR"
 # Check for existing installation
 if [ -f "$OPERATOR_DIR/docker-compose.yml" ]; then
   warn "Existing installation found at $OPERATOR_DIR"
+  # If the operator explicitly passed --install-dir, they probably meant a *new*
+  # install but accidentally pointed at an existing one (e.g. running the
+  # installer twice with the same --install-dir). Wiping cert progress in that
+  # case would silently lose work, so give them a chance to bail out.
+  if [ "$INSTALL_DIR_EXPLICIT" = true ]; then
+    warn "You passed --install-dir $OPERATOR_DIR, but it already has an install."
+    warn "Continuing will stop the running containers and WIPE cert-daemon data"
+    warn "(blobs, certs, daemon-state.json). Your mnemonic + api-key will be"
+    warn "reused from the existing files so the operator identity is preserved."
+    warn "If you meant to create a second independent attestor, pick a different"
+    warn "--install-dir (see docs/RUNNING_MULTIPLE_ATTESTORS.md)."
+    if [ -t 0 ]; then
+      read -r -p "  Proceed with reinstall into $OPERATOR_DIR? [y/N] " REPLY
+      case "$REPLY" in
+        y|Y|yes|YES) : ;;
+        *) fail "Aborted by user. No changes made." ;;
+      esac
+    else
+      info "Non-interactive shell — proceeding (set INSTALL_DIR_CONFIRM=1 to suppress this notice)."
+    fi
+  fi
   if docker compose ps --status running 2>/dev/null | grep -q materios-node; then
     info "Stopping running containers..."
     docker compose down 2>&1 | tail -3 || true
@@ -247,16 +320,26 @@ fi
 # keep crashing with stale config (e.g. "missing field db_sync_postgres_connection_string"
 # if the operator never set that env var on the old install). Scan all
 # containers on the host for the well-known names and stop them.
-LEGACY_CONTAINERS=$(docker ps -a --format '{{.Names}}' 2>/dev/null | \
-  grep -E '^(materios-[a-z0-9_-]+-)?(materios-node|cert-daemon)(-[0-9]+)?$' | \
-  grep -v "^$(basename "$OPERATOR_DIR")-" || true)
-if [ -n "$LEGACY_CONTAINERS" ]; then
-  warn "Found legacy Materios containers from a prior install (different directory):"
-  echo "$LEGACY_CONTAINERS" | sed 's/^/    /'
-  info "Stopping and removing them to avoid conflicting state..."
-  echo "$LEGACY_CONTAINERS" | xargs -r docker stop 2>/dev/null | sed 's/^/    stopped: /' || true
-  echo "$LEGACY_CONTAINERS" | xargs -r docker rm 2>/dev/null | sed 's/^/    removed: /' || true
-  ok "Legacy containers cleaned up"
+#
+# IMPORTANT: this cleanup is destructive to other installs' containers, so we
+# skip it when --install-dir was passed explicitly — in that case the operator
+# has opted in to running multiple parallel attestors on the same host, and
+# stopping their first install when they run the installer for the second
+# would clobber cert progress. See docs/RUNNING_MULTIPLE_ATTESTORS.md.
+if [ "$INSTALL_DIR_EXPLICIT" = false ]; then
+  LEGACY_CONTAINERS=$(docker ps -a --format '{{.Names}}' 2>/dev/null | \
+    grep -E '^(materios-[a-z0-9_-]+-)?(materios-node|cert-daemon)(-[0-9]+)?$' | \
+    grep -v "^${COMPOSE_PROJECT_NAME}-" || true)
+  if [ -n "$LEGACY_CONTAINERS" ]; then
+    warn "Found legacy Materios containers from a prior install (different directory):"
+    echo "$LEGACY_CONTAINERS" | sed 's/^/    /'
+    info "Stopping and removing them to avoid conflicting state..."
+    echo "$LEGACY_CONTAINERS" | xargs -r docker stop 2>/dev/null | sed 's/^/    stopped: /' || true
+    echo "$LEGACY_CONTAINERS" | xargs -r docker rm 2>/dev/null | sed 's/^/    removed: /' || true
+    ok "Legacy containers cleaned up"
+  fi
+else
+  info "--install-dir explicit: skipping legacy-container cleanup so other parallel installs keep running"
 fi
 
 # ── Step 3: Pull Docker images ──────────────────────────────────────────────
@@ -420,7 +503,11 @@ if [ "$MODE" = "attestor" ]; then
 ## Operator: ${LABEL}
 ## SS58: ${SS58}
 ## Mode: attestor
+## Install Dir: ${OPERATOR_DIR}
+## Compose Project: ${COMPOSE_PROJECT_NAME}
 ## Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+name: ${COMPOSE_PROJECT_NAME}
 
 services:
   cert-daemon:
@@ -467,7 +554,11 @@ else
 ## Materios Validator + Cert Daemon — Auto-generated by install.sh
 ## Operator: ${LABEL}
 ## SS58: ${SS58}
+## Install Dir: ${OPERATOR_DIR}
+## Compose Project: ${COMPOSE_PROJECT_NAME}
 ## Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+name: ${COMPOSE_PROJECT_NAME}
 
 services:
   materios-node:
@@ -802,6 +893,8 @@ echo ""
 echo -e "  ${BOLD}SS58 Address${RESET}   : ${SS58}"
 echo -e "  ${BOLD}Label${RESET}          : ${LABEL}"
 echo -e "  ${BOLD}Mode${RESET}           : ${MODE}"
+echo -e "  ${BOLD}Install Dir${RESET}    : ${OPERATOR_DIR}"
+echo -e "  ${BOLD}Compose Project${RESET}: ${COMPOSE_PROJECT_NAME}"
 if [ -n "$SESSION_KEYS" ] && [ ${#SESSION_KEYS} -eq 130 ]; then
 echo -e "  ${BOLD}Session Keys${RESET}   : ${SESSION_KEYS:0:18}...${SESSION_KEYS:126:4}"
 fi
