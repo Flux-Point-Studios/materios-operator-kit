@@ -3,9 +3,10 @@
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/Flux-Point-Studios/materios-operator-kit/main/update.sh | bash
+#   curl -sSL .../update.sh | bash -s -- --install-dir ~/materios-attestor-2
 #
 # What this does:
-#   1. Detects your install (validator or attestor)
+#   1. Detects your install (validator or attestor) — honours --install-dir first
 #   2. Pulls latest Docker images
 #   3. Checks for chain fork (genesis mismatch)
 #   4. If fork detected: downloads new chain spec, wipes chain data, keeps keystore
@@ -13,6 +14,26 @@
 #   6. Regenerates session keys if needed (validators only)
 #
 set -euo pipefail
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+CLI_INSTALL_DIR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --install-dir) CLI_INSTALL_DIR="$2"; shift 2 ;;
+    --help|-h)
+      cat <<'HELP'
+Usage: update.sh [--install-dir <PATH>]
+
+  --install-dir  Path to the install to update. If omitted, auto-detects
+                 ~/materios-operator or ~/materios-attestor (the default
+                 install locations). Only needed for operators who ran
+                 install.sh with a custom --install-dir.
+HELP
+      exit 0
+      ;;
+    *) echo "Unknown argument: $1. Use --help." >&2; exit 1 ;;
+  esac
+done
 
 # ── Constants ────────────────────────────────────────────────────────────────
 GATEWAY_URL="https://materios.fluxpointstudios.com/blobs"
@@ -32,7 +53,27 @@ fail()  { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
 # ── Detect install ───────────────────────────────────────────────────────────
 OPERATOR_DIR=""
 MODE=""
-if [ -f "$HOME/materios-operator/docker-compose.yml" ]; then
+if [ -n "$CLI_INSTALL_DIR" ]; then
+  # Expand ~ and resolve to absolute path
+  case "$CLI_INSTALL_DIR" in
+    "~")   CLI_INSTALL_DIR="$HOME" ;;
+    "~/"*) CLI_INSTALL_DIR="$HOME/${CLI_INSTALL_DIR:2}" ;;
+  esac
+  if command -v realpath >/dev/null 2>&1 && realpath --help 2>&1 | grep -q canonicalize-missing; then
+    CLI_INSTALL_DIR=$(realpath --canonicalize-missing "$CLI_INSTALL_DIR")
+  elif command -v python3 >/dev/null 2>&1; then
+    CLI_INSTALL_DIR=$(INSTALL_DIR="$CLI_INSTALL_DIR" python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(os.environ["INSTALL_DIR"])))')
+  fi
+  if [ ! -f "$CLI_INSTALL_DIR/docker-compose.yml" ]; then
+    fail "No Materios installation found at $CLI_INSTALL_DIR (expected docker-compose.yml)"
+  fi
+  OPERATOR_DIR="$CLI_INSTALL_DIR"
+  if grep -q "materios-node" "$OPERATOR_DIR/docker-compose.yml" 2>/dev/null; then
+    MODE="validator"
+  else
+    MODE="attestor"
+  fi
+elif [ -f "$HOME/materios-operator/docker-compose.yml" ]; then
   OPERATOR_DIR="$HOME/materios-operator"
   if grep -q "materios-node" "$OPERATOR_DIR/docker-compose.yml" 2>/dev/null; then
     MODE="validator"
@@ -43,7 +84,7 @@ elif [ -f "$HOME/materios-attestor/docker-compose.yml" ]; then
   OPERATOR_DIR="$HOME/materios-attestor"
   MODE="attestor"
 else
-  fail "No Materios installation found at ~/materios-operator or ~/materios-attestor"
+  fail "No Materios installation found at ~/materios-operator or ~/materios-attestor. If you used install.sh --install-dir, pass --install-dir <path> to update.sh too."
 fi
 
 echo ""
@@ -118,6 +159,16 @@ fi
 if [ "$NEEDS_RESET" = true ]; then
   info "Applying chain fork reset..."
 
+  # Derive compose project name from the install dir basename so volume lookups
+  # below only touch THIS install's volumes (critical when the host has multiple
+  # independent attestors — see docs/RUNNING_MULTIPLE_ATTESTORS.md).
+  COMPOSE_PROJECT_NAME=$(basename "$OPERATOR_DIR" | tr 'A-Z' 'a-z' | sed 's/[^a-z0-9_-]/-/g')
+  case "$COMPOSE_PROJECT_NAME" in
+    [a-z0-9]*) : ;;
+    *) COMPOSE_PROJECT_NAME="m-$COMPOSE_PROJECT_NAME" ;;
+  esac
+  export COMPOSE_PROJECT_NAME
+
   # Stop services
   docker compose down 2>/dev/null
 
@@ -140,13 +191,15 @@ if [ "$NEEDS_RESET" = true ]; then
       ok "Compose file updated for chain spec"
     fi
 
-    # Wipe chain data (keep keystore)
+    # Wipe chain data (keep keystore) — scope to this install's volume only
     info "Wiping chain data (keystore preserved)..."
-    NODE_VOLUME=$(docker volume ls --format '{{.Name}}' | grep "node-data" | head -1)
+    NODE_VOLUME=$(docker volume ls --format '{{.Name}}' | grep "^${COMPOSE_PROJECT_NAME}_node-data$" | head -1)
+    # Fallback for older installs that predate the explicit project-name scheme.
+    [ -z "$NODE_VOLUME" ] && NODE_VOLUME=$(docker volume ls --format '{{.Name}}' | grep "node-data" | head -1)
     if [ -n "$NODE_VOLUME" ]; then
       docker run --rm -v "$NODE_VOLUME:/data" busybox sh -c \
         "rm -rf /data/materios/chains/*/db /data/materios/chains/*/network && echo WIPED"
-      ok "Chain data wiped"
+      ok "Chain data wiped ($NODE_VOLUME)"
     else
       warn "Could not find node-data volume. You may need to wipe manually."
     fi
@@ -161,12 +214,14 @@ if [ "$NEEDS_RESET" = true ]; then
     fi
   fi
 
-  # Wipe cert daemon state
-  DAEMON_VOLUME=$(docker volume ls --format '{{.Name}}' | grep "cert-daemon" | head -1)
+  # Wipe cert daemon state — scope to this install's volume only
+  DAEMON_VOLUME=$(docker volume ls --format '{{.Name}}' | grep "^${COMPOSE_PROJECT_NAME}_cert-daemon-data$" | head -1)
+  # Fallback for older installs that predate the explicit project-name scheme.
+  [ -z "$DAEMON_VOLUME" ] && DAEMON_VOLUME=$(docker volume ls --format '{{.Name}}' | grep "cert-daemon" | head -1)
   if [ -n "$DAEMON_VOLUME" ]; then
     docker run --rm -v "$DAEMON_VOLUME:/data" busybox sh -c \
       "rm -f /data/daemon-state.json && echo DAEMON_STATE_CLEARED"
-    ok "Cert daemon state cleared"
+    ok "Cert daemon state cleared ($DAEMON_VOLUME)"
   fi
 
   echo ""
