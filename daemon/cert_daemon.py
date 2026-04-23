@@ -452,23 +452,6 @@ class CertDaemon:
         except Exception as e:
             logger.warning(f"Committee membership check failed: {e}")
 
-
-def _is_insufficient_bond_error(error) -> bool:
-    """Detect the InsufficientBond dispatch error in whatever form
-    substrate-interface hands us (dict, str, SCALE-decoded enum).
-    """
-    if error is None:
-        return False
-    if isinstance(error, dict):
-        if error.get("name") == "InsufficientBond":
-            return True
-        # Nested {"Module": {"error": "InsufficientBond", ...}} form.
-        for v in error.values():
-            if _is_insufficient_bond_error(v):
-                return True
-        return False
-    return "InsufficientBond" in str(error)
-
     async def _request_faucet_drip(self, address: str):
         """Request a MATRA airdrop from the gateway faucet to pay for join_committee."""
         gateway_url = self.config.blob_base_url
@@ -615,3 +598,26 @@ def _is_insufficient_bond_error(error) -> bool:
             await asyncio.sleep(interval)
 
         await self.send_discord("Daemon shutting down", "info")
+
+
+def _is_insufficient_bond_error(error) -> bool:
+    """Detect the InsufficientBond dispatch error in whatever form
+    substrate-interface hands us (dict, str, SCALE-decoded enum).
+
+    Module-level helper deliberately placed after the class so the class body
+    stays intact — the prior placement nested `_request_faucet_drip` and `run`
+    inside this helper (indentation pitfall), which would crash the daemon at
+    runtime even though pytest mocks didn't catch it. See the
+    `test_class_methods_intact` regression test.
+    """
+    if error is None:
+        return False
+    if isinstance(error, dict):
+        if error.get("name") == "InsufficientBond":
+            return True
+        # Nested {"Module": {"error": "InsufficientBond", ...}} form.
+        for v in error.values():
+            if _is_insufficient_bond_error(v):
+                return True
+        return False
+    return "InsufficientBond" in str(error)

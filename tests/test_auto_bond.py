@@ -22,6 +22,27 @@ from daemon.cert_daemon import CertDaemon
 from daemon.config import DaemonConfig
 
 
+# --- regression: class-body integrity --------------------------------------
+# A prior revision of this PR accidentally de-classed `run` and
+# `_request_faucet_drip` by placing `_is_insufficient_bond_error` mid-class
+# at column 0 — Python kept parsing subsequent `    async def` blocks as
+# nested defs inside the helper, silently turning two class methods into
+# unreachable closures. Mocked unit tests didn't catch it because they
+# never exercise `run` or `_request_faucet_drip`. This assertion does.
+
+
+def test_class_methods_intact():
+    """Guard against indentation drift that would nest class methods inside
+    an unrelated module-level helper."""
+    for name in ("run", "_request_faucet_drip", "_ensure_bond",
+                 "_ensure_committee_membership", "process_receipt"):
+        assert callable(getattr(CertDaemon, name, None)), (
+            f"CertDaemon.{name} missing — likely an indentation bug "
+            f"nested it inside a module-level function. Check that "
+            f"`_is_insufficient_bond_error` lives AFTER the class body."
+        )
+
+
 # --- helpers ---------------------------------------------------------------
 
 
