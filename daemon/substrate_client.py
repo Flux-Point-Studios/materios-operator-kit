@@ -56,6 +56,78 @@ class SubstrateClient:
         (e.g. a chain reset) and self-heal stale daemon state."""
         return self.substrate.get_block_hash(0)
 
+    # --- Bond helpers (OrinqReceipts pallet) --------------------------------
+    # These are used by CertDaemon._ensure_bond() to keep the attestor's
+    # reserved MATRA at or above `BondRequirement` so `join_committee` doesn't
+    # fail with `InsufficientBond`. See README → "Auto-bond on startup".
+
+    def get_bond_requirement(self) -> int:
+        """Return `OrinqReceipts.BondRequirement` in MATRA base units (u128).
+
+        Returns 0 when the storage item is absent (pre-runtime-upgrade chains)
+        so `_ensure_bond()` falls through to its "nothing to do" branch.
+        """
+        result = self.substrate.query("OrinqReceipts", "BondRequirement")
+        val = result.value
+        if val is None:
+            return 0
+        return int(val)
+
+    def get_attestor_bond(self, address: str) -> int:
+        """Return `OrinqReceipts.AttestorBonds(address)` in base units.
+
+        Maps to 0 for accounts that have never bonded (the storage value is
+        `ValueQuery` so the runtime returns 0 in that case; we defensively
+        handle a missing value anyway).
+        """
+        result = self.substrate.query("OrinqReceipts", "AttestorBonds", [address])
+        val = result.value
+        if val is None:
+            return 0
+        return int(val)
+
+    def get_free_balance(self, address: str) -> int:
+        """Return `System.Account(address).data.free` in base units.
+
+        Returns 0 if the account row does not exist (never received MATRA).
+        """
+        result = self.substrate.query("System", "Account", [address])
+        val = result.value
+        if val is None:
+            return 0
+        # substrate-interface decodes this as a dict {"nonce": .., "data": {..}}
+        try:
+            return int(val["data"]["free"])
+        except (KeyError, TypeError):
+            return 0
+
+    def submit_bond(self, amount: int) -> tuple[bool, Optional[str]]:
+        """Submit `OrinqReceipts.bond(amount)` as a signed extrinsic.
+
+        Returns `(True, tx_hash_hex)` on successful inclusion, `(False, None)`
+        otherwise. Raises on unrecoverable exceptions — callers should wrap in
+        try/except to avoid killing daemon startup on transient RPC errors.
+        """
+        call = self.substrate.compose_call(
+            call_module="OrinqReceipts",
+            call_function="bond",
+            call_params={"amount": amount},
+        )
+        extrinsic = self.substrate.create_signed_extrinsic(
+            call=call,
+            keypair=self.keypair,
+        )
+        receipt = self.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
+        if receipt.is_success:
+            logger.info(
+                f"Bond of {amount} base units posted successfully, "
+                f"block {receipt.block_hash}"
+            )
+            return True, getattr(receipt, "extrinsic_hash", None) or str(receipt.block_hash)
+        else:
+            logger.error(f"bond({amount}) failed: {receipt.error_message}")
+            return False, None
+
     def get_block_events(self, block_number: int) -> list:
         block_hash = self.substrate.get_block_hash(block_number)
         events = self.substrate.get_events(block_hash=block_hash)
