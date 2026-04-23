@@ -289,8 +289,94 @@ class CertDaemon:
         for rid in to_remove:
             self.pending.pop(rid, None)
 
+    async def _ensure_bond(self):
+        """Ensure the daemon's signer has `AttestorBonds[addr] >= BondRequirement`.
+
+        Called on startup (before the first `join_committee` attempt) and as a
+        defensive fallback if a later `join_committee` dispatch still reports
+        `InsufficientBond` (e.g. governance raised the requirement after we
+        last bonded).
+
+        Idempotent:
+          - `current_bond >= required` → skip (logs "already bonded ...")
+          - `required == 0` → skip (preprod bootstrap / upgrade grace window)
+          - `free_matra < delta` → warn (with faucet URL hint) and return;
+            does NOT submit a tx, does NOT crash. Daemon still tries to join.
+          - Otherwise → submit `bond(required - current)` and log the tx hash.
+        """
+        try:
+            my_address = self.client.keypair.ss58_address
+            required = self.client.get_bond_requirement()
+            if required == 0:
+                logger.info("OrinqReceipts.BondRequirement is 0, skipping auto-bond")
+                return
+
+            current = self.client.get_attestor_bond(my_address)
+            if current >= required:
+                logger.info(
+                    f"already bonded {current} / {required} MATRA base units, "
+                    f"skipping auto-bond"
+                )
+                return
+
+            delta = required - current
+            free = self.client.get_free_balance(my_address)
+            if free < delta:
+                # Not enough free MATRA to cover the bond delta. Warn clearly
+                # and continue — the join_committee attempt that follows will
+                # fail with InsufficientBond, but that's expected and loud.
+                logger.warning(
+                    f"Insufficient free MATRA to auto-bond: need {delta} more "
+                    f"base units (have {free}). Request more MATRA from the "
+                    f"faucet at {self.config.blob_base_url or '<blob-gateway>'}"
+                    f"/faucet/drip and restart the daemon, or wait for an "
+                    f"automatic faucet drip. Continuing anyway so the operator "
+                    f"can see the join_committee error in the logs."
+                )
+                await self.send_discord(
+                    f"Auto-bond skipped for `{my_address[:16]}...`: need "
+                    f"{delta} more MATRA base units, have {free}",
+                    "warning",
+                )
+                return
+
+            logger.info(
+                f"Auto-bonding {delta} base units to reach BondRequirement "
+                f"({current} + {delta} = {required})"
+            )
+            try:
+                success, tx_hash = self.client.submit_bond(delta)
+            except Exception as e:
+                # Defensive: never let a transient RPC glitch kill startup.
+                logger.warning(f"Auto-bond submit raised {type(e).__name__}: {e}")
+                return
+
+            if success:
+                logger.info(f"Auto-bond submitted successfully, tx {tx_hash}")
+                await self.send_discord(
+                    f"Auto-bonded {delta} MATRA base units "
+                    f"(`{my_address[:16]}...`)",
+                    "info",
+                )
+            else:
+                logger.warning(
+                    "Auto-bond submit returned failure; continuing to "
+                    "join_committee anyway so the error surfaces."
+                )
+        except Exception as e:
+            # Top-level safety net — never crash daemon startup on bond errors.
+            logger.warning(f"_ensure_bond failed with {type(e).__name__}: {e}")
+
     async def _ensure_committee_membership(self):
-        """Check if this daemon's signer is in the attestation committee. If not, join."""
+        """Check if this daemon's signer is in the attestation committee. If not, join.
+
+        Before the first join attempt we call `_ensure_bond()` to satisfy the
+        `BondRequirement` (introduced when Component 8 of the v5.1 tokenomics
+        landed). If the chain still reports `InsufficientBond` after the
+        initial bond (e.g. governance raised the floor mid-flight), we re-run
+        `_ensure_bond()` and retry the join exactly ONCE more — never an
+        infinite loop on the same failure mode.
+        """
         try:
             my_address = self.client.keypair.ss58_address
             committee = self.client.substrate.query("OrinqReceipts", "CommitteeMembers")
@@ -314,30 +400,74 @@ class CertDaemon:
                 logger.info(f"Already in attestation committee as {my_address}")
                 return
 
-            logger.info(f"Not in committee — calling join_committee as {my_address}")
-            call = self.client.substrate.compose_call(
-                call_module="OrinqReceipts",
-                call_function="join_committee",
-                call_params={},
-            )
-            extrinsic = self.client.substrate.create_signed_extrinsic(
-                call=call,
-                keypair=self.client.keypair,
-            )
-            receipt = self.client.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
+            # Ensure bond meets BondRequirement before attempting join. This
+            # handles the first-time onboarding case where the attestor has
+            # MATRA but has never called bond().
+            await self._ensure_bond()
 
-            if receipt.is_success:
-                logger.info(f"Successfully joined attestation committee!")
-                await self.send_discord(f"Joined attestation committee as `{my_address[:16]}...`", "info")
-            else:
+            logger.info(f"Not in committee — calling join_committee as {my_address}")
+
+            bond_retry_used = False
+            for attempt in range(2):  # at most: original attempt + 1 bond-fallback
+                call = self.client.substrate.compose_call(
+                    call_module="OrinqReceipts",
+                    call_function="join_committee",
+                    call_params={},
+                )
+                extrinsic = self.client.substrate.create_signed_extrinsic(
+                    call=call,
+                    keypair=self.client.keypair,
+                )
+                receipt = self.client.substrate.submit_extrinsic(
+                    extrinsic, wait_for_inclusion=True
+                )
+
+                if receipt.is_success:
+                    logger.info(f"Successfully joined attestation committee!")
+                    await self.send_discord(
+                        f"Joined attestation committee as `{my_address[:16]}...`", "info"
+                    )
+                    return
+
                 error = receipt.error_message or "unknown error"
                 logger.warning(f"join_committee failed: {error}")
-                # Common failure: can't pay fees (no MOTRA). Request faucet drip.
+
+                # Defensive re-bond path: if the chain says InsufficientBond
+                # after we already ran _ensure_bond, governance likely raised
+                # the floor. Re-run once and retry. Never loop beyond this.
+                if _is_insufficient_bond_error(error) and not bond_retry_used:
+                    bond_retry_used = True
+                    logger.info(
+                        "join_committee returned InsufficientBond — re-running "
+                        "auto-bond once and retrying."
+                    )
+                    await self._ensure_bond()
+                    continue
+
+                # Common non-bond failure: can't pay fees (no MOTRA).
                 if "pay" in str(error).lower() or "fee" in str(error).lower():
                     await self._request_faucet_drip(my_address)
+                return  # any other failure: bail, poll loop will retry later
 
         except Exception as e:
             logger.warning(f"Committee membership check failed: {e}")
+
+
+def _is_insufficient_bond_error(error) -> bool:
+    """Detect the InsufficientBond dispatch error in whatever form
+    substrate-interface hands us (dict, str, SCALE-decoded enum).
+    """
+    if error is None:
+        return False
+    if isinstance(error, dict):
+        if error.get("name") == "InsufficientBond":
+            return True
+        # Nested {"Module": {"error": "InsufficientBond", ...}} form.
+        for v in error.values():
+            if _is_insufficient_bond_error(v):
+                return True
+        return False
+    return "InsufficientBond" in str(error)
 
     async def _request_faucet_drip(self, address: str):
         """Request a MATRA airdrop from the gateway faucet to pay for join_committee."""

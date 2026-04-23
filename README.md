@@ -41,6 +41,8 @@ This prints three values:
 
 > **No registration required.** The daemon automatically joins the attestation committee on startup by submitting a `join_committee` extrinsic. If your account doesn't have enough MATRA to pay the transaction fee, the daemon auto-requests a faucet drip first.
 >
+> **Auto-bond is also handled for you.** The `OrinqReceipts` pallet enforces a `BondRequirement` (currently **1,000 MATRA** on preprod — subject to governance). Before the first `join_committee` call, the daemon reserves the required amount by submitting `bond(delta)` on your behalf. Already-bonded operators are detected and skipped, so restarts never double-bond. See [Auto-bond behaviour](#auto-bond-behaviour) below for the full contract and the single warning case an operator might see.
+>
 > **Optional:** Send your SS58 address and public key hex to the FPS team if you want higher gateway rate limits or a provisioned API key. This is not required to participate.
 
 Edit `docker-compose.yml` and fill in the required fields:
@@ -124,6 +126,60 @@ Your Machine                          FPS Infrastructure
 - **API keys** are optional for all operations. Your on-chain identity comes from your sr25519 key. Heartbeats and blob uploads are authenticated by sr25519 signature. API keys provide higher rate limits when provisioned.
 - **Heartbeat signatures** are publicly verifiable. Anyone can confirm your daemon is alive by checking the signature against your on-chain public key. FPS cannot forge heartbeats for you.
 - **Attestation transactions** are on-chain. Anyone can verify committee activity independently.
+
+## Auto-bond behaviour
+
+Committee members are required to reserve a bond under the `OrinqReceipts`
+pallet before they can be admitted. The chain stores this floor in the
+`BondRequirement` storage item (currently **1,000 MATRA = 1,000,000,000 base
+units** at 6 decimals on preprod; mainnet value will be set by governance).
+Without a sufficient bond, `join_committee` fails with `InsufficientBond` and
+the daemon would loop retry forever, burning MOTRA on each attempt.
+
+**The daemon handles this automatically.** On every startup (and once more as
+a defensive fallback if a later `join_committee` still returns
+`InsufficientBond`, e.g. because governance raised the floor), the daemon:
+
+1. Queries `OrinqReceipts.BondRequirement` → `required`.
+2. Queries `OrinqReceipts.AttestorBonds(<your-address>)` → `current`.
+3. If `current >= required`, logs `already bonded {current} / {required}
+   MATRA base units, skipping auto-bond` and continues to `join_committee`.
+4. Otherwise, queries `System.Account(<your-address>).data.free` and submits
+   `OrinqReceipts.bond(required - current)`, waiting for inclusion and
+   logging the tx hash.
+
+This is idempotent: restarting the daemon after a successful bond is a no-op.
+
+### What you'll see if your MATRA is short
+
+If your free balance is below the gap (`required - current`), the daemon
+logs a WARNING like:
+
+```
+WARNING Insufficient free MATRA to auto-bond: need 1000000000 more base
+units (have 250000000). Request more MATRA from the faucet at
+https://materios.fluxpointstudios.com/blobs/faucet/drip and restart the
+daemon, or wait for an automatic faucet drip. Continuing anyway so the
+operator can see the join_committee error in the logs.
+```
+
+It **does not crash** — the daemon still attempts `join_committee` so the
+upstream failure is visible, and a Discord warning (if configured) is posted.
+You should either:
+
+- Hit the faucet at `https://materios.fluxpointstudios.com/blobs/faucet/drip`
+  with `{"address": "<your-ss58>"}` and restart the daemon, or
+- Ask the FPS team in Discord; the standard operator drip is 1,000 MATRA.
+
+Once your balance is topped up, the next startup (or next retry of
+`_ensure_committee_membership` on the 60s loop) will post the bond cleanly.
+
+### Fees
+
+The `bond` extrinsic is signed by your attestor keypair and fees are paid in
+MOTRA (not MATRA — the two-token split is documented in `docs/`). No extra
+configuration is required: the same signer used for every other extrinsic
+covers the bond too.
 
 ## Running multiple attestors on one host
 
@@ -266,6 +322,7 @@ Monitor the overall committee health (all members, not just yours). Reads the **
 |---------|-------|-----|
 | `docker compose pull` fails with 401 | GHCR image not accessible | Make sure you can reach `ghcr.io`. If using a firewall, allow outbound HTTPS to `ghcr.io` |
 | Heartbeat not appearing on explorer | Daemon hasn't joined committee yet | Check logs for `join_committee` success; if faucet drip failed, retry or ask FPS team |
+| `join_committee` fails with `InsufficientBond` | Free MATRA below `BondRequirement` gap | Daemon auto-bonds on startup. If the warning says `Insufficient free MATRA to auto-bond`, request a faucet drip and restart. See [Auto-bond behaviour](#auto-bond-behaviour). |
 | `substrate_connected: false` in status | Can't reach RPC endpoint | Check that `wss://materios.fluxpointstudios.com/rpc` is reachable from your network |
 | High finality gap (>10) | Chain-wide issue, not your daemon | Check the explorer dashboard — if all validators show high gap, it's a chain stall |
 | `No locator found` in logs | Blob not yet uploaded for a receipt | Normal during brief windows — daemon retries automatically |
