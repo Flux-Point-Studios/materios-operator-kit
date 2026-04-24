@@ -35,7 +35,8 @@ def test_class_methods_intact():
     """Guard against indentation drift that would nest class methods inside
     an unrelated module-level helper."""
     for name in ("run", "_request_faucet_drip", "_ensure_bond",
-                 "_ensure_committee_membership", "process_receipt"):
+                 "_ensure_committee_membership", "process_receipt",
+                 "_process_block_range", "_clamp_cursor_past_pruned"):
         assert callable(getattr(CertDaemon, name, None)), (
             f"CertDaemon.{name} missing — likely an indentation bug "
             f"nested it inside a module-level function. Check that "

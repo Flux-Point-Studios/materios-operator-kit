@@ -20,6 +20,68 @@ from daemon.health_server import drain_notifications
 
 logger = logging.getLogger(__name__)
 
+
+def _default_fallback_window() -> int:
+    """Read CERT_DAEMON_PRUNED_FALLBACK_WINDOW once at import time.
+
+    Defaults to 256 — roughly matching substrate's default state-pruning
+    distance. If an operator runs a node with a deeper pruning window (or
+    an archive node), they can bump this via env so the self-heal clamps
+    further back and processes more historical events before giving up.
+    """
+    try:
+        return max(0, int(os.environ.get("CERT_DAEMON_PRUNED_FALLBACK_WINDOW", "256")))
+    except ValueError:
+        return 256
+
+
+# Module-level so tests can monkeypatch without spinning up the whole daemon.
+FALLBACK_WINDOW: int = _default_fallback_window()
+
+# Cap on clamp iterations per single poll tick. Prevents an unbounded
+# clamp-retry loop if the fallback window is itself behind pruning (very deep
+# pruning, chain tip jumping faster than we can poll, etc.) — at the cap we
+# break out of the tick and let the next tick recompute head from scratch.
+MAX_CLAMPS_PER_TICK: int = 5
+
+
+def _is_pruned_state_error(exc) -> bool:
+    """Detect the substrate "state pruned" error in whatever form the client
+    raises it. Checks both the RPC error code (4003) and the message string
+    ("State already discarded") for robustness across substrate-interface
+    versions. Accepts any exception or nested dict/list payload.
+    """
+    if exc is None:
+        return False
+    # Unwrap SubstrateRequestException / similar that stash the JSON-RPC
+    # error dict on `args[0]`.
+    for arg in getattr(exc, "args", ()):
+        if _is_pruned_state_error_payload(arg):
+            return True
+    return _is_pruned_state_error_payload(str(exc))
+
+
+def _is_pruned_state_error_payload(payload) -> bool:
+    if payload is None:
+        return False
+    if isinstance(payload, dict):
+        if payload.get("code") == 4003:
+            return True
+        msg = payload.get("message")
+        if isinstance(msg, str) and "State already discarded" in msg:
+            return True
+        # Recurse into nested error envelopes.
+        for v in payload.values():
+            if _is_pruned_state_error_payload(v):
+                return True
+        return False
+    if isinstance(payload, (list, tuple)):
+        return any(_is_pruned_state_error_payload(item) for item in payload)
+    if isinstance(payload, str):
+        return "State already discarded" in payload or "'code': 4003" in payload
+    return False
+
+
 class CertDaemon:
     def __init__(self, config: DaemonConfig):
         self.config = config
@@ -36,6 +98,10 @@ class CertDaemon:
         self.last_processed_block: int = 0
         self._running = True
         self._notified_ids: dict[str, float] = {}  # receipt_id -> timestamp for dedupe
+        # Tracks pruned-block numbers we've already warned about in the
+        # current tick so we log the self-heal message ONCE per stuck block,
+        # not on every retry. Cleared at the top of each poll tick.
+        self._pruned_warned_blocks: set[int] = set()
 
     def stop(self):
         self._running = False
@@ -132,6 +198,95 @@ class CertDaemon:
             os.replace(tmp, self.config.state_file)
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
+
+    async def _process_block_range(self, head: int):
+        """Process every block in `(last_processed_block, head]`, self-healing
+        past `State already discarded` (RPC 4003) errors from the node's
+        pruning window.
+
+        Design:
+          - Each block's RPC calls are wrapped in a try/except. A 4003 from
+            ANY call in the block (event fetch, certified-event fetch) is
+            treated as "cursor is past pruning" and triggers a clamp.
+          - After a clamp, we re-enter the outer loop with the new cursor.
+            If the clamped cursor is ALSO past pruning, we clamp again, up
+            to `MAX_CLAMPS_PER_TICK` — then bail and let the next tick
+            recompute `head` from scratch.
+          - Non-4003 exceptions propagate to the poll loop's outer try/except
+            so reconnection logic still fires.
+
+        Broken out of `run()` so the self-heal behavior is unit-testable
+        without spinning up the full daemon lifecycle.
+        """
+        clamps_this_tick = 0
+        processed_all = False
+        while not processed_all and clamps_this_tick < MAX_CLAMPS_PER_TICK:
+            processed_all = True  # set False if we clamp and need to retry
+            for block_num in range(self.last_processed_block + 1, head + 1):
+                if not self._running:
+                    return
+                try:
+                    events = self.client.get_block_events(block_num)
+                    for event in events:
+                        await self.process_receipt(event["receipt_id"])
+                    self.last_processed_block = block_num
+                    health_server.increment_metric("blocks_processed_total")
+
+                    # Scan for AvailabilityCertified events for checkpointing
+                    if self.config.checkpoint_enabled:
+                        certified = self.client.get_block_certified_events(block_num)
+                        for cert_event in certified:
+                            cert_hash_bytes = bytes.fromhex(cert_event["cert_hash"].removeprefix("0x"))
+                            self.checkpointer.add_cert(cert_event["receipt_id"], cert_hash_bytes, block_num)
+
+                    self.save_state()
+                except Exception as per_block_exc:
+                    if _is_pruned_state_error(per_block_exc):
+                        self._clamp_cursor_past_pruned(block_num, head)
+                        clamps_this_tick += 1
+                        processed_all = False
+                        break
+                    # Non-pruned error — re-raise to the poll loop's outer
+                    # try/except so the existing reconnect path fires.
+                    raise
+
+    def _clamp_cursor_past_pruned(self, stuck_block: int, head: int) -> int:
+        """Advance `last_processed_block` past the node's state-pruning window
+        when we hit a `State already discarded` (RPC code 4003) error.
+
+        Crashloop context: if a validator was restarted (runtime upgrade,
+        chain reset recovery, OOM kill) while the cert-daemon held an old
+        `last_processed_block`, the node will have since pruned state for
+        that block. Every poll tick then re-requests the same pruned block,
+        gets a 4003, reconnects, and loops forever. Manual rescue used to be
+        `docker exec ... rm -f daemon-state.json && docker restart ...` —
+        this method makes the daemon self-heal instead.
+
+        Behavior:
+          - Advance cursor to `max(current, head - FALLBACK_WINDOW)` so we
+            never move backward.
+          - Clamp to `0` if `head < FALLBACK_WINDOW` (very new chain).
+          - Log a single INFO warning per stuck block per tick (dedupe via
+            `self._pruned_warned_blocks`).
+          - Persist state so a crash before the next tick doesn't reintroduce
+            the same stuck cursor.
+
+        Returns the new `last_processed_block` so the caller can break out
+        of its inner block-range loop and let the next tick pick up from
+        the clamped cursor.
+        """
+        new_cursor = max(self.last_processed_block, head - FALLBACK_WINDOW)
+        if new_cursor < 0:
+            new_cursor = 0
+        if stuck_block not in self._pruned_warned_blocks:
+            self._pruned_warned_blocks.add(stuck_block)
+            logger.info(
+                f"pruned cursor at block {stuck_block} — clamping forward to "
+                f"head-{FALLBACK_WINDOW} (head={head}, new_cursor={new_cursor})"
+            )
+        self.last_processed_block = new_cursor
+        self.save_state()
+        return new_cursor
 
     async def send_discord(self, message: str, level: str = "info"):
         if not self.config.discord_webhook_url:
@@ -540,23 +695,18 @@ class CertDaemon:
                     self.save_state()
                     logger.info(f"First run, starting from block {head}")
 
-                for block_num in range(self.last_processed_block + 1, head + 1):
-                    if not self._running:
-                        break
-                    events = self.client.get_block_events(block_num)
-                    for event in events:
-                        await self.process_receipt(event["receipt_id"])
-                    self.last_processed_block = block_num
-                    health_server.increment_metric("blocks_processed_total")
+                # Reset per-tick dedupe set so we warn once per stuck block
+                # per tick, not once ever (a clamp that advances past one
+                # pruned block should still warn if a LATER block is also
+                # pruned on a future tick).
+                self._pruned_warned_blocks.clear()
 
-                    # Scan for AvailabilityCertified events for checkpointing
-                    if self.config.checkpoint_enabled:
-                        certified = self.client.get_block_certified_events(block_num)
-                        for cert_event in certified:
-                            cert_hash_bytes = bytes.fromhex(cert_event["cert_hash"].removeprefix("0x"))
-                            self.checkpointer.add_cert(cert_event["receipt_id"], cert_hash_bytes, block_num)
-
-                    self.save_state()
+                # Process outstanding blocks through `_process_block_range`,
+                # which wraps each block's RPC calls in a try/except so a
+                # `State already discarded` error from the node's pruning
+                # window triggers a self-heal clamp instead of an infinite
+                # retry loop.
+                await self._process_block_range(head)
 
                 # Retry pending receipts
                 await self.retry_pending()
