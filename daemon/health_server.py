@@ -42,6 +42,10 @@ _metrics = {
     "substrate_connected": False,
     "finalized_head": 0,
     "finality_gap": 0,
+    # Pending-receipt eviction (task #180)
+    "evicted_synthetic_total": 0,
+    "evicted_ttl_total": 0,
+    "evicted_failure_cap_total": 0,
 }
 _metrics_lock = threading.Lock()
 
@@ -160,6 +164,9 @@ class HealthHandler(BaseHTTPRequestHandler):
             "lastPollTimestamp": snapshot.get("last_poll_timestamp", 0),
             "connected": snapshot.get("substrate_connected", False),
             "finalityGap": snapshot.get("finality_gap", 0),
+            "evictedSynthetic": snapshot.get("evicted_synthetic_total", 0),
+            "evictedTtl": snapshot.get("evicted_ttl_total", 0),
+            "evictedFailureCap": snapshot.get("evicted_failure_cap_total", 0),
         }
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

@@ -49,6 +49,10 @@ class DaemonConfig:
     # Heartbeat
     heartbeat_url: str = ""  # HEARTBEAT_URL — empty = disabled
     heartbeat_interval: int = 30  # HEARTBEAT_INTERVAL, seconds
+    # Pending-receipt residue eviction (task #180)
+    pending_max_age_seconds: int = 6 * 3600  # PENDING_MAX_AGE_SECONDS — 0 = disabled
+    pending_max_failures: int = 60           # PENDING_MAX_FAILURES — 0 = disabled
+    prune_synthetic_pattern: bool = True     # PRUNE_SYNTHETIC_PATTERN
 
     @classmethod
     def from_env(cls) -> "DaemonConfig":
@@ -95,4 +99,7 @@ class DaemonConfig:
             schema_registry_path=os.environ.get("SCHEMA_REGISTRY_PATH", cls.schema_registry_path),
             heartbeat_url=os.environ.get("HEARTBEAT_URL", cls.heartbeat_url),
             heartbeat_interval=int(os.environ.get("HEARTBEAT_INTERVAL", cls.heartbeat_interval)),
+            pending_max_age_seconds=int(os.environ.get("PENDING_MAX_AGE_SECONDS", cls.pending_max_age_seconds)),
+            pending_max_failures=int(os.environ.get("PENDING_MAX_FAILURES", cls.pending_max_failures)),
+            prune_synthetic_pattern=os.environ.get("PRUNE_SYNTHETIC_PATTERN", "true").lower() in ("true", "1", "yes"),
         )
