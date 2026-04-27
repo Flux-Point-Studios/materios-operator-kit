@@ -21,6 +21,34 @@ from daemon.health_server import drain_notifications
 logger = logging.getLogger(__name__)
 
 
+# Minimum verification level required to attest a receipt on-chain.
+#
+# Set to ROOT_VERIFIED (3) — the verifier MUST have computed the Merkle
+# root from the fetched chunks AND confirmed it matches `base_root_sha256`
+# on the receipt. Anything below that is insufficient evidence:
+#
+#   FETCHED (1)        — chunks downloaded but no integrity check
+#   HASH_VERIFIED (2)  — each chunk's SHA-256 matches the manifest's
+#                        declared hash, but the manifest is supplied by
+#                        the (potentially malicious) blob-gateway. A
+#                        malicious gateway can serve any (data, declared
+#                        hash) pair that's internally consistent but
+#                        unrelated to the on-chain commitment.
+#   ROOT_VERIFIED (3)  — `merkle_root(chunk_hashes) == receipt.base_root_sha256`,
+#                        the only level that proves the data corresponds to
+#                        the on-chain commitment.
+#
+# Bug fixed by task #184: the gate previously accepted HASH_VERIFIED, so a
+# Merkle-root mismatch (already logged as CRITICAL by the verifier) still
+# resulted in `cert_store.save()` + `submit_availability_cert()`. The cert
+# body itself (post PR #5) is purely a hash of on-chain fields, so the
+# off-chain pre-attestation gate is the ONLY mechanism stopping a wrong-
+# content blob from getting an availability cert. That gate MUST require
+# ROOT_VERIFIED. See `tests/test_blob_verifier_merkle_gate.py` for the
+# live evidence + repro.
+MIN_ATTESTATION_LEVEL_TO_ATTEST: AttestationLevel = AttestationLevel.ROOT_VERIFIED
+
+
 def _default_fallback_window() -> int:
     """Read CERT_DAEMON_PRUNED_FALLBACK_WINDOW once at import time.
 
@@ -362,11 +390,23 @@ class CertDaemon:
             f"chunks={verification.chunks_verified}/{verification.chunks_total}"
         )
 
-        if verification.attestation_level < AttestationLevel.HASH_VERIFIED:
-            logger.warning(f"Verification failed for {receipt_id}: {verification.errors}")
+        if verification.attestation_level < MIN_ATTESTATION_LEVEL_TO_ATTEST:
+            # Hard reject. Includes the Merkle-root mismatch case
+            # (level=HASH_VERIFIED but blob_verifier already logged CRITICAL),
+            # the chunk-hash mismatch case, and the unfetchable-chunk case.
+            # In all three the data does NOT match the on-chain commitment,
+            # so we MUST NOT save the cert or submit an availability tx.
+            logger.error(
+                f"Verification REJECTED for {receipt_id}: "
+                f"level={verification.attestation_level.name} "
+                f"(need {MIN_ATTESTATION_LEVEL_TO_ATTEST.name}); "
+                f"errors={verification.errors}"
+            )
             health_server.increment_metric("verification_failures_total")
             await self.send_discord(
-                f"Verification failed for `{receipt_id[:16]}...`: {verification.errors[0] if verification.errors else 'unknown'}",
+                f"Verification rejected for `{receipt_id[:16]}...` "
+                f"(level={verification.attestation_level.name}): "
+                f"{verification.errors[0] if verification.errors else 'unknown'}",
                 "warning",
             )
             return
