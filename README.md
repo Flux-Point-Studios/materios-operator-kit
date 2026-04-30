@@ -55,6 +55,8 @@ LOCATOR_REGISTRY_API_KEY: ""    # optional — reads are public, not required
 
 > **Note**: API keys are optional. Your sr25519 signature authenticates heartbeats and blob uploads. API keys provide higher rate limits but are not required for any operation.
 
+> **Heartbeat is required for explorer visibility.** The daemon only starts the heartbeat sender thread when `HEARTBEAT_URL` is set (see `daemon/main.py`). The shipped `docker-compose.yml` already configures `HEARTBEAT_URL: "https://materios.fluxpointstudios.com/preprod-blobs"` and `HEARTBEAT_INTERVAL: "30"` — leave them as-is. **Without `HEARTBEAT_URL` the daemon attests but never reports liveness — explorer will show "No heartbeat" forever.** If you copy the compose snippet into a custom file or onboarding paste, make sure both vars come along; the preprod path is `/preprod-blobs`, not `/blobs`.
+
 ### Step 4: Start the daemon
 
 ```bash
