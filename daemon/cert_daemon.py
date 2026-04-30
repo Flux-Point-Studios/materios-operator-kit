@@ -17,6 +17,7 @@ from daemon.checkpoint import CardanoCheckpointer
 from daemon.content_validator import ContentValidator
 from daemon import health_server
 from daemon.health_server import drain_notifications
+from daemon.eviction import EvictionConfig, evict_pending, is_synthetic_hash
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,8 @@ class CertDaemon:
         # current tick so we log the self-heal message ONCE per stuck block,
         # not on every retry. Cleared at the top of each poll tick.
         self._pruned_warned_blocks: set[int] = set()
+        # Eviction totals — surfaced in /status (task #180)
+        self._eviction_totals = {"synthetic": 0, "ttl": 0, "failure_cap": 0}
 
     def stop(self):
         self._running = False
@@ -370,6 +373,17 @@ class CertDaemon:
             logger.info(f"Cert already stored for {receipt_id}, skipping")
             return
 
+        # Drop obviously-synthetic receipt-ids (stress-test residue) before
+        # they ever enter the pending set. Real receipt ids are SHA-256 of
+        # content; the test harness uses repeating-stride filler bytes.
+        # Task #180.
+        if self.config.prune_synthetic_pattern and is_synthetic_hash(receipt_id):
+            logger.warning(
+                f"Skipping synthetic-pattern receipt {receipt_id[:16]}... (stress residue)"
+            )
+            self._eviction_totals["synthetic"] += 1
+            return
+
         # Resolve blob locations (try receipt_id first, then content_hash fallback)
         content_hash_hex = receipt.content_hash.hex() if isinstance(receipt.content_hash, bytes) else str(receipt.content_hash)
         manifest = await self.locator.resolve(receipt_id, content_hash=content_hash_hex)
@@ -466,10 +480,17 @@ class CertDaemon:
         now = time.time()
         to_remove = []
         for receipt_id, pending in list(self.pending.items()):
+            # Skip entries we'll evict in the post-pass — avoids a useless
+            # locator HTTP call per stress-residue entry. Big win: 71k
+            # synthetic entries used to each generate one failed connect
+            # per loop; now they cost only the eviction pass. Task #180.
+            if self.config.prune_synthetic_pattern and is_synthetic_hash(receipt_id):
+                continue
             content_hash_hex = pending.receipt.content_hash.hex() if isinstance(pending.receipt.content_hash, bytes) else str(pending.receipt.content_hash)
             manifest = await self.locator.resolve(receipt_id, content_hash=content_hash_hex)
             if manifest is None:
                 pending.retries += 1
+                pending.failure_count += 1
                 if now - pending.first_seen > self.config.pending_alert_seconds and pending.retries % 60 == 0:
                     await self.send_discord(
                         f"Receipt `{receipt_id[:16]}...` pending for {int((now - pending.first_seen) / 60)}min, no locator found",
@@ -477,12 +498,37 @@ class CertDaemon:
                     )
                 continue
 
-            # Found locator — process it
+            # Found locator — reset failure counter and process
+            pending.failure_count = 0
             await self.process_receipt(receipt_id)
             to_remove.append(receipt_id)
 
         for rid in to_remove:
             self.pending.pop(rid, None)
+
+        # Eviction pass — drops synthetic / TTL-expired / failure-capped
+        # entries. Task #180.
+        cfg = EvictionConfig(
+            max_age_seconds=self.config.pending_max_age_seconds,
+            max_failures=self.config.pending_max_failures,
+            prune_synthetic=self.config.prune_synthetic_pattern,
+        )
+        stats = evict_pending(self.pending, now=now, cfg=cfg)
+        if stats.total > 0:
+            self._eviction_totals["synthetic"] += stats.evicted_synthetic
+            self._eviction_totals["ttl"] += stats.evicted_ttl
+            self._eviction_totals["failure_cap"] += stats.evicted_failure_cap
+            logger.info(
+                f"Evicted {stats.total} pending receipts "
+                f"(synthetic={stats.evicted_synthetic}, ttl={stats.evicted_ttl}, "
+                f"failure_cap={stats.evicted_failure_cap}); "
+                f"{len(self.pending)} remain"
+            )
+            health_server.update_metrics(
+                evicted_synthetic_total=self._eviction_totals["synthetic"],
+                evicted_ttl_total=self._eviction_totals["ttl"],
+                evicted_failure_cap_total=self._eviction_totals["failure_cap"],
+            )
 
     async def _ensure_bond(self):
         """Ensure the daemon's signer has `AttestorBonds[addr] >= BondRequirement`.

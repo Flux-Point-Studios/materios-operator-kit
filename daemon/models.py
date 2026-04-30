@@ -59,3 +59,4 @@ class PendingReceipt:
     first_seen: float  # time.time()
     retries: int = 0
     last_error: str = ""
+    failure_count: int = 0  # consecutive locator-lookup failures (task #180 eviction)
