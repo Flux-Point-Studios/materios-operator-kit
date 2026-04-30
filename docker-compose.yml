@@ -31,7 +31,11 @@ services:
       MATERIOS_RPC_URL: "wss://materios.fluxpointstudios.com/rpc"
       BLOB_GATEWAY_URL: "https://materios.fluxpointstudios.com/blobs"
       LOCATOR_REGISTRY_URL: "https://materios.fluxpointstudios.com/blobs"
-      HEARTBEAT_URL: "https://materios.fluxpointstudios.com/blobs"
+      ## HEARTBEAT_URL is REQUIRED — without it the daemon attests fine but
+      ## never reports liveness, so the explorer shows "No heartbeat" forever
+      ## and the gateway can't tell you're online. Preprod uses /preprod-blobs
+      ## (mainnet path is /blobs).
+      HEARTBEAT_URL: "https://materios.fluxpointstudios.com/preprod-blobs"
       HEARTBEAT_INTERVAL: "30"
 
       ## ─── External daemons do NOT checkpoint to Cardano L1 ──────────
