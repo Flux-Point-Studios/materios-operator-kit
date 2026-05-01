@@ -37,6 +37,10 @@ services:
       ## (mainnet path is /blobs).
       HEARTBEAT_URL: "https://materios.fluxpointstudios.com/preprod-blobs"
       HEARTBEAT_INTERVAL: "30"
+      # Cardano Ogmios HTTP /health for cert epoch metadata.
+      # Public default is fine for external operators. If running on the
+      # Flux Point LAN, override to http://192.168.0.133:1337 for lower latency.
+      OGMIOS_URL: "https://ogmios.saturnswap.io"
 
       ## ─── External daemons do NOT checkpoint to Cardano L1 ──────────
       CHECKPOINT_ENABLED: "false"

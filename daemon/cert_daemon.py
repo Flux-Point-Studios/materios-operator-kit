@@ -130,6 +130,12 @@ class CertDaemon:
         # current tick so we log the self-heal message ONCE per stuck block,
         # not on every retry. Cleared at the top of each poll tick.
         self._pruned_warned_blocks: set[int] = set()
+        # Ogmios reachability state — used to log a WARNING only on the
+        # transition reachable->unreachable (and an INFO on recovery), rather
+        # than once per poll cycle. Per task-185: stale k8s DNS default was
+        # firing the warning every 12s on all 4 daemons.
+        # None = unknown (boot), True = reachable, False = unreachable.
+        self._ogmios_reachable: Optional[bool] = None
 
     def stop(self):
         self._running = False
@@ -332,7 +338,17 @@ class CertDaemon:
             logger.warning(f"Discord notification failed: {e}")
 
     def get_cardano_epoch(self) -> int:
-        """Get current Cardano epoch from Ogmios /health endpoint."""
+        """Get current Cardano epoch from Ogmios /health endpoint.
+
+        Returns 0 on any failure (NXDOMAIN, refused, timeout, malformed JSON,
+        non-200, missing fields). The caller treats 0 as "unknown" and the
+        cert builder accepts it.
+
+        Per task-185: warnings are rate-limited to state TRANSITIONS only
+        (reachable->unreachable, or vice versa). The previous implementation
+        logged once per poll cycle, polluting logs every 12s when the default
+        k8s DNS name failed to resolve.
+        """
         try:
             import requests as _requests
             resp = _requests.get(
@@ -341,6 +357,12 @@ class CertDaemon:
                 timeout=5,
             )
             data = resp.json()
+            # Mark reachable; log recovery if we were previously unreachable.
+            if self._ogmios_reachable is False:
+                logger.info(
+                    f"Ogmios reachable again at {self.config.ogmios_url}"
+                )
+            self._ogmios_reachable = True
             epoch = data.get("currentEpoch")
             if epoch is not None:
                 return int(epoch)
@@ -351,7 +373,16 @@ class CertDaemon:
                 return slot // 432000  # preprod epoch length
             return 0
         except Exception as e:
-            logger.warning(f"Failed to get Cardano epoch from Ogmios: {e}")
+            # Only log on the transition from reachable (or unknown) ->
+            # unreachable. Subsequent failures stay silent until recovery.
+            if self._ogmios_reachable is not False:
+                logger.warning(
+                    f"Failed to get Cardano epoch from Ogmios "
+                    f"({self.config.ogmios_url}): {e}. Will retry silently "
+                    f"until reachable. Set OGMIOS_URL env to override the "
+                    f"default endpoint."
+                )
+            self._ogmios_reachable = False
             return 0
 
     async def process_receipt(self, receipt_id: str):

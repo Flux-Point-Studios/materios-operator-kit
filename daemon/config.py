@@ -5,7 +5,15 @@ from dataclasses import dataclass
 @dataclass
 class DaemonConfig:
     rpc_url: str = "ws://materios-rpc.materios.svc.cluster.local:9944"
-    ogmios_url: str = "http://materios-ogmios.materios.svc.cluster.local:1337"
+    # OGMIOS_URL — Cardano Ogmios HTTP /health endpoint used to fetch the
+    # current Cardano epoch for cert metadata. Default points at the LAN
+    # Cardano stack on Node-3 (preprod). Set OGMIOS_URL to override.
+    # Public WAN fallback: https://ogmios.saturnswap.io (note: WS-leaning;
+    # the /health HTTP route is reachable but the public path has known wedge
+    # issues for long-running clients — prefer LAN).
+    # The k8s in-cluster name `materios-ogmios.materios.svc.cluster.local`
+    # was removed in task-185 (NXDOMAIN on the bare-metal cluster).
+    ogmios_url: str = "http://192.168.0.133:1337"
     poll_interval: int = 12  # seconds
     signer_uri: str = "//Alice"
     chain_id: str = ""  # Materios genesis hash, set via CHAIN_ID env
