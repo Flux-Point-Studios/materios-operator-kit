@@ -130,6 +130,45 @@ class CertDaemon:
         # current tick so we log the self-heal message ONCE per stuck block,
         # not on every retry. Cleared at the top of each poll tick.
         self._pruned_warned_blocks: set[int] = set()
+        # Concurrency primitives for parallelized per-receipt processing
+        # (task #120). Lazy-initialized on first use because asyncio.Lock /
+        # asyncio.Semaphore must be constructed under a running event loop
+        # in older Python versions, and `__init__` may run before the loop
+        # is alive. See `_ensure_concurrency_primitives()`.
+        #
+        #   _chain_write_lock — serializes the on-chain submit step so the
+        #     extrinsic nonce stays monotonic. Without this, two parallel
+        #     submits would both fetch the same `accountNextIndex` and the
+        #     second would die with "Priority too low" (per
+        #     `feedback_polkadot_nonce_race_on_burst.md`).
+        #   _pending_lock — guards `self.pending` against concurrent
+        #     mutation across receipt-processing coroutines. Without this,
+        #     two coroutines that both fail locator-resolution would race
+        #     on the same dict key.
+        #   _concurrency_sem — bounds the number of in-flight
+        #     `process_receipt` coroutines per block to
+        #     `config.max_concurrent_receipts` (default 8). Prevents
+        #     unbounded fan-out that would hammer the blob gateway.
+        self._chain_write_lock: Optional[asyncio.Lock] = None
+        self._pending_lock: Optional[asyncio.Lock] = None
+        self._concurrency_sem: Optional[asyncio.Semaphore] = None
+
+    def _ensure_concurrency_primitives(self):
+        """Lazy-init asyncio Lock / Semaphore inside the running event loop.
+
+        Idempotent — only constructs if the field is still None. Called from
+        `_process_block_range` and `process_receipt`'s pending-mutation paths
+        so callers from any entry point (poll loop, push notification,
+        retry_pending) all share the same primitives.
+        """
+        if self._chain_write_lock is None:
+            self._chain_write_lock = asyncio.Lock()
+        if self._pending_lock is None:
+            self._pending_lock = asyncio.Lock()
+        if self._concurrency_sem is None:
+            self._concurrency_sem = asyncio.Semaphore(
+                max(1, self.config.max_concurrent_receipts)
+            )
 
     def stop(self):
         self._running = False
@@ -236,16 +275,30 @@ class CertDaemon:
           - Each block's RPC calls are wrapped in a try/except. A 4003 from
             ANY call in the block (event fetch, certified-event fetch) is
             treated as "cursor is past pruning" and triggers a clamp.
+          - Receipts WITHIN a block are processed concurrently via a bounded
+            `asyncio.gather` (cap = `config.max_concurrent_receipts`, default
+            8) so HTTP-bound prep (locator + blob fetch + Merkle) overlaps.
+            Per-receipt failures are isolated — `return_exceptions=True` keeps
+            the rest of the batch progressing instead of cancelling siblings.
+          - The on-chain submit step inside `process_receipt` is serialized
+            by a chain-write lock so the extrinsic nonce stays monotonic
+            (per `feedback_polkadot_nonce_race_on_burst.md`).
+          - Block-level completion remains SEQUENTIAL — block N+1 is only
+            entered after every receipt in block N completes (success or
+            error). This keeps the cursor-advance contract: once
+            `last_processed_block = N`, every receipt in (prior, N] has been
+            seen exactly once.
           - After a clamp, we re-enter the outer loop with the new cursor.
             If the clamped cursor is ALSO past pruning, we clamp again, up
             to `MAX_CLAMPS_PER_TICK` — then bail and let the next tick
             recompute `head` from scratch.
-          - Non-4003 exceptions propagate to the poll loop's outer try/except
-            so reconnection logic still fires.
+          - Non-4003 exceptions on the per-block RPC propagate to the poll
+            loop's outer try/except so reconnection logic still fires.
 
         Broken out of `run()` so the self-heal behavior is unit-testable
         without spinning up the full daemon lifecycle.
         """
+        self._ensure_concurrency_primitives()
         clamps_this_tick = 0
         processed_all = False
         while not processed_all and clamps_this_tick < MAX_CLAMPS_PER_TICK:
@@ -255,8 +308,22 @@ class CertDaemon:
                     return
                 try:
                     events = self.client.get_block_events(block_num)
-                    for event in events:
-                        await self.process_receipt(event["receipt_id"])
+                    if events:
+                        # Bounded-concurrency batch of per-receipt coroutines.
+                        # `return_exceptions=True` ensures one failed receipt
+                        # (gateway 500, blob verify error, content rejection,
+                        # transient RPC glitch) does not cancel the others.
+                        results = await asyncio.gather(
+                            *(self._process_receipt_bounded(e["receipt_id"]) for e in events),
+                            return_exceptions=True,
+                        )
+                        for ev, res in zip(events, results):
+                            if isinstance(res, BaseException):
+                                logger.warning(
+                                    f"process_receipt failed for "
+                                    f"{ev['receipt_id'][:16]}... in block {block_num}: "
+                                    f"{type(res).__name__}: {res}"
+                                )
                     self.last_processed_block = block_num
                     health_server.increment_metric("blocks_processed_total")
 
@@ -277,6 +344,21 @@ class CertDaemon:
                     # Non-pruned error — re-raise to the poll loop's outer
                     # try/except so the existing reconnect path fires.
                     raise
+
+    async def _process_receipt_bounded(self, receipt_id: str):
+        """Run `process_receipt` under the per-block concurrency semaphore.
+
+        Acquiring the semaphore here (rather than inside `process_receipt`)
+        keeps the bound applied ONLY to the parallel-batch entrypoint —
+        callers from `retry_pending` and the push-notification path stay
+        single-threaded against `self.pending` and don't need to compete for
+        a slot. The shared chain-write lock and pending lock still apply
+        in `process_receipt` regardless of caller, so nonce / dict-mutation
+        safety is preserved across all entry points.
+        """
+        assert self._concurrency_sem is not None  # set by _ensure_concurrency_primitives
+        async with self._concurrency_sem:
+            return await self.process_receipt(receipt_id)
 
     def _clamp_cursor_past_pruned(self, stuck_block: int, head: int) -> int:
         """Advance `last_processed_block` past the node's state-pruning window
@@ -355,6 +437,10 @@ class CertDaemon:
             return 0
 
     async def process_receipt(self, receipt_id: str):
+        # Concurrency primitives are required for the pending / chain-write
+        # locks below regardless of which entrypoint called us (parallel
+        # batch, push notification, retry_pending). Idempotent.
+        self._ensure_concurrency_primitives()
         receipt = self.client.get_receipt(receipt_id)
         if receipt is None:
             logger.warning(f"Receipt {receipt_id} not found on chain")
@@ -375,12 +461,13 @@ class CertDaemon:
         manifest = await self.locator.resolve(receipt_id, content_hash=content_hash_hex)
         if manifest is None:
             logger.info(f"No locator found for {receipt_id}, adding to pending")
-            if receipt_id not in self.pending:
-                self.pending[receipt_id] = PendingReceipt(
-                    receipt_id=receipt_id,
-                    receipt=receipt,
-                    first_seen=time.time(),
-                )
+            async with self._pending_lock:
+                if receipt_id not in self.pending:
+                    self.pending[receipt_id] = PendingReceipt(
+                        receipt_id=receipt_id,
+                        receipt=receipt,
+                        first_seen=time.time(),
+                    )
             return
 
         # Verify blobs
@@ -446,11 +533,31 @@ class CertDaemon:
         # Store cert to filesystem
         self.cert_store.save(receipt_id, dcbor_bytes)
 
-        # Submit on-chain
-        success = self.client.submit_availability_cert(receipt_id, cert_hash)
+        # Submit on-chain. Two concerns:
+        #
+        #   (1) Nonce ordering — substrate-interface fetches `accountNextIndex`
+        #       on every submit. Two concurrent submits on the same signing
+        #       key would race, the second dying with "Priority too low" (per
+        #       memory `feedback_polkadot_nonce_race_on_burst.md`). We
+        #       serialize the submit step under `_chain_write_lock` so nonces
+        #       stay monotonic across the parallelized batch.
+        #
+        #   (2) Event-loop blocking — `submit_extrinsic(wait_for_inclusion=True)`
+        #       is synchronous and blocks ~6-12s per call (one block time).
+        #       Calling it directly under `await asyncio.gather(...)` would
+        #       freeze the event loop and starve every sibling coroutine of
+        #       its prep-phase HTTP I/O. `asyncio.to_thread` shunts the
+        #       blocking call to a worker thread so other coroutines keep
+        #       making progress on locator/blob fetches while one submit is
+        #       pending. The lock keeps the chain-write path itself serial.
+        async with self._chain_write_lock:
+            success = await asyncio.to_thread(
+                self.client.submit_availability_cert, receipt_id, cert_hash
+            )
         if success:
             health_server.increment_metric("certs_submitted_total")
-            self.pending.pop(receipt_id, None)
+            async with self._pending_lock:
+                self.pending.pop(receipt_id, None)
             await self.send_discord(
                 f"Cert submitted for `{receipt_id[:16]}...` (L{verification.attestation_level})",
                 "info",
@@ -463,9 +570,16 @@ class CertDaemon:
             )
 
     async def retry_pending(self):
+        self._ensure_concurrency_primitives()
         now = time.time()
         to_remove = []
-        for receipt_id, pending in list(self.pending.items()):
+        # Snapshot under lock so a concurrent push-notification or batched
+        # process_receipt cannot mutate the dict mid-iteration. The actual
+        # locator-resolve work happens OUTSIDE the lock to avoid serializing
+        # all retries behind one HTTP call.
+        async with self._pending_lock:
+            snapshot = list(self.pending.items())
+        for receipt_id, pending in snapshot:
             content_hash_hex = pending.receipt.content_hash.hex() if isinstance(pending.receipt.content_hash, bytes) else str(pending.receipt.content_hash)
             manifest = await self.locator.resolve(receipt_id, content_hash=content_hash_hex)
             if manifest is None:
@@ -481,8 +595,10 @@ class CertDaemon:
             await self.process_receipt(receipt_id)
             to_remove.append(receipt_id)
 
-        for rid in to_remove:
-            self.pending.pop(rid, None)
+        if to_remove:
+            async with self._pending_lock:
+                for rid in to_remove:
+                    self.pending.pop(rid, None)
 
     async def _ensure_bond(self):
         """Ensure the daemon's signer has `AttestorBonds[addr] >= BondRequirement`.
