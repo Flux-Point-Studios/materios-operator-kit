@@ -77,12 +77,47 @@ class CardanoCheckpointer:
                 self.pending_leaves = state.get("pending_leaves", [])
                 self.last_checkpointed_block = state.get("last_checkpointed_block", 0)
                 self.last_flush_time = state.get("last_flush_time", 0.0)
+                # Task #116: an M-of-N committee emits one AvailabilityCertified
+                # event per signer for the same (receipt_id, cert_hash). Earlier
+                # versions of add_cert appended every event, inflating the leaf
+                # count by ~M. Dedupe any such residue carried over in state on
+                # startup so the next flush counts unique facts only.
+                pre = len(self.pending_leaves)
+                self.pending_leaves = self._dedupe_leaves(self.pending_leaves)
+                removed = pre - len(self.pending_leaves)
+                if removed > 0:
+                    logger.warning(
+                        f"Checkpoint state load: removed {removed} duplicate "
+                        f"(receipt_id, cert_hash) leaves carried over from prior runs"
+                    )
+                    self._save_state()
                 logger.info(
                     f"Checkpoint state loaded: {len(self.pending_leaves)} pending, "
                     f"last_block={self.last_checkpointed_block}"
                 )
             except Exception as e:
                 logger.warning(f"Failed to load checkpoint state: {e}")
+
+    @staticmethod
+    def _dedupe_leaves(leaves: list[dict]) -> list[dict]:
+        """Collapse leaves sharing the same (receipt_id, cert_hash).
+
+        A re-attestation with a DIFFERENT cert_hash for the same receipt_id is
+        a distinct fact and is preserved. Only same-(receipt_id, cert_hash)
+        duplicates — the M-of-N committee echoes — are merged.
+
+        The first occurrence is kept (preserves earliest block_num + timestamp,
+        which is what `should_flush` uses for the leaf-age trigger).
+        """
+        seen: set[tuple[str, str]] = set()
+        out: list[dict] = []
+        for leaf in leaves:
+            key = (leaf.get("receipt_id", ""), leaf.get("cert_hash", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(leaf)
+        return out
 
     def _save_state(self):
         """Persist to PVC — survives daemon restart."""
@@ -102,11 +137,31 @@ class CardanoCheckpointer:
             logger.error(f"Failed to save checkpoint state: {e}")
 
     def add_cert(self, receipt_id: str, cert_hash: bytes, block_num: int):
-        """Add a certified receipt to the pending batch."""
+        """Add a certified receipt to the pending batch.
+
+        Task #116: collapse duplicate (receipt_id, cert_hash) facts. An M-of-N
+        committee emits one AvailabilityCertified event per signer for the
+        same cert; treating each as a separate Merkle leaf inflates the
+        Cardano L1 anchor by a factor of ~M. A re-attestation with a DIFFERENT
+        cert_hash IS a distinct fact and is appended normally.
+        """
+        cert_hash_hex = cert_hash.hex()
+        for existing in self.pending_leaves:
+            if (
+                existing.get("receipt_id") == receipt_id
+                and existing.get("cert_hash") == cert_hash_hex
+            ):
+                logger.debug(
+                    f"Checkpoint: dedupe duplicate cert for {receipt_id[:16]}... "
+                    f"at block {block_num} (already pending from block "
+                    f"{existing.get('block_num')})"
+                )
+                return
+
         self.pending_leaves.append(
             {
                 "receipt_id": receipt_id,
-                "cert_hash": cert_hash.hex(),
+                "cert_hash": cert_hash_hex,
                 "block_num": block_num,
                 "timestamp": time.time(),
             }
