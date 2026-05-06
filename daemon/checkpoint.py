@@ -83,11 +83,16 @@ class CardanoCheckpointer:
         self.pending_leaves: list[dict] = []
         self.last_checkpointed_block: int = 0
         self.last_flush_time: float = 0.0
-        # Derive SS58 from signer_uri ONCE at startup so we never include the
-        # raw URI (which may be a BIP39 mnemonic on validator hosts) in any
-        # outbound metadata payload. Anchor worker forwards batch_metadata
-        # into Cardano L1 tx metadata — a seed leak here is permanent.
-        self.submitter_address: str = Keypair.create_from_uri(config.signer_uri).ss58_address
+        # Derive Keypair ONCE at startup. Used for:
+        #   1. submitter_address — published in batch_metadata (NEVER include the
+        #      raw signer_uri, which may be a BIP39 mnemonic; anchor worker
+        #      forwards batch_metadata into Cardano L1 tx metadata — a seed
+        #      leak here is permanent).
+        #   2. signing the gateway's `/batches/:anchorId` PUT (task #122) so
+        #      the daemon authenticates with sr25519 sig instead of needing a
+        #      static API key in compose env.
+        self.keypair: Keypair = Keypair.create_from_uri(config.signer_uri)
+        self.submitter_address: str = self.keypair.ss58_address
         self._load_state()
 
     def _load_state(self):
@@ -414,10 +419,6 @@ class CardanoCheckpointer:
                 "source": "daemon",
             }
 
-            headers = {"Content-Type": "application/json"}
-            if blob_gateway_api_key:
-                headers["x-api-key"] = blob_gateway_api_key
-
             # Strip 0x prefix from anchor_id for URL path. The gateway
             # canonicalizes via its own stripHexPrefix on save AND read, so
             # the resource is reachable either way — but the daemon emits
@@ -426,6 +427,33 @@ class CardanoCheckpointer:
             anchor_id_clean = anchor_id
             if anchor_id_clean.startswith("0x"):
                 anchor_id_clean = anchor_id_clean[2:]
+
+            # Auth: sr25519 sig over `materios-upload-v1|{anchorId}|{address}|{ts}`
+            # (task #122). Pre-image format pinned by gateway's upload-auth.ts.
+            # `contentHash` slot is `anchorId` per the route's resolveAuth call.
+            # IMPORTANT: gateway uses the URL-path anchorId (no 0x), so the
+            # signing string MUST use the same form — sign with anchor_id_clean,
+            # not the 0x-prefixed form.
+            ts = int(time.time())
+            signing_string = (
+                f"materios-upload-v1|{anchor_id_clean}|{self.submitter_address}|{ts}"
+            )
+            sig_bytes = self.keypair.sign(signing_string.encode("utf-8"))
+            sig_hex = "0x" + sig_bytes.hex()
+
+            headers = {
+                "Content-Type": "application/json",
+                "x-upload-sig": sig_hex,
+                "x-uploader-address": self.submitter_address,
+                "x-upload-ts": str(ts),
+            }
+            # Belt-and-suspenders: if an API key is also configured, attach it.
+            # Gateway resolveAuth checks api-key BEFORE upload-sig, so when both
+            # are present it'll authenticate via api-key. Either path produces a
+            # 200; we prefer sig because it doesn't require provisioning a
+            # static secret in compose env.
+            if blob_gateway_api_key:
+                headers["x-api-key"] = blob_gateway_api_key
 
             # PUT is idempotent and matches the gateway's documented upsert
             # contract (routes/batches.ts wires both POST and PUT to the same
