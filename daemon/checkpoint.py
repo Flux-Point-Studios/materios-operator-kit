@@ -50,6 +50,28 @@ def merkle_root(leaves: list[bytes]) -> bytes:
     return layer[0]
 
 
+def compute_anchor_id(root_hash_hex: str, manifest_hash_hex: str) -> str:
+    """Deterministically synthesize the anchorId from (rootHash, manifestHash).
+
+    Pre-image: rootHash raw bytes ++ manifestHash raw bytes (each parsed from
+    its hex representation, any leading 0x stripped). SHA-256 over those raw
+    bytes, then 0x-prefix the digest hex.
+
+    This matches the algorithm in the Materios anchor worker (see
+    `services/anchor-worker-materios/src/anchor.ts::deriveAnchorId`, which does
+    `sha256(Buffer.from(rootHex.slice(2) + manifestHex.slice(2), "hex"))`) so:
+      * the daemon can index batch metadata under the same anchorId BEFORE
+        the anchor-worker responds (no round-trip dependency for retries),
+      * external auditors can re-derive anchorId from on-chain rootHash +
+        manifestHash with no extra inputs,
+      * the cert-daemon ↔ anchor-worker round-trip is idempotent when the
+        request is replayed.
+    """
+    root_bytes = bytes.fromhex(root_hash_hex.removeprefix("0x").removeprefix("0X"))
+    manifest_bytes = bytes.fromhex(manifest_hash_hex.removeprefix("0x").removeprefix("0X"))
+    return "0x" + hashlib.sha256(root_bytes + manifest_bytes).hexdigest()
+
+
 class CardanoCheckpointer:
     """Batches certified receipts and periodically checkpoints to Cardano."""
 
@@ -247,8 +269,16 @@ class CardanoCheckpointer:
             json.dumps(manifest, sort_keys=True).encode()
         ).hexdigest()
 
+        # Task #117: synthesize the anchorId locally so the daemon, the anchor
+        # worker, and the gateway-side reverse-lookup index all agree on the
+        # same id before any network round-trip. The daemon can then save
+        # batch history under this id and the gateway POST is independent of
+        # the anchor-worker's response shape.
+        anchor_id = compute_anchor_id(root.hex(), manifest_hash)
+
         # Build batch metadata for anchor worker to post as backup
         batch_metadata = {
+            "anchorId": anchor_id,
             "rootHash": root.hex(),
             "leafCount": len(leaves),
             "leafHashes": [lh.hex() for lh in leaves],
@@ -259,23 +289,43 @@ class CardanoCheckpointer:
             "source": "daemon",
         }
 
-        anchor_response = self._submit_to_cardano(root, manifest, manifest_hash, batch_metadata)
+        anchor_response = self._submit_to_cardano(
+            root, manifest, manifest_hash, anchor_id, batch_metadata
+        )
 
         if anchor_response is not None:
             leaf_hashes = [lh.hex() for lh in leaves]
-            self._save_batch_history(eligible, leaves, root, manifest, manifest_hash)
+            # Defensive: if the worker returned a different anchorId (would
+            # indicate an algorithm drift between daemon and worker — a real
+            # bug we'd need to know about), prefer the worker's so the
+            # gateway-side index matches what's referenced on-chain. Log the
+            # mismatch loudly so it doesn't go unnoticed.
+            worker_anchor_id = anchor_response.get("anchorId", "") or ""
+            if worker_anchor_id and worker_anchor_id.lower() != anchor_id.lower():
+                logger.error(
+                    f"Anchor ID mismatch: daemon computed {anchor_id}, "
+                    f"worker returned {worker_anchor_id}. Using worker's value."
+                )
+                anchor_id = worker_anchor_id
 
-            # Post batch metadata to blob gateway for SDK verification
-            anchor_id = anchor_response.get("anchorId", "")
-            if anchor_id:
-                self._post_batch_metadata(anchor_id, root.hex(), eligible, leaf_hashes)
+            self._save_batch_history(
+                eligible, leaves, root, manifest, manifest_hash, anchor_id
+            )
+
+            # Post batch metadata to blob gateway for SDK verification.
+            # This is the canonical write path; anchor-worker also fires a
+            # belt-and-suspenders backup PUT.
+            self._post_batch_metadata(anchor_id, root.hex(), eligible, leaf_hashes)
 
             self.last_checkpointed_block = to_block
             self.last_flush_time = time.time()
             # Remove only the eligible leaves; keep unconfirmed ones
             self.pending_leaves = [l for l in self.pending_leaves if l["block_num"] > confirmed_cutoff]
             self._save_state()
-            logger.info(f"Checkpoint submitted: root={root.hex()[:16]}... ({count} certs)")
+            logger.info(
+                f"Checkpoint submitted: root={root.hex()[:16]}... "
+                f"anchorId={anchor_id[:18]}... ({count} certs)"
+            )
         else:
             logger.error("Checkpoint submission failed — will retry on next flush")
 
@@ -288,8 +338,15 @@ class CardanoCheckpointer:
         root: bytes,
         manifest: dict,
         manifest_hash: str,
+        anchor_id: str,
     ):
-        """Append completed batch to checkpoint-history.json for verification."""
+        """Append completed batch to checkpoint-history.json for verification.
+
+        Includes anchor_id so the local history file is keyed the same way as
+        the gateway's `/batches/:anchorId` reverse-lookup index. Matters for
+        replay/repair: a future tool can scan history.json and POST any
+        missing batches back to the gateway without recomputing the id.
+        """
         history_file = self.state_file.replace("checkpoint-state.json", "checkpoint-history.json")
         try:
             if os.path.exists(history_file):
@@ -300,6 +357,7 @@ class CardanoCheckpointer:
 
             batch = {
                 "timestamp": time.time(),
+                "anchor_id": anchor_id,
                 "root_hash": root.hex(),
                 "manifest_hash": manifest_hash,
                 "manifest": manifest,
@@ -329,14 +387,19 @@ class CardanoCheckpointer:
         root_hash: str,
         eligible_leaves: list[dict],
         leaf_hashes: list[str],
-    ):
-        """Post batch metadata to blob gateway for SDK verification."""
+    ) -> bool:
+        """PUT batch metadata to blob gateway for SDK verification.
+
+        Returns True on 2xx, False on any error or missing config. The
+        endpoint is idempotent (PUT semantics on the gateway side), so this
+        can be safely retried.
+        """
         blob_gateway_url = self.config.blob_gateway_url or os.environ.get("BLOB_GATEWAY_URL", "")
         blob_gateway_api_key = self.config.blob_gateway_api_key or os.environ.get("BLOB_GATEWAY_API_KEY", "")
 
         if not blob_gateway_url:
             logger.debug("BLOB_GATEWAY_URL not set, skipping batch metadata post")
-            return
+            return False
 
         try:
             batch_metadata = {
@@ -348,39 +411,61 @@ class CardanoCheckpointer:
                 "blockRangeEnd": max(leaf.get("block_num", 0) for leaf in eligible_leaves),
                 "submitter": self.submitter_address,
                 "timestamp": datetime.utcnow().isoformat(),
+                "source": "daemon",
             }
 
             headers = {"Content-Type": "application/json"}
             if blob_gateway_api_key:
                 headers["x-api-key"] = blob_gateway_api_key
 
-            # Strip 0x prefix from anchor_id for URL path
+            # Strip 0x prefix from anchor_id for URL path. The gateway
+            # canonicalizes via its own stripHexPrefix on save AND read, so
+            # the resource is reachable either way — but the daemon emits
+            # the prefix-less form to match the gateway's storage layout
+            # exactly (`<hex>.json`).
             anchor_id_clean = anchor_id
             if anchor_id_clean.startswith("0x"):
                 anchor_id_clean = anchor_id_clean[2:]
 
-            resp = requests.post(
+            # PUT is idempotent and matches the gateway's documented upsert
+            # contract (routes/batches.ts wires both POST and PUT to the same
+            # handler; PUT is preferred for re-tries).
+            resp = requests.put(
                 f"{blob_gateway_url}/batches/{anchor_id_clean}",
                 json=batch_metadata,
                 headers=headers,
                 timeout=10,
             )
             if resp.status_code in (200, 201):
-                logger.info(f"Posted batch metadata for anchor {anchor_id[:16]}... to gateway")
-            else:
-                logger.warning(f"Failed to post batch metadata: {resp.status_code} {resp.text[:200]}")
+                logger.info(
+                    f"Posted batch metadata for anchor {anchor_id[:16]}... to gateway"
+                )
+                return True
+            logger.warning(
+                f"Failed to post batch metadata for anchor {anchor_id[:16]}...: "
+                f"{resp.status_code} {resp.text[:200]}"
+            )
+            return False
         except Exception as e:
             logger.warning(f"Error posting batch metadata to gateway: {e}")
+            return False
 
     def _submit_to_cardano(
-        self, root: bytes, manifest: dict, manifest_hash: str, batch_metadata: dict | None = None
+        self,
+        root: bytes,
+        manifest: dict,
+        manifest_hash: str,
+        anchor_id: str,
+        batch_metadata: dict | None = None,
     ) -> Optional[dict]:
         """POST checkpoint to the Cardano anchor worker.
 
-        Returns the anchor response dict on success (containing anchorId, blockHash, etc.),
-        or None on failure.
+        Passes a deterministically-computed `anchorId` so the worker preserves
+        it across the chain (idempotency). Returns the anchor response dict on
+        success (containing anchorId, blockHash, etc.), or None on failure.
         """
         payload = {
+            "anchorId": anchor_id,
             "contentHash": root.hex(),
             "rootHash": root.hex(),
             "manifestHash": manifest_hash,
