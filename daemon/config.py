@@ -49,6 +49,15 @@ class DaemonConfig:
     # Heartbeat
     heartbeat_url: str = ""  # HEARTBEAT_URL — empty = disabled
     heartbeat_interval: int = 30  # HEARTBEAT_INTERVAL, seconds
+    # Per-block parallelization (task #120)
+    #
+    # Cap on concurrent `process_receipt` coroutines per block. The prep
+    # phase (locator fetch + blob download + Merkle verify) is HTTP-bound
+    # and parallelizes well; the submit phase is serialized by a chain-write
+    # lock to keep nonces monotonic. 8 is a conservative ceiling that avoids
+    # hammering the gateway/RPC for nodes processing dozens of receipts in
+    # one block. Tune via MAX_CONCURRENT_RECEIPTS env var.
+    max_concurrent_receipts: int = 8
 
     @classmethod
     def from_env(cls) -> "DaemonConfig":
@@ -95,4 +104,7 @@ class DaemonConfig:
             schema_registry_path=os.environ.get("SCHEMA_REGISTRY_PATH", cls.schema_registry_path),
             heartbeat_url=os.environ.get("HEARTBEAT_URL", cls.heartbeat_url),
             heartbeat_interval=int(os.environ.get("HEARTBEAT_INTERVAL", cls.heartbeat_interval)),
+            max_concurrent_receipts=max(
+                1, int(os.environ.get("MAX_CONCURRENT_RECEIPTS", cls.max_concurrent_receipts))
+            ),
         )

@@ -68,6 +68,12 @@ def _make_daemon(
     daemon.pending = {}
     daemon._notified_ids = {}
     daemon._pruned_warned_blocks = set()
+    # Concurrency primitives added in task #120 — fixtures bypass __init__
+    # via `CertDaemon.__new__`, so we have to materialize the fields the
+    # `_ensure_concurrency_primitives()` lazy-init path expects.
+    daemon._chain_write_lock = None
+    daemon._pending_lock = None
+    daemon._concurrency_sem = None
     daemon.checkpointer = MagicMock()
 
     # Replace state persistence so we don't touch disk.

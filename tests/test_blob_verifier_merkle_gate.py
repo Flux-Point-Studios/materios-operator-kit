@@ -307,6 +307,11 @@ def test_daemon_does_not_attest_on_merkle_mismatch():
             daemon.pending = {}
             daemon._notified_ids = {}
             daemon._pruned_warned_blocks = set()
+            # Concurrency primitives (task #120) — lazy-init path needs the
+            # field present even when bypassing __init__ via __new__.
+            daemon._chain_write_lock = None
+            daemon._pending_lock = None
+            daemon._concurrency_sem = None
             daemon._running = True
 
             await daemon.process_receipt(receipt_id)
