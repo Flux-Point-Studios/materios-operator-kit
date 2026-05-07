@@ -15,6 +15,10 @@ from daemon.cert_builder import build_cert
 from daemon.cert_store import CertStore
 from daemon.checkpoint import CardanoCheckpointer
 from daemon.content_validator import ContentValidator
+from daemon.evidence_submitter import (
+    EvidenceSubmitter,
+    maybe_create_evidence_submitter,
+)
 from daemon import health_server
 from daemon.health_server import drain_notifications
 
@@ -152,6 +156,10 @@ class CertDaemon:
         self._chain_write_lock: Optional[asyncio.Lock] = None
         self._pending_lock: Optional[asyncio.Lock] = None
         self._concurrency_sem: Optional[asyncio.Semaphore] = None
+        # Task #143 — TEE evidence submitter. Lazy-initialised after the
+        # event loop is alive (in `run()`), since it depends on the same
+        # `_chain_write_lock` the receipt path uses for nonce safety.
+        self.evidence_submitter: Optional[EvidenceSubmitter] = None
 
     def _ensure_concurrency_primitives(self):
         """Lazy-init asyncio Lock / Semaphore inside the running event loop.
@@ -172,6 +180,13 @@ class CertDaemon:
 
     def stop(self):
         self._running = False
+        # Best-effort: signal the evidence submitter loop to exit on its
+        # next sleep boundary. Safe if it was never started.
+        try:
+            if self.evidence_submitter is not None:
+                self.evidence_submitter.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
     def load_state(self):
         if os.path.exists(self.config.state_file):
@@ -804,6 +819,18 @@ class CertDaemon:
         # Auto-join the attestation committee if not already a member
         await self._ensure_committee_membership()
         self._last_committee_check = time.time()
+
+        # Task #143 — fire up the TEE evidence submitter. Reuses the
+        # receipt-path's chain-write lock so submit_evidence and
+        # attest_availability_cert never race on the signer's nonce. Soft-
+        # disabled when the gateway URL or submitter token are unset (older
+        # deploys that don't yet act as evidence submitters).
+        self._ensure_concurrency_primitives()
+        self.evidence_submitter = maybe_create_evidence_submitter(
+            self.config, self.client, self._chain_write_lock
+        )
+        if self.evidence_submitter is not None:
+            self.evidence_submitter.start()
 
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
 
