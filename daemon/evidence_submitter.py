@@ -52,13 +52,80 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
-from typing import Any, Optional
+import time
+from typing import Any, Literal, Optional
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Pallet-side payload size cap. PINNED to
+# `partnerchain/pallets/tee-attestation/src/types.rs::MAX_EVIDENCE_PAYLOAD_BYTES`.
+# Any payload exceeding this cap is rejected by SCALE bounds-check at decode
+# time and returns a structurally-bad failure — no point burning the tx fee.
+# ---------------------------------------------------------------------------
+MAX_EVIDENCE_PAYLOAD_BYTES = 16 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Terminal-error classification.
+#
+# Maps known pallet-side errors and pre-flight failure reasons into either
+# "terminal" (won't succeed on retry — record locally so the cursor can move
+# past) or "retryable" (transient — let the next tick try again).
+#
+# Source of truth for the pallet variants is
+# `partnerchain/pallets/tee-attestation/src/lib.rs` (search `pub enum Error`):
+#   - PalletDisabled   → kill-switch on; operator may flip back off       (RETRY)
+#   - VerificationFailed → verifier rejected the bytes; resubmitting is a
+#     no-op + burns weight                                                (TERMINAL)
+#   - TooManyEntries   → cap reached for this receipt; further submits
+#     for the same row will keep hitting the cap                          (TERMINAL)
+#
+# Pre-flight failure reasons we synthesise client-side:
+#   - PayloadTooLarge       → exceeds MAX_EVIDENCE_PAYLOAD_BYTES           (TERMINAL)
+#   - PayloadAssemblyError  → gateway shape couldn't be translated         (TERMINAL)
+#   - UnsupportedEvidenceType → no Phase 2 verifier for this variant       (TERMINAL)
+#
+# `AttestorNotRegistered` is NOT in this map intentionally — the pallet
+# doesn't surface that today (registration is gateway-side), but if it
+# ever does, leave it retryable so `ensure_registered` re-runs.
+# ---------------------------------------------------------------------------
+TERMINAL_ERROR_REASONS: frozenset[str] = frozenset({
+    "VerificationFailed",
+    "TooManyEntries",
+    "PayloadTooLarge",
+    "PayloadAssemblyError",
+    "UnsupportedEvidenceType",
+})
+
+
+def _classify_chain_error(err: Optional[str]) -> Literal["terminal", "retryable"]:
+    """Map a pallet-side `error_message` (or a synthesized client-side reason
+    label) to either "terminal" or "retryable". Substring match against the
+    known terminal reasons; anything else (including PalletDisabled) stays
+    retryable.
+
+    The matching is forgiving — substrate-interface stringifies pallet
+    errors as JSON-shaped dicts that always include the variant name. A
+    plain identifier substring is sufficient.
+    """
+    if not err:
+        return "retryable"
+    s = str(err)
+    # PalletDisabled is explicitly retryable — operator may flip the
+    # kill-switch back off without a chain reset.
+    if "PalletDisabled" in s:
+        return "retryable"
+    for terminal in TERMINAL_ERROR_REASONS:
+        if terminal in s:
+            return "terminal"
+    return "retryable"
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +303,7 @@ class EvidenceSubmitter:
         admin_token: Optional[str] = None,
         poll_interval: int = 30,
         page_size: int = 50,
+        failed_state_path: Optional[str] = None,
     ):
         self.config = config
         self.client = substrate_client
@@ -251,6 +319,127 @@ class EvidenceSubmitter:
         self._cursor = 0
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        # Local skip-bit store for rows whose pallet error is structurally
+        # terminal (VerificationFailed, TooManyEntries, PayloadTooLarge, …).
+        # Without this, the gateway query (`WHERE submitted_to_chain_at IS
+        # NULL`) keeps surfacing the row every tick, the daemon resubmits, the
+        # pallet rejects again — and each rejection still consumes the
+        # declared submit_evidence weight (1B ref_time / 32KB proof) charged
+        # as fees. We persist by row id + reason to a JSON file alongside the
+        # cert-daemon's existing state files so the skip survives restart.
+        self._failed_state_path: str = (
+            failed_state_path
+            or os.path.join(
+                getattr(config, "data_dir", "/data"), "evidence-failed.json"
+            )
+        )
+        self._failed_rows: dict[int, dict] = self._load_failed_rows()
+
+    # -- local terminal-failure tracking -------------------------------------
+
+    def _load_failed_rows(self) -> dict[int, dict]:
+        """Load the failed-row map from disk on construction. Tolerates
+        missing or malformed files — returns `{}` and keeps moving.
+        """
+        path = self._failed_state_path
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path) as f:
+                blob = json.load(f)
+            entries = blob.get("rows") if isinstance(blob, dict) else blob
+            if not isinstance(entries, list):
+                return {}
+            out: dict[int, dict] = {}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                rid = entry.get("row_id")
+                if rid is None:
+                    continue
+                try:
+                    rid_int = int(rid)
+                except (TypeError, ValueError):
+                    continue
+                out[rid_int] = {
+                    "row_id": rid_int,
+                    "reason": str(entry.get("reason") or "unknown"),
+                    "failed_at": entry.get("failed_at") or "",
+                    "receipt_id": entry.get("receipt_id") or "",
+                    "evidence_type": entry.get("evidence_type") or "",
+                }
+            return out
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"evidence_submitter: failed to load failed-row state from "
+                f"{path}: {type(e).__name__}: {e}"
+            )
+            return {}
+
+    def _save_failed_rows(self) -> None:
+        """Atomically persist the failed-row map. Called only on mutation."""
+        path = self._failed_state_path
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        except OSError:
+            # If we can't create the parent dir we still try the write so
+            # the underlying error propagates clearly.
+            pass
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(
+                    {"rows": list(self._failed_rows.values())},
+                    f,
+                    sort_keys=True,
+                )
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                f"evidence_submitter: failed to persist failed-row state to "
+                f"{path}: {type(e).__name__}: {e}"
+            )
+
+    def _record_failed_row(
+        self,
+        row_id: int,
+        reason: str,
+        *,
+        receipt_id: str = "",
+        evidence_type: str = "",
+    ) -> None:
+        """Mark a row id as terminally failed so the next tick skips it.
+
+        Why this exists: a pallet `VerificationFailed` (or any other terminal
+        error) won't go away on retry — re-submitting the same bytes
+        deterministically lands the same rejection. Without skipping locally
+        the daemon hot-loops on the row every poll interval, each loop costing
+        the declared `submit_evidence` weight (`1B ref_time / 32KB proof`)
+        charged as fees.
+
+        We log WARN with row_id + reason + first 64 hex chars of the receipt
+        id so an operator can reconcile against the gateway DB by-hand. The
+        on-disk record is keyed by row_id.
+        """
+        if row_id in self._failed_rows:
+            return  # already recorded — do not bump failed_at
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self._failed_rows[row_id] = {
+            "row_id": int(row_id),
+            "reason": reason,
+            "failed_at": ts,
+            "receipt_id": receipt_id[:64] if receipt_id else "",
+            "evidence_type": evidence_type,
+        }
+        logger.warning(
+            f"evidence_submitter: row {row_id} marked TERMINAL "
+            f"(reason={reason!r}, receipt_id={receipt_id[:16]}..., "
+            f"type={evidence_type or 'n/a'}) — local skip-bit set, "
+            f"will not be resubmitted"
+        )
+        self._save_failed_rows()
 
     # -- registration on startup ---------------------------------------------
 
@@ -422,6 +611,11 @@ class EvidenceSubmitter:
 
         Returns the chain extrinsic hash (hex, 0x-prefixed) on success;
         None on any non-success path. Caller skips the gateway ack on None.
+
+        Terminal failures (pallet `VerificationFailed`, `TooManyEntries`,
+        a pre-flight payload-size cap miss, …) are recorded into the local
+        skip-bit store via `_record_failed_row` so the row is filtered out
+        on the next tick. See `_classify_chain_error` for the taxonomy.
         """
         row_id = int(row["id"])
         receipt_id_hex = str(row["receipt_id"])
@@ -439,7 +633,10 @@ class EvidenceSubmitter:
             )
             return None
 
-        # 2. Translate gateway payload → pallet payload bytes.
+        # 2. Translate gateway payload → pallet payload bytes. Both
+        # NotImplementedError and shape-validation ValueError are TERMINAL —
+        # the gateway row's bytes won't morph into something the pallet
+        # accepts on retry, so record the local skip-bit.
         try:
             payload_bytes = _build_evidence_payload_bytes(
                 self.client.substrate, evidence_type, payload
@@ -448,11 +645,40 @@ class EvidenceSubmitter:
             logger.warning(
                 f"evidence_submitter: row {row_id} {evidence_type} unsupported: {e}"
             )
+            self._record_failed_row(
+                row_id,
+                "UnsupportedEvidenceType",
+                receipt_id=receipt_id_hex,
+                evidence_type=evidence_type,
+            )
             return None
         except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"evidence_submitter: row {row_id} payload assembly failed: "
                 f"{type(e).__name__}: {e}"
+            )
+            self._record_failed_row(
+                row_id,
+                "PayloadAssemblyError",
+                receipt_id=receipt_id_hex,
+                evidence_type=evidence_type,
+            )
+            return None
+
+        # 2b. Pre-flight payload-size check — saves the round-trip + tx fee
+        # for rows that exceed the pallet's BoundedVec cap. The pallet
+        # would reject these at SCALE-decode time anyway. PINNED to
+        # MAX_EVIDENCE_PAYLOAD_BYTES (16 KiB).
+        if len(payload_bytes) > MAX_EVIDENCE_PAYLOAD_BYTES:
+            logger.warning(
+                f"evidence_submitter: row {row_id} payload {len(payload_bytes)}B "
+                f"exceeds cap {MAX_EVIDENCE_PAYLOAD_BYTES}B — terminal"
+            )
+            self._record_failed_row(
+                row_id,
+                "PayloadTooLarge",
+                receipt_id=receipt_id_hex,
+                evidence_type=evidence_type,
             )
             return None
 
@@ -473,6 +699,9 @@ class EvidenceSubmitter:
                     True,  # wait_for_inclusion
                 )
             except Exception as e:  # noqa: BLE001
+                # Compose/submit raise on transport / nonce / encoding
+                # failures. These are usually transient (RPC hiccup, txpool
+                # full, etc.) — keep them retryable.
                 logger.warning(
                     f"evidence_submitter: row {row_id} compose/submit raised: "
                     f"{type(e).__name__}: {e}"
@@ -481,24 +710,65 @@ class EvidenceSubmitter:
 
         if not getattr(receipt, "is_success", False):
             err = getattr(receipt, "error_message", None)
-            if _is_pallet_disabled_error(err):
+            classification = _classify_chain_error(err)
+            if classification == "terminal":
+                # `VerificationFailed`, `TooManyEntries`, … — resubmitting will
+                # land the same rejection and burn fees. Record locally so the
+                # next tick filters this row out before composing.
+                logger.warning(
+                    f"evidence_submitter: row {row_id} TERMINAL pallet error "
+                    f"{err!r} — recording local skip-bit "
+                    f"(receipt_id={receipt_id_hex[:16]}..., "
+                    f"type={evidence_type})"
+                )
+                # Try to extract a stable variant name for the reason field.
+                reason = "VerificationFailed"
+                if err and "TooManyEntries" in str(err):
+                    reason = "TooManyEntries"
+                self._record_failed_row(
+                    row_id,
+                    reason,
+                    receipt_id=receipt_id_hex,
+                    evidence_type=evidence_type,
+                )
+            elif _is_pallet_disabled_error(err):
                 logger.warning(
                     f"evidence_submitter: row {row_id} dispatched while "
-                    f"pallet kill-switch ON ({err}) — leaving NOT-acked, "
-                    f"operator must flip TeeAttestation.Disabled=false"
+                    f"pallet kill-switch ON ({err}) — leaving NOT-acked + "
+                    f"NOT-skipped (retryable), operator must flip "
+                    f"TeeAttestation.Disabled=false"
                 )
             else:
                 logger.warning(
-                    f"evidence_submitter: row {row_id} submit_evidence failed: {err}"
+                    f"evidence_submitter: row {row_id} submit_evidence failed "
+                    f"(retryable): {err}"
                 )
             return None
 
-        ext_hash = (
-            getattr(receipt, "extrinsic_hash", None)
-            or str(getattr(receipt, "block_hash", "")) or ""
-        )
+        # Read both fields independently so we can detect the all-empty case.
+        ext_hash_attr = getattr(receipt, "extrinsic_hash", None)
+        block_hash_attr = getattr(receipt, "block_hash", None)
+        ext_hash_str = str(ext_hash_attr) if ext_hash_attr else ""
+        block_hash_str = str(block_hash_attr) if block_hash_attr else ""
+        ext_hash = ext_hash_str or block_hash_str
         if not ext_hash:
-            ext_hash = "0x" + ("00" * 32)  # last-resort placeholder
+            # P2 #6: do NOT silently fall back to an all-zero placeholder. The
+            # gateway uses `chain_extrinsic_hash` for forensics + idempotency;
+            # writing zeros has burned us before (see
+            # `feedback_v2_contract_drift_chain_break.md`). Treat as a
+            # retryable miss — the chain submission may already have landed
+            # but we couldn't extract the hash. The next tick will see the
+            # row again (gateway query is `submitted_to_chain_at IS NULL`)
+            # and retry. The pallet's `submit_evidence` is idempotent at the
+            # `(receipt_id, attest_key_hash)` level so a duplicate landing
+            # is safe.
+            logger.error(
+                f"evidence_submitter: row {row_id} submit_evidence reported "
+                f"is_success but receipt has no extrinsic_hash or block_hash "
+                f"(receipt={receipt!r}) — refusing to ack with zero "
+                f"placeholder, will retry on next tick"
+            )
+            return None
         logger.info(
             f"evidence_submitter: row {row_id} submit_evidence OK "
             f"(receipt_id={receipt_id_hex[:16]}…, type={evidence_type}, "
@@ -509,33 +779,107 @@ class EvidenceSubmitter:
     # -- main loop -----------------------------------------------------------
 
     async def _tick(self) -> None:
-        """Single poll tick: fetch pending, submit each, ack each."""
+        """Single poll tick: fetch pending, submit each, ack each.
+
+        Cursor advancement (post-P1-fix). The gateway query is
+        `WHERE id > ? AND submitted_to_chain_at IS NULL`. Old logic advanced
+        the cursor to `next_since` whenever ANY row in the batch acked,
+        which permanently filtered earlier-failed rows out of the daemon's
+        view (cursor=0, rows=[10,11], 10 fails + 11 succeeds → cursor=11
+        → row 10 stranded). The fix: track per-row outcomes and clamp the
+        cursor to `min(next_since, first_unacked_id - 1)`.
+
+        Also: rows already in the local terminal-failure store
+        (`_failed_rows`) are skipped before any chain work, so they don't
+        keep burning weight. Their ids ARE treated as "acked" for cursor
+        purposes — we want the cursor to step over them since the next tick
+        would skip them again anyway.
+        """
         rows, next_since = await self.fetch_pending()
         if not rows:
             return
-        logger.info(f"evidence_submitter: {len(rows)} pending row(s)")
-        last_acked = self._cursor
-        for row in rows:
+
+        # Filter out any rows we've already classified as terminally failed.
+        # Their gateway state (`submitted_to_chain_at IS NULL`) means they'll
+        # keep coming back forever; the local skip-bit is the only thing
+        # keeping us from re-burning fees on them.
+        eligible: list[dict] = []
+        skipped_terminal: list[int] = []
+        for r in rows:
+            try:
+                rid = int(r["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if rid in self._failed_rows:
+                skipped_terminal.append(rid)
+                continue
+            eligible.append(r)
+        if skipped_terminal:
+            logger.info(
+                f"evidence_submitter: skipping {len(skipped_terminal)} "
+                f"row(s) flagged terminal locally: {skipped_terminal[:8]}"
+                + ("..." if len(skipped_terminal) > 8 else "")
+            )
+        if not eligible and not skipped_terminal:
+            return
+
+        logger.info(
+            f"evidence_submitter: {len(eligible)} eligible "
+            f"({len(skipped_terminal)} skipped) of {len(rows)} pending row(s)"
+        )
+
+        # Per-row outcome: True = "may advance past" (acked OR locally
+        # marked terminal — both mean the gateway query won't re-surface a
+        # workable row), False = "must NOT advance past" (hash returned but
+        # ack failed, or chain submit returned None for a retryable reason
+        # and the row remains pending in the gateway).
+        outcomes: list[tuple[int, bool]] = []
+        # Pre-record terminal-skips as advanceable so they don't anchor the
+        # cursor. They're still in `_failed_rows` and will be filtered again
+        # next tick — but we don't want them to permanently stall the cursor.
+        for rid in skipped_terminal:
+            outcomes.append((rid, True))
+
+        for row in eligible:
             if not self._running:
                 break
             row_id = int(row["id"])
             ext_hash = await self.submit_one(row)
             if ext_hash is not None:
                 acked = await self.mark_submitted(row_id, ext_hash)
-                if acked:
-                    last_acked = row_id
-            # Whether ext_hash was None or ack failed, do NOT advance the
-            # cursor PAST this row — we'll see it again next tick. The
-            # gateway's `submitted_to_chain_at IS NULL` filter is the
-            # canonical source of "still pending".
-        # Advance the cursor to next_since ONLY if we successfully acked at
-        # least up to it. Otherwise keep retrying from the failure point.
-        # For safety, always set to min(last_acked, next_since) so a
-        # transient failure on row N doesn't prevent us from seeing N+1.
-        if last_acked >= next_since:
-            self._cursor = next_since
+                outcomes.append((row_id, bool(acked)))
+            else:
+                # submit_one returned None. Either it recorded the row as
+                # locally terminal (in which case it's now in `_failed_rows`
+                # and we treat it as advanceable), OR it's a retryable miss
+                # we want the cursor to stop short of.
+                if row_id in self._failed_rows:
+                    outcomes.append((row_id, True))
+                else:
+                    outcomes.append((row_id, False))
+
+        if not outcomes:
+            return
+
+        # Find the earliest row id we could NOT advance past — that's the
+        # cursor's hard ceiling for this tick. P1 fix: previously we keyed
+        # off the LAST ack only, which let earlier-row failures slip through.
+        unadvanceable = [rid for (rid, ok) in outcomes if not ok]
+        if unadvanceable:
+            first_unacked = min(unadvanceable)
+            new_cursor = first_unacked - 1
         else:
-            self._cursor = max(self._cursor, last_acked)
+            # Every row was acked or terminal-skipped. We can advance to the
+            # max of the row ids we processed AND the gateway's `next_since`
+            # (whichever is larger).
+            highest_processed = max(rid for (rid, _) in outcomes)
+            new_cursor = max(highest_processed, next_since)
+
+        # Cursor is monotonically non-decreasing — never go backwards even if
+        # the gateway re-surfaces an older row id (e.g. retroactive insert
+        # during testing). Going backwards would just re-emit work we've
+        # already either acked or terminally-failed.
+        self._cursor = max(self._cursor, new_cursor)
 
     async def _run_forever(self) -> None:
         """Outer loop. Continues until `stop()` is called. Catches per-tick
@@ -642,6 +986,9 @@ def maybe_create_evidence_submitter(
         page_size = int(os.environ.get("EVIDENCE_SUBMITTER_PAGE_SIZE", "50"))
     except ValueError:
         page_size = 50
+    failed_state_path = (
+        os.environ.get("EVIDENCE_SUBMITTER_FAILED_STATE_PATH") or None
+    )
     return EvidenceSubmitter(
         config=config,
         substrate_client=substrate_client,
@@ -651,4 +998,5 @@ def maybe_create_evidence_submitter(
         admin_token=admin_token,
         poll_interval=poll_interval,
         page_size=page_size,
+        failed_state_path=failed_state_path,
     )
