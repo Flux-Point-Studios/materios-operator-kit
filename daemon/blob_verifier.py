@@ -20,7 +20,57 @@ class BlobVerifier:
         self.config = config
 
     async def verify(self, receipt: ReceiptRecord, manifest: BlobManifest) -> VerificationResult:
-        """Fetch all chunks, verify hashes (L2), then verify Merkle root (L3)."""
+        """Fetch all chunks, verify hashes (L2), then verify Merkle root (L3).
+
+        Self-rooted shortcut (task #186):
+          When the manifest claims `chunks=[]` AND the on-chain
+          `base_root_sha256` equals the on-chain `content_hash`, the
+          receipt is a `compute_metering_v2`-style self-rooted record.
+          The "blob" is inline in the manifest body (the gateway
+          stores `{schema, record, chunks: [], rootHash: content_hash}`)
+          and there is nothing to fetch or hash. Return ROOT_VERIFIED
+          directly.
+
+          Both predicates are required:
+            - `chunks=[]`: the manifest authority (gateway) explicitly
+              declares no blob chunks. A blob upload that just happens
+              to have a single chunk whose hash equals its content_hash
+              still has chunks=[chunk], not [], so the legitimate-blob
+              path is unaffected.
+            - `base_root_sha256 == content_hash`: the on-chain receipt
+              confirms the receipt-submitter populated `baseRootSha256`
+              from the `rootHash` field of the upload-completion
+              callback (which v2's metering route sets equal to the
+              record's content_hash). A normal blob receipt has
+              `base_root_sha256 = merkle_root(chunk_hashes)`, which
+              does not in general equal the blob's content_hash.
+
+          Both predicates are derived from chain state + the manifest's
+          existence — they are operator-deterministic, so M-of-N
+          committee determinism is preserved (per
+          `feedback_mofn_hash_determinism.md`).
+
+          Trust framing: this leans on gateway honesty for the
+          self-rooted assertion (chunks=[]). That is the existing trust
+          model — the gateway is the manifest authority for the entire
+          blob path too. Defense in depth comes from the M-of-N
+          committee threshold and the Cardano L1 anchor of the cert
+          batch, not from a second signature check inside the verifier.
+        """
+        if not manifest.chunks and receipt.base_root_sha256 == receipt.content_hash:
+            logger.info(
+                f"Self-rooted manifest for {receipt.receipt_id} "
+                f"(chunks=[], base_root==content_hash="
+                f"{receipt.content_hash.hex()[:16]}...) — "
+                f"verification short-circuits to ROOT_VERIFIED."
+            )
+            return VerificationResult(
+                attestation_level=AttestationLevel.ROOT_VERIFIED,
+                computed_root=receipt.base_root_sha256,
+                chunks_total=0,
+                chunks_verified=0,
+            )
+
         result = VerificationResult(
             attestation_level=AttestationLevel.FETCHED,
             chunks_total=len(manifest.chunks),
