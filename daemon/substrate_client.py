@@ -11,6 +11,30 @@ from websocket import WebSocketException
 from daemon.config import DaemonConfig
 from daemon.models import ReceiptRecord
 
+
+def _bump_health_last_poll_ts() -> None:
+    """Update health_server's `last_poll_timestamp` to wall-clock now.
+
+    Called from `_call_with_retry`/`_call_no_retry` after every successful
+    RPC so the metric reflects "time since last successful chain
+    interaction", NOT "time since last completed poll cycle". Without this,
+    a long-running operation (e.g. 256-block startup catchup) would let
+    `last_poll_timestamp` stay frozen for minutes, tripping the cert-daemon
+    liveness watchdog's 90-180s threshold even though the daemon is
+    actively making forward progress on each block.
+
+    Imported lazily to avoid a hard dependency from substrate_client into
+    health_server (and to keep this file unit-testable without spinning
+    up the health server thread).
+    """
+    try:
+        from daemon import health_server as _hs
+        _hs.update_metrics(last_poll_timestamp=time.time())
+    except Exception:
+        # Health server may not be initialised in tests; never fail the
+        # actual RPC path because of a metric update.
+        pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -185,11 +209,13 @@ class SubstrateClient:
                 try:
                     result = fn(*args, **kwargs)
                     self._last_ok_at = time.monotonic()
+                    _bump_health_last_poll_ts()
                     return result
                 except SubstrateRequestException:
                     # Real chain-side error (e.g. unknown storage). The
                     # WS is fine; bumping the freshness stamp is correct.
                     self._last_ok_at = time.monotonic()
+                    _bump_health_last_poll_ts()
                     raise
                 except _WS_TRANSIENT as e:
                     last_exc = e
@@ -229,9 +255,11 @@ class SubstrateClient:
             try:
                 result = fn(*args, **kwargs)
                 self._last_ok_at = time.monotonic()
+                _bump_health_last_poll_ts()
                 return result
             except SubstrateRequestException:
                 self._last_ok_at = time.monotonic()
+                _bump_health_last_poll_ts()
                 raise
             except _WS_TRANSIENT:
                 # Mark the WS broken so the next caller reconnects, but

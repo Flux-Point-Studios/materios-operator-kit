@@ -334,6 +334,71 @@ def test_submit_bond_is_not_decorated_with_at_rpc():
     assert result == (False, None)
 
 
+def test_successful_rpc_bumps_health_last_poll_timestamp():
+    """Every successful RPC must update health_server.last_poll_timestamp.
+
+    Without this, a long-running operation (e.g. 256-block startup catchup
+    that takes 5+ minutes) would leave the metric frozen at the value set
+    by the previous completed poll cycle. The cron liveness watchdog would
+    then see `last_poll_age > 90s` and false-positive a wedge — restarting
+    the daemon mid-catchup, which puts it in a feedback loop where it
+    never finishes catching up before the next restart.
+
+    Pin the per-RPC update so the watchdog tracks LAST CHAIN INTERACTION
+    rather than LAST COMPLETED POLL CYCLE.
+    """
+    from daemon import health_server as hs
+
+    # Reset metric to a stale-looking value.
+    hs.update_metrics(last_poll_timestamp=0.0)
+    assert hs._metrics["last_poll_timestamp"] == 0.0
+
+    client = _build_client()
+    fake_handle = mock.Mock()
+
+    def fake_connect():
+        client.substrate = fake_handle
+        client._last_ok_at = time.monotonic()
+        return True
+
+    def successful_rpc():
+        return "hello"
+
+    with mock.patch.object(client, "connect", side_effect=fake_connect):
+        client._call_with_retry(successful_rpc)
+
+    fresh_ts = hs._metrics["last_poll_timestamp"]
+    assert fresh_ts > 0.0, "last_poll_timestamp not bumped by _call_with_retry"
+    # Sanity: it should be within the last second.
+    assert (time.time() - fresh_ts) < 5.0, (
+        f"last_poll_timestamp={fresh_ts} doesn't look like a wall-clock now"
+    )
+
+
+def test_no_retry_path_also_bumps_health_last_poll_timestamp():
+    """Same regression as above but for _call_no_retry (used by state-changing
+    extrinsics). A long submit shouldn't let the watchdog false-positive."""
+    from daemon import health_server as hs
+
+    hs.update_metrics(last_poll_timestamp=0.0)
+    client = _build_client()
+    fake_handle = mock.Mock()
+
+    def fake_connect():
+        client.substrate = fake_handle
+        client._last_ok_at = time.monotonic()
+        return True
+
+    def successful_submit():
+        return (True, "0xdeadbeef")
+
+    with mock.patch.object(client, "connect", side_effect=fake_connect):
+        client._call_no_retry(successful_submit)
+
+    fresh_ts = hs._metrics["last_poll_timestamp"]
+    assert fresh_ts > 0.0
+
+
 def test_lock_serializes_concurrent_calls():
     """Multiple threads calling RPCs must NOT interleave WS sends — the
     transport keys responses by request id and concurrent send/recv
