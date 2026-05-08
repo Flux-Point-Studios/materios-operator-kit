@@ -913,6 +913,11 @@ class CertDaemon:
                     last_processed_block=self.last_processed_block,
                     last_poll_timestamp=time.time(),
                     pending_receipts=len(self.pending),
+                    # Refresh `substrate_connected` from the WS client's
+                    # truthful liveness check (recent-success-based) so a
+                    # silently-wedged socket no longer reports "connected".
+                    # Watchtower + heartbeat consumers see the real state.
+                    substrate_connected=self.client.connected,
                 )
 
             except Exception as e:
