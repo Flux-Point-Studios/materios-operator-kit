@@ -58,6 +58,29 @@ def _rpc(method: Callable) -> Callable:
 
 
 class SubstrateClient:
+    """Wrapper around substrate-interface that adds WS-transport hardening.
+
+    SCOPE OF GUARANTEES — IMPORTANT:
+
+    The retry shell, lock serialization, and recv-timeout protections only
+    cover RPC calls that go THROUGH this class's public methods (the ones
+    decorated `@_rpc` for queries, or routed through `_call_no_retry` for
+    state-changing submits).
+
+    Several call sites in the daemon currently bypass this layer and
+    access `client.substrate.*` directly — e.g. `cert_daemon.py` for
+    the `join_committee` flow (lines ~708, 738, 743, 747) and
+    `evidence_submitter.py` for `submit_evidence` (~593, 627, 642, 693,
+    697). Those callers race against this class's lock and will not
+    benefit from auto-reconnect on transient WS errors. Per the 2026-05-08
+    pre-merge review, this is a known scope gap; the structural fix is
+    to add public methods + `@_rpc` decoration for each bypass site,
+    tracked under task #156 (cert-daemon evidence_submitter timeout).
+    Until that lands, those bypass sites are best-effort and the cron
+    liveness watchdog at materios-node/cert-daemon-liveness-watchdog.sh
+    is the safety net.
+    """
+
     def __init__(self, config: DaemonConfig):
         self.config = config
         self.substrate: Optional[SubstrateInterface] = None
@@ -67,6 +90,8 @@ class SubstrateClient:
         # evidence_submitter + bond/heartbeat helpers) must NOT issue
         # interleaved requests on the same socket — the response queue
         # is keyed by request id and concurrent send/recv pairs race.
+        # NOTE: this lock only guards calls through this class's API;
+        # see class-level docstring for the bypass-path scope gap.
         self._lock = threading.RLock()
         # Monotonic timestamp of the last successful RPC. Defaults to 0.0
         # so the freshly-constructed client is reported as NOT connected
@@ -139,7 +164,14 @@ class SubstrateClient:
 
     def _call_with_retry(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
         """Run `fn(*args, **kwargs)` with one auto-reconnect retry on a
-        WS-transport error. Substrate-side errors propagate untouched."""
+        WS-transport error. Substrate-side errors propagate untouched.
+
+        SAFETY: only use this for IDEMPOTENT operations — queries, header
+        reads, event scans. For state-changing extrinsics (signed tx
+        submits) use `_call_no_retry` instead: an auto-retry mid-submit
+        risks resubmitting a tx the chain already accepted but whose
+        response we lost on the WS close, causing double-execution.
+        """
         last_exc: Optional[BaseException] = None
         for attempt in (1, 2):
             with self._lock:
@@ -177,6 +209,41 @@ class SubstrateClient:
         raise last_exc if last_exc is not None else ConnectionError(
             "substrate-client: retry shell exhausted"
         )
+
+    def _call_no_retry(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
+        """Like `_call_with_retry` but does NOT auto-retry on WS errors.
+
+        Use for state-changing extrinsics (`submit_bond`,
+        `_submit_cert_inner`, etc.) where a transparent retry could
+        double-execute. The substrate handle is still dropped on a WS
+        error so the next caller reconnects, but THIS call propagates
+        the failure up so the caller (which knows whether resubmit is
+        safe — typically by re-reading on-chain state first) decides.
+        """
+        with self._lock:
+            if self.substrate is None:
+                if not self.connect():
+                    raise ConnectionError(
+                        f"substrate-client: cannot reach {self.config.rpc_url}"
+                    )
+            try:
+                result = fn(*args, **kwargs)
+                self._last_ok_at = time.monotonic()
+                return result
+            except SubstrateRequestException:
+                self._last_ok_at = time.monotonic()
+                raise
+            except _WS_TRANSIENT:
+                # Mark the WS broken so the next caller reconnects, but
+                # do NOT retry here — caller decides if the operation
+                # can safely be re-attempted (after re-reading state).
+                try:
+                    if self.substrate is not None:
+                        self.substrate.close()
+                except Exception:
+                    pass
+                self.substrate = None
+                raise
 
     # ─── chain-state queries (all WS-wrapped via @_rpc) ──────────────────
 
@@ -246,14 +313,22 @@ class SubstrateClient:
         except (KeyError, TypeError):
             return 0
 
-    @_rpc
     def submit_bond(self, amount: int) -> tuple[bool, Optional[str]]:
         """Submit `OrinqReceipts.bond(amount)` as a signed extrinsic.
 
         Returns `(True, tx_hash_hex)` on successful inclusion, `(False, None)`
         otherwise. Raises on unrecoverable exceptions — callers should wrap in
         try/except to avoid killing daemon startup on transient RPC errors.
+
+        Routed through `_call_no_retry` (NOT `_call_with_retry`) because
+        `bond()` is non-idempotent: if the first submit reaches the chain
+        but the response is dropped on a WS close, an auto-retry would
+        double-bond. Callers idempotently re-observe via
+        `get_attestor_bond()` before resubmitting.
         """
+        return self._call_no_retry(self._submit_bond_inner, amount)
+
+    def _submit_bond_inner(self, amount: int) -> tuple[bool, Optional[str]]:
         call = self.substrate.compose_call(
             call_module="OrinqReceipts",
             call_function="bond",
@@ -339,21 +414,33 @@ class SubstrateClient:
         Note: this method has its OWN retry loop (over chain-side
         SubstrateRequestException for transient nonce/inclusion races) that
         is distinct from the WS-transport retry. The single-shot inner
-        chain call is wrapped via `_call_with_retry` so a WS wedge mid-tx
-        triggers exactly one reconnect, but the outer loop still attempts
-        `tx_max_retries` chain-side resubmits.
+        chain call is routed through `_call_no_retry` (NOT
+        `_call_with_retry`) because attest_availability_cert may not be
+        fully idempotent across all chain states — a transparent
+        same-block resubmit could trigger duplicate-pubkey or
+        already-certified errors that look like real chain rejections.
+        Instead, on a WS error the inner call surfaces the failure to
+        this outer loop, which sleeps + reconnects via the next
+        iteration's first call.
         """
         for attempt in range(self.config.tx_max_retries):
             try:
-                return self._call_with_retry(self._submit_cert_inner, receipt_id, cert_hash)
+                return self._call_no_retry(self._submit_cert_inner, receipt_id, cert_hash)
             except SubstrateRequestException as e:
                 logger.error(f"Cert tx attempt {attempt + 1} failed for {receipt_id}: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
-            except Exception as e:
-                logger.error(f"Unexpected error submitting cert for {receipt_id}: {e}")
+            except _WS_TRANSIENT as e:
+                # WS-layer error — substrate handle was already dropped
+                # by `_call_no_retry`; next iteration will reconnect.
+                logger.error(f"Cert tx attempt {attempt + 1} WS error for {receipt_id}: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
+            except Exception as e:
+                # Unknown non-WS, non-chain exception — almost certainly
+                # a programming bug. Don't keep hammering it.
+                logger.error(f"Unexpected error submitting cert for {receipt_id}: {e}")
+                raise
         return False
 
     def _submit_cert_inner(self, receipt_id: str, cert_hash: bytes) -> bool:

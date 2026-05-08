@@ -74,11 +74,14 @@ def test_connect_passes_ws_options_timeout():
     assert captured["kwargs"].get("ws_options") == {"timeout": 17}
 
 
-def test_connect_default_timeout_is_30s():
-    """Default ws_recv_timeout (30s) is the production default and must
-    not silently become 0 or None — those would re-create the wedge."""
+def test_connect_default_timeout_is_45s():
+    """Default ws_recv_timeout (45s) is the production default and must
+    not silently become 0 or None — those would re-create the wedge.
+    45s allows `submit_extrinsic(wait_for_inclusion=True)` to ride out
+    a 1-2 block reorg + congested mempool (worst case ~24s) without
+    premature reconnect."""
     client = _build_client()
-    assert client._ws_recv_timeout == 30
+    assert client._ws_recv_timeout == 45
 
 
 # ─── (2) connected property is recent-success-based ──────────────────────
@@ -264,6 +267,71 @@ def test_get_best_block_number_uses_retry_shell():
             result = client.get_best_block_number()
     assert result == 1000
     assert flaky_calls["n"] == 2
+
+
+def test_no_retry_path_does_not_resubmit_state_changing_extrinsics():
+    """`_call_no_retry` MUST NOT auto-retry — used for state-changing
+    extrinsics (submit_bond, submit_availability_cert) where a transparent
+    resubmit could double-execute if the chain saw the original but the
+    response was lost on the WS close.
+
+    Pre-merge review (2026-05-08) flagged this as P1: the original cut
+    routed `submit_bond` through `_call_with_retry` which would resubmit
+    and double-bond. Pin the no-retry behavior here so a future refactor
+    cannot silently re-introduce the regression.
+    """
+    client = _build_client()
+    call_count = {"n": 0}
+
+    def flaky_submit():
+        call_count["n"] += 1
+        raise socket.timeout("simulated wedge during submit")
+
+    fake_handle = mock.Mock()
+
+    def fake_connect():
+        client.substrate = fake_handle
+        client._last_ok_at = time.monotonic()
+        return True
+
+    with mock.patch.object(client, "connect", side_effect=fake_connect):
+        with pytest.raises(socket.timeout):
+            client._call_no_retry(flaky_submit)
+
+    # CRITICAL: must NOT have retried.
+    assert call_count["n"] == 1, (
+        f"_call_no_retry resubmitted (n={call_count['n']}) — "
+        "this re-introduces the P1 double-execution risk"
+    )
+    # Substrate handle dropped so next caller reconnects (matches
+    # _call_with_retry's behavior — same recovery, just no auto-retry).
+    assert client.substrate is None
+
+
+def test_submit_bond_is_not_decorated_with_at_rpc():
+    """`@_rpc` would route submit_bond through `_call_with_retry`, which
+    auto-retries on transient WS errors. For non-idempotent state changes
+    that's a P1 — a duplicate `bond()` call double-bonds. Pin the
+    routing through `_call_no_retry` instead. Catches accidental
+    re-introduction of the @_rpc decorator on submit_bond."""
+    client = _build_client()
+    no_retry_calls = {"n": 0}
+
+    original_no_retry = client._call_no_retry
+
+    def spy_no_retry(fn, *args, **kwargs):
+        no_retry_calls["n"] += 1
+        # Make it return a sentinel without actually invoking.
+        return (False, None)
+
+    client._call_no_retry = spy_no_retry  # type: ignore[assignment]
+    try:
+        result = client.submit_bond(1000)
+    finally:
+        client._call_no_retry = original_no_retry  # type: ignore[assignment]
+
+    assert no_retry_calls["n"] == 1, "submit_bond is no longer routing through _call_no_retry"
+    assert result == (False, None)
 
 
 def test_lock_serializes_concurrent_calls():

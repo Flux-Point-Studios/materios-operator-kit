@@ -64,10 +64,15 @@ class DaemonConfig:
     # websocket.create_connection(timeout=N). Without this the underlying
     # `socket.recv()` blocks forever when the chain RPC silently stops
     # responding — observed wedges of 11+ hours on the 2026-05-08 incident.
-    # 30s is generous enough for any single RPC (block events fetch, large
-    # state queries) while ensuring the daemon notices a dead socket inside
-    # one poll cycle.
-    ws_recv_timeout: int = 30
+    # 45s is generous enough for `submit_extrinsic(wait_for_inclusion=True)`
+    # on a congested mempool / 1-2 block reorg (worst case ~24s) while
+    # ensuring the daemon notices a dead socket inside one poll cycle. Was
+    # 30s in the first cut of this fix — bumped after pre-merge security
+    # review flagged that 30s could trigger premature reconnect on a slow
+    # extrinsic submit (which compounds with the non-idempotent retry
+    # concern, since fixed by routing extrinsic submits through
+    # `_call_no_retry`).
+    ws_recv_timeout: int = 45
     # `ws_connected_freshness`: how many seconds since the last successful
     # RPC the `connected` property still reports True. Decoupled from
     # `ws_recv_timeout` so that a single long call doesn't immediately
