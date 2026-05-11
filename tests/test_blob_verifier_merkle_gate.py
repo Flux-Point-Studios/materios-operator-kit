@@ -75,7 +75,11 @@ def _make_receipt(receipt_id: str, base_root: bytes) -> ReceiptRecord:
         content_hash=b"\x11" * 32,
         base_root_sha256=base_root,
         storage_locator_hash=b"\x22" * 32,
-        schema_hash=b"\x33" * 32,
+        # Use LEGACY_SCHEMA_HASH (zero bytes) — this fixture exercises the
+        # legacy chunk-Merkle path which is what was active before task #198
+        # added schema-aware dispatch. Receipts on chain with schema_hash=0x00
+        # MUST keep going through this path for backward compatibility.
+        schema_hash=b"\x00" * 32,
         base_manifest_hash=b"\x44" * 32,
         safety_manifest_hash=b"\x55" * 32,
         monitor_config_hash=b"\x66" * 32,

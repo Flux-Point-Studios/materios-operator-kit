@@ -1,13 +1,54 @@
 import logging
+import socket
+import threading
 import time
-from typing import Optional
+from functools import wraps
+from typing import Optional, Callable, Any
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.exceptions import SubstrateRequestException
+from websocket import WebSocketException
 
 from daemon.config import DaemonConfig
 from daemon.models import ReceiptRecord
 
+
+def _bump_health_last_poll_ts() -> None:
+    """Update health_server's `last_poll_timestamp` to wall-clock now.
+
+    Called from `_call_with_retry`/`_call_no_retry` after every successful
+    RPC so the metric reflects "time since last successful chain
+    interaction", NOT "time since last completed poll cycle". Without this,
+    a long-running operation (e.g. 256-block startup catchup) would let
+    `last_poll_timestamp` stay frozen for minutes, tripping the cert-daemon
+    liveness watchdog's 90-180s threshold even though the daemon is
+    actively making forward progress on each block.
+
+    Imported lazily to avoid a hard dependency from substrate_client into
+    health_server (and to keep this file unit-testable without spinning
+    up the health server thread).
+    """
+    try:
+        from daemon import health_server as _hs
+        _hs.update_metrics(last_poll_timestamp=time.time())
+    except Exception:
+        # Health server may not be initialised in tests; never fail the
+        # actual RPC path because of a metric update.
+        pass
+
 logger = logging.getLogger(__name__)
+
+
+# Errors that mean "the WS layer is broken; reconnect and retry once".
+# Don't list SubstrateRequestException here — that's a chain-side error
+# (e.g. "no such storage key"); reconnecting wouldn't help and would mask bugs.
+_WS_TRANSIENT = (
+    socket.timeout,
+    WebSocketException,
+    ConnectionError,
+    BrokenPipeError,
+    OSError,
+    EOFError,
+)
 
 
 def _to_bytes32(val) -> bytes:
@@ -21,35 +62,231 @@ def _to_bytes32(val) -> bytes:
     return bytes(val)
 
 
+def _rpc(method: Callable) -> Callable:
+    """Decorator: route a SubstrateClient method through `_call_with_retry`.
+
+    Every public RPC method on SubstrateClient is wrapped so that:
+      1. socket-level recv timeout fires within `ws_recv_timeout` seconds
+         (set via `ws_options={'timeout': N}` on connect),
+      2. transient WS errors trigger one reconnect + retry,
+      3. `_last_ok_at` is bumped on every success so the `connected`
+         property reports honest state to heartbeat/metrics consumers.
+
+    Substrate-side errors (SubstrateRequestException) propagate untouched —
+    those are real chain responses and must not be silently retried.
+    """
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        return self._call_with_retry(method, self, *args, **kwargs)
+    return wrapper
+
+
 class SubstrateClient:
+    """Wrapper around substrate-interface that adds WS-transport hardening.
+
+    SCOPE OF GUARANTEES — IMPORTANT:
+
+    The retry shell, lock serialization, and recv-timeout protections only
+    cover RPC calls that go THROUGH this class's public methods (the ones
+    decorated `@_rpc` for queries, or routed through `_call_no_retry` for
+    state-changing submits).
+
+    Several call sites in the daemon currently bypass this layer and
+    access `client.substrate.*` directly — e.g. `cert_daemon.py` for
+    the `join_committee` flow (lines ~708, 738, 743, 747) and
+    `evidence_submitter.py` for `submit_evidence` (~593, 627, 642, 693,
+    697). Those callers race against this class's lock and will not
+    benefit from auto-reconnect on transient WS errors. Per the 2026-05-08
+    pre-merge review, this is a known scope gap; the structural fix is
+    to add public methods + `@_rpc` decoration for each bypass site,
+    tracked under task #156 (cert-daemon evidence_submitter timeout).
+    Until that lands, those bypass sites are best-effort and the cron
+    liveness watchdog at materios-node/cert-daemon-liveness-watchdog.sh
+    is the safety net.
+    """
+
     def __init__(self, config: DaemonConfig):
         self.config = config
         self.substrate: Optional[SubstrateInterface] = None
         self.keypair = Keypair.create_from_uri(config.signer_uri)
+        # Serialize all RPC calls + reconnects. substrate-interface internally
+        # uses a single WS connection; concurrent callers (poll loop +
+        # evidence_submitter + bond/heartbeat helpers) must NOT issue
+        # interleaved requests on the same socket — the response queue
+        # is keyed by request id and concurrent send/recv pairs race.
+        # NOTE: this lock only guards calls through this class's API;
+        # see class-level docstring for the bypass-path scope gap.
+        self._lock = threading.RLock()
+        # Monotonic timestamp of the last successful RPC. Defaults to 0.0
+        # so the freshly-constructed client is reported as NOT connected
+        # until the first call lands. (`connect()` immediately bumps it
+        # on a successful WS handshake.)
+        self._last_ok_at: float = 0.0
+
+    # ─── connection lifecycle ────────────────────────────────────────────
+
+    @property
+    def _ws_recv_timeout(self) -> int:
+        # Honoured by `websocket.create_connection(timeout=N)` → sets
+        # `socket.settimeout(N)` on the underlying TCP socket so blocking
+        # `.recv()` raises `socket.timeout` instead of hanging forever.
+        return getattr(self.config, "ws_recv_timeout", 30)
+
+    @property
+    def _connected_freshness(self) -> int:
+        # `connected` returns True only if the most recent successful RPC
+        # was within this many seconds. Independent of `ws_recv_timeout`
+        # so a long-running call doesn't immediately mark us disconnected.
+        return getattr(self.config, "ws_connected_freshness", 90)
 
     def connect(self) -> bool:
-        try:
-            self.substrate = SubstrateInterface(url=self.config.rpc_url, config={'strict_scale_decode': False})
-            logger.info(f"Connected to {self.config.rpc_url}, chain: {self.substrate.chain}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to substrate: {e}")
-            self.substrate = None
-            return False
+        """(Re-)open the WS connection. Idempotent + safe to call from any
+        thread. On success bumps `_last_ok_at` so `connected` flips to True."""
+        with self._lock:
+            # Tear down a stale connection before opening a new one.
+            if self.substrate is not None:
+                try:
+                    # close() may itself raise on a dead socket; suppress.
+                    self.substrate.close()
+                except Exception:
+                    pass
+                self.substrate = None
+            try:
+                self.substrate = SubstrateInterface(
+                    url=self.config.rpc_url,
+                    config={"strict_scale_decode": False},
+                    ws_options={"timeout": self._ws_recv_timeout},
+                )
+                # Probe the connection so a half-open socket is caught at
+                # connect time, not on first business-logic call.
+                _ = self.substrate.chain
+                self._last_ok_at = time.monotonic()
+                logger.info(
+                    f"Connected to {self.config.rpc_url}, chain: {self.substrate.chain} "
+                    f"(ws_recv_timeout={self._ws_recv_timeout}s)"
+                )
+                return True
+            except Exception as e:
+                logger.error(f"Failed to connect to substrate: {e}")
+                self.substrate = None
+                return False
 
     @property
     def connected(self) -> bool:
-        return self.substrate is not None
+        """Truthful liveness check.
 
+        Returns True only when the WS object exists AND a successful RPC
+        landed within `_connected_freshness` seconds. Avoids the original
+        bug where `substrate is not None` reported True even after the
+        underlying socket had been silently dead for hours.
+        """
+        if self.substrate is None:
+            return False
+        return (time.monotonic() - self._last_ok_at) < self._connected_freshness
+
+    # ─── retry shell ─────────────────────────────────────────────────────
+
+    def _call_with_retry(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
+        """Run `fn(*args, **kwargs)` with one auto-reconnect retry on a
+        WS-transport error. Substrate-side errors propagate untouched.
+
+        SAFETY: only use this for IDEMPOTENT operations — queries, header
+        reads, event scans. For state-changing extrinsics (signed tx
+        submits) use `_call_no_retry` instead: an auto-retry mid-submit
+        risks resubmitting a tx the chain already accepted but whose
+        response we lost on the WS close, causing double-execution.
+        """
+        last_exc: Optional[BaseException] = None
+        for attempt in (1, 2):
+            with self._lock:
+                if self.substrate is None:
+                    if not self.connect():
+                        # Couldn't even open a fresh socket — let the
+                        # caller's outer except handle the outage.
+                        raise ConnectionError(
+                            f"substrate-client: cannot reach {self.config.rpc_url}"
+                        )
+                try:
+                    result = fn(*args, **kwargs)
+                    self._last_ok_at = time.monotonic()
+                    _bump_health_last_poll_ts()
+                    return result
+                except SubstrateRequestException:
+                    # Real chain-side error (e.g. unknown storage). The
+                    # WS is fine; bumping the freshness stamp is correct.
+                    self._last_ok_at = time.monotonic()
+                    _bump_health_last_poll_ts()
+                    raise
+                except _WS_TRANSIENT as e:
+                    last_exc = e
+                    logger.warning(
+                        f"substrate-client: WS error on attempt {attempt} "
+                        f"({type(e).__name__}: {e}); reconnecting"
+                    )
+                    # Force a reconnect on next iteration.
+                    try:
+                        if self.substrate is not None:
+                            self.substrate.close()
+                    except Exception:
+                        pass
+                    self.substrate = None
+                    continue
+        # Fell through both attempts.
+        raise last_exc if last_exc is not None else ConnectionError(
+            "substrate-client: retry shell exhausted"
+        )
+
+    def _call_no_retry(self, fn: Callable, *args: Any, **kwargs: Any) -> Any:
+        """Like `_call_with_retry` but does NOT auto-retry on WS errors.
+
+        Use for state-changing extrinsics (`submit_bond`,
+        `_submit_cert_inner`, etc.) where a transparent retry could
+        double-execute. The substrate handle is still dropped on a WS
+        error so the next caller reconnects, but THIS call propagates
+        the failure up so the caller (which knows whether resubmit is
+        safe — typically by re-reading on-chain state first) decides.
+        """
+        with self._lock:
+            if self.substrate is None:
+                if not self.connect():
+                    raise ConnectionError(
+                        f"substrate-client: cannot reach {self.config.rpc_url}"
+                    )
+            try:
+                result = fn(*args, **kwargs)
+                self._last_ok_at = time.monotonic()
+                _bump_health_last_poll_ts()
+                return result
+            except SubstrateRequestException:
+                self._last_ok_at = time.monotonic()
+                _bump_health_last_poll_ts()
+                raise
+            except _WS_TRANSIENT:
+                # Mark the WS broken so the next caller reconnects, but
+                # do NOT retry here — caller decides if the operation
+                # can safely be re-attempted (after re-reading state).
+                try:
+                    if self.substrate is not None:
+                        self.substrate.close()
+                except Exception:
+                    pass
+                self.substrate = None
+                raise
+
+    # ─── chain-state queries (all WS-wrapped via @_rpc) ──────────────────
+
+    @_rpc
     def get_finalized_head_number(self) -> int:
         head_hash = self.substrate.get_chain_finalised_head()
         header = self.substrate.get_block_header(head_hash)
         return header["header"]["number"]
 
+    @_rpc
     def get_best_block_number(self) -> int:
         header = self.substrate.get_block_header()
         return header["header"]["number"]
 
+    @_rpc
     def get_genesis_hash(self) -> str:
         """Return the chain's genesis hash (0x-prefixed lowercase hex). Used to
         detect that we're pointed at a different chain than we were last run
@@ -61,6 +298,7 @@ class SubstrateClient:
     # reserved MATRA at or above `BondRequirement` so `join_committee` doesn't
     # fail with `InsufficientBond`. See README → "Auto-bond on startup".
 
+    @_rpc
     def get_bond_requirement(self) -> int:
         """Return `OrinqReceipts.BondRequirement` in MATRA base units (u128).
 
@@ -73,6 +311,7 @@ class SubstrateClient:
             return 0
         return int(val)
 
+    @_rpc
     def get_attestor_bond(self, address: str) -> int:
         """Return `OrinqReceipts.AttestorBonds(address)` in base units.
 
@@ -86,6 +325,7 @@ class SubstrateClient:
             return 0
         return int(val)
 
+    @_rpc
     def get_free_balance(self, address: str) -> int:
         """Return `System.Account(address).data.free` in base units.
 
@@ -107,7 +347,16 @@ class SubstrateClient:
         Returns `(True, tx_hash_hex)` on successful inclusion, `(False, None)`
         otherwise. Raises on unrecoverable exceptions — callers should wrap in
         try/except to avoid killing daemon startup on transient RPC errors.
+
+        Routed through `_call_no_retry` (NOT `_call_with_retry`) because
+        `bond()` is non-idempotent: if the first submit reaches the chain
+        but the response is dropped on a WS close, an auto-retry would
+        double-bond. Callers idempotently re-observe via
+        `get_attestor_bond()` before resubmitting.
         """
+        return self._call_no_retry(self._submit_bond_inner, amount)
+
+    def _submit_bond_inner(self, amount: int) -> tuple[bool, Optional[str]]:
         call = self.substrate.compose_call(
             call_module="OrinqReceipts",
             call_function="bond",
@@ -128,6 +377,7 @@ class SubstrateClient:
             logger.error(f"bond({amount}) failed: {receipt.error_message}")
             return False, None
 
+    @_rpc
     def get_block_events(self, block_number: int) -> list:
         block_hash = self.substrate.get_block_hash(block_number)
         events = self.substrate.get_events(block_hash=block_hash)
@@ -143,6 +393,7 @@ class SubstrateClient:
                 })
         return receipt_events
 
+    @_rpc
     def get_block_certified_events(self, block_number: int) -> list:
         """Scan a block for AvailabilityCertified events."""
         block_hash = self.substrate.get_block_hash(block_number)
@@ -158,6 +409,7 @@ class SubstrateClient:
                 })
         return certified
 
+    @_rpc
     def get_receipt(self, receipt_id: str) -> Optional[ReceiptRecord]:
         result = self.substrate.query(
             module="OrinqReceipts",
@@ -185,33 +437,58 @@ class SubstrateClient:
         )
 
     def submit_availability_cert(self, receipt_id: str, cert_hash: bytes) -> bool:
-        """Submit attest_availability_cert directly (no Sudo). Returns True on finalization."""
+        """Submit attest_availability_cert directly (no Sudo). Returns True on finalization.
+
+        Note: this method has its OWN retry loop (over chain-side
+        SubstrateRequestException for transient nonce/inclusion races) that
+        is distinct from the WS-transport retry. The single-shot inner
+        chain call is routed through `_call_no_retry` (NOT
+        `_call_with_retry`) because attest_availability_cert may not be
+        fully idempotent across all chain states — a transparent
+        same-block resubmit could trigger duplicate-pubkey or
+        already-certified errors that look like real chain rejections.
+        Instead, on a WS error the inner call surfaces the failure to
+        this outer loop, which sleeps + reconnects via the next
+        iteration's first call.
+        """
         for attempt in range(self.config.tx_max_retries):
             try:
-                call = self.substrate.compose_call(
-                    call_module="OrinqReceipts",
-                    call_function="attest_availability_cert",
-                    call_params={
-                        "receipt_id": receipt_id,
-                        "cert_hash": list(cert_hash),
-                    },
-                )
-                extrinsic = self.substrate.create_signed_extrinsic(
-                    call=call,
-                    keypair=self.keypair,
-                )
-                receipt = self.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
-                if receipt.is_success:
-                    logger.info(f"Cert attested for {receipt_id}, block {receipt.block_hash}")
-                    return True
-                else:
-                    logger.error(f"Cert tx failed for {receipt_id}: {receipt.error_message}")
+                return self._call_no_retry(self._submit_cert_inner, receipt_id, cert_hash)
             except SubstrateRequestException as e:
                 logger.error(f"Cert tx attempt {attempt + 1} failed for {receipt_id}: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
-            except Exception as e:
-                logger.error(f"Unexpected error submitting cert for {receipt_id}: {e}")
+            except _WS_TRANSIENT as e:
+                # WS-layer error — substrate handle was already dropped
+                # by `_call_no_retry`; next iteration will reconnect.
+                logger.error(f"Cert tx attempt {attempt + 1} WS error for {receipt_id}: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
+            except Exception as e:
+                # Unknown non-WS, non-chain exception — almost certainly
+                # a programming bug. Don't keep hammering it.
+                logger.error(f"Unexpected error submitting cert for {receipt_id}: {e}")
+                raise
+        return False
+
+    def _submit_cert_inner(self, receipt_id: str, cert_hash: bytes) -> bool:
+        call = self.substrate.compose_call(
+            call_module="OrinqReceipts",
+            call_function="attest_availability_cert",
+            call_params={
+                "receipt_id": receipt_id,
+                "cert_hash": list(cert_hash),
+            },
+        )
+        extrinsic = self.substrate.create_signed_extrinsic(
+            call=call,
+            keypair=self.keypair,
+        )
+        receipt = self.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
+        if receipt.is_success:
+            logger.info(f"Cert attested for {receipt_id}, block {receipt.block_hash}")
+            return True
+        logger.error(f"Cert tx failed for {receipt_id}: {receipt.error_message}")
+        # Returning False (rather than raising) preserves the original
+        # caller contract: True = on-chain success, False = chain rejected.
         return False
