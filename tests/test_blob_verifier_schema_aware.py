@@ -36,6 +36,7 @@ from daemon.schemas import (
     LEGACY_SCHEMA_HASH,
     SCHEMA_HASH_COMPUTE_METERING_V2,
     SCHEMA_HASH_COMPUTE_METERING_V2_1,
+    SCHEMA_HASH_ORYNQ_TRACE_V1,
 )
 
 
@@ -211,6 +212,60 @@ def test_v2_inline_record_with_empty_chunks_verifies():
     assert result.attestation_level == AttestationLevel.ROOT_VERIFIED, (
         f"v2 inline self-rooted rejected at {result.attestation_level.name}, errors={result.errors}"
     )
+
+
+def test_orynq_trace_v1_envelope_verifies_with_semantic_root():
+    """orynq_trace_v1 receipts use a semantic root (Merkle of the trace
+    event tree) as base_root_sha256, while content_hash pins the
+    JSON-serialised publicView. The two intentionally differ — the
+    discriminator path accepts on faith because chunk integrity is
+    verified independently.
+
+    This is the live-evidence shape of receipts produced by
+    materios-orynq-drain.service (drain.mjs → anchors-materios
+    submitCertifiedReceipt) — the 93% rejection class from task #198/200.
+    """
+    from aiohttp import web
+
+    json_bytes = b'{"taskId":"task-xyz","events":[{"kind":"prompt"}]}'
+    json_hash = sha256(json_bytes)
+    semantic_trace_root = sha256(b"merkle-of-trace-events-distinct-value")
+    assert json_hash != semantic_trace_root
+
+    receipt = _make_receipt(
+        "0xdr" + "00" * 31,
+        content_hash=json_hash,
+        base_root=semantic_trace_root,
+        schema_hash=SCHEMA_HASH_ORYNQ_TRACE_V1,
+    )
+
+    async def _go():
+        async def handler(request):
+            return web.Response(body=json_bytes, content_type="application/octet-stream")
+
+        app = web.Application()
+        app.router.add_get("/chunk", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            manifest = BlobManifest(
+                receipt_id=receipt.receipt_id,
+                chunks=[ChunkInfo(0, f"http://127.0.0.1:{port}/chunk", json_hash, len(json_bytes))],
+            )
+            verifier = BlobVerifier(DaemonConfig())
+            return await verifier.verify(receipt, manifest)
+        finally:
+            await runner.cleanup()
+
+    result = _run(_go())
+    assert result.attestation_level == AttestationLevel.ROOT_VERIFIED, (
+        f"orynq_trace_v1 rejected at {result.attestation_level.name}, errors={result.errors}. "
+        f"This is the live production rejection class — drain.mjs receipts must verify."
+    )
+    assert result.chunks_verified == 1
 
 
 def test_v2_1_schema_hash_takes_same_path():
