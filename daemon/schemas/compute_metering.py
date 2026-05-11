@@ -36,24 +36,7 @@ SCHEMA_HASH_COMPUTE_METERING_V2_1: bytes = hashlib.sha256(
 
 LEGACY_SCHEMA_HASH: bytes = b"\x00" * 32
 
-TRUSTED_DISCRIMINATOR_SCHEMAS: FrozenSet[bytes] = frozenset(
-    {
-        SCHEMA_HASH_COMPUTE_METERING_V2,
-        SCHEMA_HASH_COMPUTE_METERING_V2_1,
-    }
-)
-
-
-def schema_name(schema_hash: bytes) -> Optional[str]:
-    """Return a human-readable name for a known schema hash, or None.
-
-    Used only in logs — never in cert_hash inputs, so a future name change
-    doesn't affect M-of-N determinism.
-    """
-    if schema_hash == LEGACY_SCHEMA_HASH:
-        return "legacy_blob"
-    if schema_hash == SCHEMA_HASH_COMPUTE_METERING_V2:
-        return SCHEMA_VERSION_COMPUTE_METERING_V2
-    if schema_hash == SCHEMA_HASH_COMPUTE_METERING_V2_1:
-        return SCHEMA_VERSION_COMPUTE_METERING_V2_1
-    return None
+# Canonical TRUSTED_DISCRIMINATOR_SCHEMAS + schema_name() live in
+# `daemon/schemas/__init__.py` so additional schema modules can register
+# without circular imports. Importers should pull from `daemon.schemas`
+# (the package), not this file directly.
