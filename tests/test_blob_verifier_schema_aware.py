@@ -432,6 +432,23 @@ def test_v2_inline_record_with_zero_content_hash_is_rejected_sentinel_guard():
     )
 
 
+def test_every_trusted_schema_has_a_registered_name():
+    """Lockstep check: every entry in TRUSTED_DISCRIMINATOR_SCHEMAS must
+    also be a known case in schema_name(). Catches registration omissions
+    at test time so the BlobVerifier dispatch path's runtime None-guard
+    never has to fire in production.
+    """
+    from daemon.schemas import TRUSTED_DISCRIMINATOR_SCHEMAS, schema_name
+
+    for sh in TRUSTED_DISCRIMINATOR_SCHEMAS:
+        name = schema_name(sh)
+        assert name is not None, (
+            f"hash {sh.hex()} in TRUSTED_DISCRIMINATOR_SCHEMAS has no name "
+            f"in schema_name(). Add the case in daemon/schemas/__init__.py."
+        )
+        assert isinstance(name, str) and len(name) > 0
+
+
 def test_malformed_schema_hash_length_is_rejected_at_dispatch():
     """Defense against RPC decode drift / codec bugs: a schema_hash that
     isn't exactly 32 bytes must NOT fall through to "unknown schema" and

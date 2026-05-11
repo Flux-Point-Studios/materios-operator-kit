@@ -88,14 +88,33 @@ class BlobVerifier:
 
         if sh in TRUSTED_DISCRIMINATOR_SCHEMAS:
             # By construction every hash in TRUSTED_DISCRIMINATOR_SCHEMAS
-            # has a registered name in daemon/schemas/__init__.py
-            # schema_name(), so `name` is guaranteed non-None here. Pass
-            # it directly; no defensive fallback string.
-            assert name is not None, (
-                f"BUG: hash {sh.hex()} is in TRUSTED_DISCRIMINATOR_SCHEMAS "
-                f"but schema_name() returned None. Register the name in "
-                f"daemon/schemas/__init__.py."
-            )
+            # also has a registered name in daemon/schemas/__init__.py
+            # schema_name(). A None here is a BUG (registration omission)
+            # that should page loudly, not silently substitute a fake
+            # label. But we still need to honor the VerificationResult
+            # contract — every other failure path returns a result
+            # rather than raising, and `assert` would (a) strip under
+            # -O / PYTHONOPTIMIZE=1, (b) bubble as an uncaught exception
+            # that crashes the poll-loop coroutine. So: log CRITICAL +
+            # return an error result. The lockstep test
+            # `test_every_trusted_schema_has_a_registered_name` is the
+            # real safety net — this branch is the runtime backstop.
+            if name is None:
+                logger.critical(
+                    f"BUG: schema_hash {sh.hex()} is in "
+                    f"TRUSTED_DISCRIMINATOR_SCHEMAS but schema_name() "
+                    f"returned None. Register the name in "
+                    f"daemon/schemas/__init__.py::schema_name()."
+                )
+                result = VerificationResult(
+                    attestation_level=AttestationLevel.FETCHED,
+                    chunks_total=len(manifest.chunks),
+                )
+                result.errors.append(
+                    f"Trusted discriminator schema_hash {sh.hex()} has no "
+                    f"registered name. Operator-kit configuration bug."
+                )
+                return result
             return await self._verify_trusted_discriminator(
                 receipt, manifest, schema_label=name,
             )
