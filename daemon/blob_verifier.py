@@ -162,12 +162,28 @@ class BlobVerifier:
         Required invariant for acceptance:
             merkle_root(chunk_hashes) == content_hash
 
-        That equation is the "envelope is well-formed" check — it proves
-        the chunks the gateway returned hash to the same content_hash the
-        chain recorded. If true, the envelope bytes are pinned byte-for-
-        byte across all committee members, and the schema-specific
-        meaning of base_root_sha256 can be trusted at the M-of-N
-        committee layer.
+        What this invariant proves and DOESN'T prove:
+          PROVES: the chunks the gateway served to THIS attester hash to
+          the same content_hash the chain recorded. Envelope bytes are
+          deterministic across all committee members who see the same
+          content_hash → same chunks → same hashes.
+          DOES NOT prove: that base_root_sha256 (the semantic root) was
+          honestly derived from those envelope bytes. The semantic root
+          remains caller-supplied; this verifier accepts it on faith for
+          schemas in `TRUSTED_DISCRIMINATOR_SCHEMAS`.
+
+        The defense against a dishonest semantic root is the M-of-N
+        committee threshold + Cardano L1 anchor — NOT a second
+        verification inside cert-daemon. Downstream consumers (billing
+        API, observers) that read the envelope bytes + the on-chain
+        base_root_sha256 are responsible for re-deriving the semantic
+        root and rejecting mismatches at THEIR layer.
+
+        For v2.0 this trust split is acceptable. A future schema joining
+        `TRUSTED_DISCRIMINATOR_SCHEMAS` whose semantic root cannot be
+        independently re-derived by downstream consumers SHOULD instead
+        register a per-schema canonicalization hook here. See followup
+        task on the security review of this commit.
 
         Sub-case (chunks=[]): a metering record that is fully inline in
         the manifest body (gateway stores `{record, chunks: []}`).
@@ -180,8 +196,16 @@ class BlobVerifier:
         if not manifest.chunks:
             # Inline-record self-rooted case. base_root_sha256 == content_hash
             # is the on-chain assertion that the rootHash callback was wired
-            # correctly. If that holds, accept.
-            if receipt.base_root_sha256 == receipt.content_hash:
+            # correctly. We ALSO require content_hash != zero-bytes — the
+            # sentinel `b'\\x00' * 32` is what `merkle_root([])` returns and
+            # what unset chain fields decode to; without this guard a
+            # malicious or buggy submitter could grind an all-zero
+            # content_hash + base_root and get ROOT_VERIFIED for free.
+            # (Security-review followup, 2026-05-11.)
+            if (
+                receipt.base_root_sha256 == receipt.content_hash
+                and receipt.content_hash != LEGACY_SCHEMA_HASH
+            ):
                 logger.info(
                     f"Schema-discriminator self-rooted for {receipt.receipt_id} "
                     f"(schema={schema_label}, chunks=[], "

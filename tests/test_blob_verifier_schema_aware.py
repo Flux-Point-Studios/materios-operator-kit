@@ -349,6 +349,34 @@ def test_legacy_blob_rejected_on_merkle_mismatch_unchanged():
 # ---------------------------------------------------------------------------
 
 
+def test_v2_inline_record_with_zero_content_hash_is_rejected_sentinel_guard():
+    """Security guard (review #1, 2026-05-11): the chunks=[] + base_root
+    == content_hash branch must REJECT when content_hash is the all-zero
+    sentinel. Otherwise a submitter could grind a zero content_hash +
+    base_root and free-ride ROOT_VERIFIED via the discriminator path
+    without uploading any envelope at all.
+    """
+    zero_hash = b"\x00" * 32
+    receipt = _make_receipt(
+        "0xab" * 32,
+        content_hash=zero_hash,
+        base_root=zero_hash,
+        schema_hash=SCHEMA_HASH_COMPUTE_METERING_V2,
+    )
+    manifest = BlobManifest(receipt_id=receipt.receipt_id, chunks=[], total_size=0)
+
+    async def _go():
+        verifier = BlobVerifier(DaemonConfig())
+        return await verifier.verify(receipt, manifest)
+
+    result = _run(_go())
+    assert result.attestation_level < AttestationLevel.ROOT_VERIFIED, (
+        f"sentinel zero-bytes content_hash was accepted at {result.attestation_level.name} "
+        "— the all-zero sentinel guard is the only thing keeping a malicious "
+        "submitter from grinding chunks=[] + base_root==content_hash==0x00 for free."
+    )
+
+
 def test_unknown_schema_hash_is_rejected_not_silently_passed():
     """A receipt with a schema_hash we don't recognize must NOT fall through
     to the legacy chunk-Merkle path. New schemas must register in
