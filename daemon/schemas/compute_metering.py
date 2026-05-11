@@ -21,7 +21,6 @@ exact version string).
 from __future__ import annotations
 
 import hashlib
-from typing import FrozenSet, Optional
 
 
 SCHEMA_VERSION_COMPUTE_METERING_V2 = "compute_metering_v2"

@@ -37,7 +37,7 @@ class BlobVerifier:
             metering records that landed before this dispatcher existed.
 
           - A schema in `TRUSTED_DISCRIMINATOR_SCHEMAS` (currently
-            `compute_metering_v2`, `compute_metering_v2_1`):
+            `compute_metering_v2`, `compute_metering_v2_1`, `orynq_trace_v1`):
             trust-the-discriminator path. Chunk integrity is independently
             verified (`chunk-Merkle == content_hash` — the envelope bytes
             are cryptographically pinned by the on-chain content_hash).
