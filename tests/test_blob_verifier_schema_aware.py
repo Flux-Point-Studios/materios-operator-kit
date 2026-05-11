@@ -432,6 +432,42 @@ def test_v2_inline_record_with_zero_content_hash_is_rejected_sentinel_guard():
     )
 
 
+def test_malformed_schema_hash_length_is_rejected_at_dispatch():
+    """Defense against RPC decode drift / codec bugs: a schema_hash that
+    isn't exactly 32 bytes must NOT fall through to "unknown schema" and
+    look like a class-registration omission. Surface the malformation
+    explicitly so operators see the real cause (substrate_client decode
+    path) in the log.
+    """
+    chunk_data = b"data"
+    chunk_hash = sha256(chunk_data)
+    # Pass a 16-byte schema_hash — half-length, plausible under a partial
+    # decode bug.
+    short_schema = b"\x77" * 16
+    receipt = _make_receipt(
+        "0xbe" * 32,
+        content_hash=chunk_hash,
+        base_root=chunk_hash,
+        schema_hash=short_schema,
+    )
+
+    async def _go():
+        manifest = BlobManifest(
+            receipt_id=receipt.receipt_id,
+            chunks=[ChunkInfo(0, "http://nowhere/chunk", chunk_hash, len(chunk_data))],
+        )
+        verifier = BlobVerifier(DaemonConfig())
+        return await verifier.verify(receipt, manifest)
+
+    result = _run(_go())
+    assert result.attestation_level < AttestationLevel.ROOT_VERIFIED
+    # Error should call out the length specifically — not the generic
+    # "Unknown schema_hash" message — so operators can find the decode path.
+    assert any("not a 32-byte" in e or "expected 32-byte" in e for e in result.errors), (
+        f"malformed schema_hash didn't surface a length-specific error: {result.errors}"
+    )
+
+
 def test_unknown_schema_hash_is_rejected_not_silently_passed():
     """A receipt with a schema_hash we don't recognize must NOT fall through
     to the legacy chunk-Merkle path. New schemas must register in
