@@ -257,22 +257,12 @@ class CertDaemon:
                 logger.warning(f"Failed to remove checkpoint state: {e}")
         self._live_chain_genesis = live
 
-        # IMPORTANT: As of 2026-05-12, `build_cert` reads `self._live_chain_genesis`
-        # directly (not `self.config.chain_id`). The cert_daemon.process_receipt
-        # path is therefore immune to stale CHAIN_ID env. However, the
-        # checkpoint pipeline (daemon/checkpoint.py) STILL reads
-        # `self.config.chain_id` for leaf metadata + materios_chain_id binding.
-        # If env was empty, auto-populate so checkpoints work. If env was set
-        # (even to a stale value), we leave it alone — overwriting a wrongly-
-        # set value would conflict with whatever the operator intended (and
-        # the broader fix is task #207, which migrates checkpoint.py to
-        # `_live_chain_genesis` too).
-        if not self.config.chain_id:
-            self.config.chain_id = live.removeprefix("0x")
-            logger.info(
-                f"CHAIN_ID env was empty; auto-populated config.chain_id from "
-                f"live RPC for checkpoint binding: {self.config.chain_id[:16]}..."
-            )
+        # As of 2026-05-12, both cert construction (`build_cert`) and the
+        # checkpoint pipeline (`checkpoint.py::flush`) read
+        # `self._live_chain_genesis` directly. `config.chain_id` is no longer
+        # consulted on the hot path — env is decorative documentation only.
+        # See feedback_cert_daemon_chain_id_must_be_set.md for the bug class
+        # this migration eliminates.
 
     def save_state(self):
         try:
@@ -922,7 +912,17 @@ class CertDaemon:
 
                 # Periodic L1 checkpoint flush
                 if self.config.checkpoint_enabled and self.checkpointer.should_flush():
-                    self.checkpointer.flush(current_best_block=head)
+                    live_genesis = getattr(self, "_live_chain_genesis", None)
+                    if not live_genesis:
+                        logger.warning(
+                            "Checkpoint flush deferred: _live_chain_genesis "
+                            "not yet set. Will retry next interval."
+                        )
+                    else:
+                        self.checkpointer.flush(
+                            current_best_block=head,
+                            live_chain_genesis=live_genesis,
+                        )
 
                 # Track finalized head for health metrics
                 try:
