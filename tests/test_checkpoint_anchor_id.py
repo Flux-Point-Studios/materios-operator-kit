@@ -187,7 +187,7 @@ class TestFlushPostsAnchorIdEverywhere:
 
             with patch("daemon.checkpoint.requests.post", side_effect=fake_post):
                 with patch("daemon.checkpoint.requests.put", side_effect=fake_put):
-                    ok = cp.flush(current_best_block=200)
+                    ok = cp.flush(current_best_block=200, live_chain_genesis="00" * 32)
 
             assert ok is True
             # Anchor-worker payload must include anchorId
@@ -237,7 +237,7 @@ class TestFlushPostsAnchorIdEverywhere:
 
             with patch("daemon.checkpoint.requests.post", side_effect=fake_post):
                 with patch("daemon.checkpoint.requests.put", side_effect=fake_put):
-                    cp.flush(current_best_block=200)
+                    cp.flush(current_best_block=200, live_chain_genesis="00" * 32)
 
             sent_anchor_id = seen["anchor_payload"]["anchorId"]
             sent_id_clean = sent_anchor_id.removeprefix("0x")
@@ -293,7 +293,7 @@ class TestFlushPostsAnchorIdEverywhere:
 
             with patch("daemon.checkpoint.requests.post", side_effect=fake_post):
                 with patch("daemon.checkpoint.requests.put", side_effect=fake_put):
-                    cp.flush(current_best_block=200)
+                    cp.flush(current_best_block=200, live_chain_genesis="00" * 32)
 
             # The gateway PUT must use the override id, not the locally-computed one.
             assert seen_gateway_url, "Gateway PUT was never invoked"
@@ -326,7 +326,7 @@ class TestFlushPostsAnchorIdEverywhere:
 
             with patch("daemon.checkpoint.requests.post", side_effect=fake_post):
                 with patch("daemon.checkpoint.requests.put", side_effect=fake_put):
-                    cp.flush(current_best_block=200)
+                    cp.flush(current_best_block=200, live_chain_genesis="00" * 32)
 
             # checkpoint-history.json should now exist alongside state file
             history_path = cp.state_file.replace(
@@ -378,7 +378,7 @@ class TestFlushPostsAnchorIdEverywhere:
 
             with patch("daemon.checkpoint.requests.post", side_effect=fake_post):
                 with patch("daemon.checkpoint.requests.put", side_effect=fake_put):
-                    ok = cp.flush(current_best_block=200)
+                    ok = cp.flush(current_best_block=200, live_chain_genesis="00" * 32)
 
             # Cardano submission was OK → checkpoint succeeded as a whole.
             assert ok is True

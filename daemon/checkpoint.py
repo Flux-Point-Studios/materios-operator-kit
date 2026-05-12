@@ -218,8 +218,16 @@ class CardanoCheckpointer:
         elapsed = (time.time() - self.last_flush_time) / 60.0
         return elapsed >= self.interval_minutes
 
-    def flush(self, current_best_block: int = 0) -> bool:
+    def flush(self, current_best_block: int = 0, live_chain_genesis: Optional[str] = None) -> bool:
         """Build Merkle root and submit checkpoint to Cardano anchor worker.
+
+        `live_chain_genesis` MUST be the authoritative chain genesis hash from
+        `chain_getBlockHash[0]` (the value cert_daemon stores on
+        `self._live_chain_genesis`). It binds every leaf and the manifest so
+        cross-chain replay / stale-env divergence is impossible by construction
+        (task #207 successor to cert-daemon PR #22). Passing `None` is a hard
+        error — flushes with an unknown chain context could anchor stale-chain
+        leaves to Cardano L1, which is unrecoverable.
 
         Only includes leaves confirmed by at least `finality_confirmations` blocks.
         Returns True if checkpoint was submitted successfully.
@@ -231,6 +239,17 @@ class CardanoCheckpointer:
             logger.warning("Checkpoint flush skipped: CARDANO_ANCHOR_URL not configured")
             return False
 
+        if not live_chain_genesis:
+            logger.error(
+                "Checkpoint flush refused: live_chain_genesis is unset. "
+                "The caller (cert_daemon.poll loop) MUST pass "
+                "self._live_chain_genesis. Skipping flush — leaves stay queued "
+                "and will retry next interval once live genesis is available."
+            )
+            return False
+
+        chain_id_norm = live_chain_genesis.removeprefix("0x").removeprefix("0X").lower()
+
         # Filter by confirmation depth
         confirmed_cutoff = current_best_block - self.config.finality_confirmations
         eligible = [l for l in self.pending_leaves if l["block_num"] <= confirmed_cutoff]
@@ -241,7 +260,7 @@ class CardanoCheckpointer:
             )
             return True  # nothing confirmed enough yet
 
-        chain_id_bytes = bytes.fromhex(self.config.chain_id)
+        chain_id_bytes = bytes.fromhex(chain_id_norm)
 
         leaves = []
         for leaf in eligible:
@@ -263,7 +282,7 @@ class CardanoCheckpointer:
         )
 
         manifest = {
-            "materios_chain_id": self.config.chain_id,
+            "materios_chain_id": chain_id_norm,
             "cardano_network_id": self.config.cardano_network_id,
             "from_block": from_block,
             "to_block": to_block,
