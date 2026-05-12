@@ -257,14 +257,21 @@ class CertDaemon:
                 logger.warning(f"Failed to remove checkpoint state: {e}")
         self._live_chain_genesis = live
 
-        # If CHAIN_ID env was left empty (our preprod compose through 2026-04-17
-        # shipped like this), auto-populate from the live RPC so checkpoint
-        # leaves bind to the right chain. Strip 0x so bytes.fromhex accepts it.
+        # IMPORTANT: As of 2026-05-12, `build_cert` reads `self._live_chain_genesis`
+        # directly (not `self.config.chain_id`). The cert_daemon.process_receipt
+        # path is therefore immune to stale CHAIN_ID env. However, the
+        # checkpoint pipeline (daemon/checkpoint.py) STILL reads
+        # `self.config.chain_id` for leaf metadata + materios_chain_id binding.
+        # If env was empty, auto-populate so checkpoints work. If env was set
+        # (even to a stale value), we leave it alone — overwriting a wrongly-
+        # set value would conflict with whatever the operator intended (and
+        # the broader fix is task #207, which migrates checkpoint.py to
+        # `_live_chain_genesis` too).
         if not self.config.chain_id:
             self.config.chain_id = live.removeprefix("0x")
             logger.info(
-                f"CHAIN_ID env was empty; auto-populated from live RPC: "
-                f"{self.config.chain_id[:16]}..."
+                f"CHAIN_ID env was empty; auto-populated config.chain_id from "
+                f"live RPC for checkpoint binding: {self.config.chain_id[:16]}..."
             )
 
     def save_state(self):
@@ -529,12 +536,31 @@ class CertDaemon:
                 )
                 return  # Don't certify — receipt stays with zero cert hash
 
-        # Get Cardano epoch
+        # Get Cardano epoch (still passed for API-compat; build_cert ignores it)
         epoch = self.get_cardano_epoch()
+
+        # Source the chain_id from the LIVE genesis we queried via RPC, not
+        # from the env-set config.chain_id. Operator env can drift stale
+        # across chain resets (2026-05-11 preprod: 5 receipts stranded because
+        # our 3 daemons had a v5 hash cached in env while external attestors
+        # used the correct v6 hash → CertHashMismatch every cross-attest).
+        # The live RPC value is the single source of truth.
+        live_chain_id = getattr(self, "_live_chain_genesis", None)
+        if not live_chain_id:
+            # Should be impossible by the time process_receipt runs (the poll
+            # loop calls verify_chain_genesis_or_wipe until _live_chain_genesis
+            # is set). Defensive: refuse to attest rather than silently fall
+            # back to a potentially-wrong value.
+            logger.error(
+                f"Cannot attest {receipt_id[:16]}…: _live_chain_genesis not "
+                f"set yet (substrate RPC has not provided the genesis hash). "
+                f"Skipping — will retry on next poll."
+            )
+            return
 
         # Build cert
         dcbor_bytes, cert_hash = build_cert(
-            chain_id=self.config.chain_id,
+            chain_id=live_chain_id,
             receipt_id=receipt_id,
             content_hash=receipt.content_hash,
             base_root_sha256=receipt.base_root_sha256,
