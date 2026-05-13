@@ -185,6 +185,37 @@ class TestScanForBadAttest:
 # --------------------------------------------------------------------------
 
 class TestSubmitAvailabilityCert:
+    def test_compose_call_uses_runtime_arg_name_claimed_hash(self, client):
+        """Spec-219's `attest_availability_cert` extrinsic takes `claimed_hash`,
+        NOT `cert_hash`. The runtime rejects the call with `Parameter
+        'claimed_hash' not specified` if we use the wrong key, even though
+        the daemon's Python variable name is `cert_hash`.
+
+        This test pins the call_params key against the runtime contract.
+        If the runtime ever renames it again, swap the assertion in lockstep.
+        First spotted by an external operator hitting the parameter-name
+        mismatch on the :7ccb6ff image; hotfixed 2026-05-13.
+        """
+        captured = {}
+        def capture_compose(call_module, call_function, call_params):
+            captured["module"] = call_module
+            captured["function"] = call_function
+            captured["params"] = call_params
+            return MagicMock()
+        client.substrate.compose_call = MagicMock(side_effect=capture_compose)
+        client.substrate.create_signed_extrinsic = MagicMock(return_value=MagicMock())
+        client.substrate.submit_extrinsic = MagicMock(return_value=_receipt(True, []))
+
+        client.submit_availability_cert(RECEIPT_ID, b"\xaa" * 32)
+        assert captured["module"] == "OrinqReceipts"
+        assert captured["function"] == "attest_availability_cert"
+        assert "claimed_hash" in captured["params"], \
+            "runtime expects claimed_hash; bare cert_hash will fail with 'Parameter not specified'"
+        assert "cert_hash" not in captured["params"], \
+            "cert_hash is the pre-spec-219 name; must not be passed"
+        assert captured["params"]["claimed_hash"] == list(b"\xaa" * 32)
+        assert captured["params"]["receipt_id"] == RECEIPT_ID
+
     def test_accepted_attest_returns_success_outcome(self, client):
         """Happy path: dispatch Ok, no strike events → success."""
         client.substrate.compose_call = MagicMock(return_value=MagicMock())

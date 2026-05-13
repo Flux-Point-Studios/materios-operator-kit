@@ -251,7 +251,7 @@ class SubstrateClient:
                     call_function="attest_availability_cert",
                     call_params={
                         "receipt_id": receipt_id,
-                        "cert_hash": list(cert_hash),
+                        "claimed_hash": list(cert_hash),
                     },
                 )
                 extrinsic = self.substrate.create_signed_extrinsic(
