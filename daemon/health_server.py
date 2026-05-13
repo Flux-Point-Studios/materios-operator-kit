@@ -36,6 +36,8 @@ _metrics = {
     "blocks_processed_total": 0,
     "certs_submitted_total": 0,
     "verification_failures_total": 0,
+    "bad_attest_strikes_total": 0,
+    "auto_slashed_total": 0,
     "pending_receipts": 0,
     "last_processed_block": 0,
     "last_poll_timestamp": 0.0,

@@ -581,10 +581,10 @@ class CertDaemon:
         #       making progress on locator/blob fetches while one submit is
         #       pending. The lock keeps the chain-write path itself serial.
         async with self._chain_write_lock:
-            success = await asyncio.to_thread(
+            outcome = await asyncio.to_thread(
                 self.client.submit_availability_cert, receipt_id, cert_hash
             )
-        if success:
+        if outcome.success:
             health_server.increment_metric("certs_submitted_total")
             async with self._pending_lock:
                 self.pending.pop(receipt_id, None)
@@ -592,6 +592,36 @@ class CertDaemon:
                 f"Cert submitted for `{receipt_id[:16]}...` (L{verification.attestation_level})",
                 "info",
             )
+        elif outcome.bad_attest_strike:
+            # spec-219: runtime rejected our cert_hash as non-canonical.
+            # Strike is permanent for this receipt — retry would re-strike
+            # against the same canonical value. Drop from pending so we
+            # stop wasting submits; operator must fix the input drift
+            # (chain_id, locator-hash, base-root) before any new receipts
+            # can succeed.
+            health_server.increment_metric("bad_attest_strikes_total")
+            async with self._pending_lock:
+                self.pending.pop(receipt_id, None)
+            if outcome.auto_slashed:
+                health_server.increment_metric("auto_slashed_total")
+                await self.send_discord(
+                    f"AUTO-SLASHED for bad attest on `{receipt_id[:16]}...` — "
+                    f"strikes={outcome.strikes}, "
+                    f"amount={outcome.slashed_amount}. "
+                    f"Signer ejected from committee; re-bond required after "
+                    f"fixing cert-builder input drift.",
+                    "critical",
+                )
+            else:
+                claimed_hex = outcome.claimed.hex()[:16] if outcome.claimed else "?"
+                canonical_hex = outcome.canonical.hex()[:16] if outcome.canonical else "?"
+                await self.send_discord(
+                    f"BadAttestStrike on `{receipt_id[:16]}...` — "
+                    f"strikes={outcome.strikes}, claimed=`{claimed_hex}...` "
+                    f"vs canonical=`{canonical_hex}...`. "
+                    f"Check chain_id / cert_builder inputs.",
+                    "critical",
+                )
         else:
             health_server.increment_metric("verification_failures_total")
             await self.send_discord(
