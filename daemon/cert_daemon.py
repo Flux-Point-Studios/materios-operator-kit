@@ -11,7 +11,7 @@ from daemon.models import AttestationLevel, PendingReceipt
 from daemon.substrate_client import SubstrateClient
 from daemon.locator_registry import LocatorRegistry
 from daemon.blob_verifier import BlobVerifier
-from daemon.cert_builder import build_cert
+from daemon.cert_builder import scale_cert_encode, scale_cert_hash
 from daemon.cert_store import CertStore
 from daemon.checkpoint import CardanoCheckpointer
 from daemon.content_validator import ContentValidator
@@ -257,7 +257,7 @@ class CertDaemon:
                 logger.warning(f"Failed to remove checkpoint state: {e}")
         self._live_chain_genesis = live
 
-        # As of 2026-05-12, both cert construction (`build_cert`) and the
+        # As of spec-219, both cert construction (`scale_cert_encode`) and the
         # checkpoint pipeline (`checkpoint.py::flush`) read
         # `self._live_chain_genesis` directly. `config.chain_id` is no longer
         # consulted on the hot path — env is decorative documentation only.
@@ -526,9 +526,6 @@ class CertDaemon:
                 )
                 return  # Don't certify — receipt stays with zero cert hash
 
-        # Get Cardano epoch (still passed for API-compat; build_cert ignores it)
-        epoch = self.get_cardano_epoch()
-
         # Source the chain_id from the LIVE genesis we queried via RPC, not
         # from the env-set config.chain_id. Operator env can drift stale
         # across chain resets (2026-05-11 preprod: 5 receipts stranded because
@@ -548,21 +545,28 @@ class CertDaemon:
             )
             return
 
-        # Build cert
-        dcbor_bytes, cert_hash = build_cert(
-            chain_id=live_chain_id,
+        # Build cert (spec-219 SCALE-canonical: byte-identical to runtime's
+        # `canonical_cert_hash(receipt_id)`). The runtime now verifies the
+        # claim against its own computation on every attest_availability_cert
+        # — drift = CertHashMismatch + BadAttestStrike + (at threshold)
+        # auto-slash. See design doc spec-219 §3.
+        cert_bytes = scale_cert_encode(
+            chain_genesis=live_chain_id,
             receipt_id=receipt_id,
             content_hash=receipt.content_hash,
             base_root_sha256=receipt.base_root_sha256,
             storage_locator_hash=receipt.storage_locator_hash,
-            attested_at_epoch=epoch,
-            retention_days=self.config.retention_days,
-            attestation_level=verification.attestation_level,
-            cert_schema_version=self.config.cert_schema_version,
+        )
+        cert_hash = scale_cert_hash(
+            chain_genesis=live_chain_id,
+            receipt_id=receipt_id,
+            content_hash=receipt.content_hash,
+            base_root_sha256=receipt.base_root_sha256,
+            storage_locator_hash=receipt.storage_locator_hash,
         )
 
         # Store cert to filesystem
-        self.cert_store.save(receipt_id, dcbor_bytes)
+        self.cert_store.save(receipt_id, cert_bytes)
 
         # Submit on-chain. Two concerns:
         #
