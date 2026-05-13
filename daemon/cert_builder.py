@@ -138,12 +138,29 @@ def scale_cert_encode(
     ])
 
 
-def scale_cert_hash(*args, **kwargs) -> bytes:
-    """SHA-256 of `scale_cert_encode(*args, **kwargs)`.
+def scale_cert_hash(
+    chain_genesis,
+    receipt_id,
+    content_hash,
+    base_root_sha256,
+    storage_locator_hash,
+) -> bytes:
+    """SHA-256 of `scale_cert_encode(...)`.
 
     Returns the 32-byte canonical `cert_hash` that the runtime's
     `canonical_cert_hash(receipt_id)` will compute from the same inputs.
     Mismatch on `attest_availability_cert` = `CertHashMismatch` +
     `BadAttestStrike` + (at threshold) auto-slash.
+
+    Signature mirrors `scale_cert_encode` so typos surface at the call
+    site, not buried inside the encoder.
     """
-    return hashlib.sha256(scale_cert_encode(*args, **kwargs)).digest()
+    return hashlib.sha256(
+        scale_cert_encode(
+            chain_genesis=chain_genesis,
+            receipt_id=receipt_id,
+            content_hash=content_hash,
+            base_root_sha256=base_root_sha256,
+            storage_locator_hash=storage_locator_hash,
+        )
+    ).digest()

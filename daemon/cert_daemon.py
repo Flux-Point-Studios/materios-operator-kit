@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ from daemon.models import AttestationLevel, PendingReceipt
 from daemon.substrate_client import SubstrateClient
 from daemon.locator_registry import LocatorRegistry
 from daemon.blob_verifier import BlobVerifier
-from daemon.cert_builder import scale_cert_encode, scale_cert_hash
+from daemon.cert_builder import scale_cert_encode
 from daemon.cert_store import CertStore
 from daemon.checkpoint import CardanoCheckpointer
 from daemon.content_validator import ContentValidator
@@ -557,13 +558,7 @@ class CertDaemon:
             base_root_sha256=receipt.base_root_sha256,
             storage_locator_hash=receipt.storage_locator_hash,
         )
-        cert_hash = scale_cert_hash(
-            chain_genesis=live_chain_id,
-            receipt_id=receipt_id,
-            content_hash=receipt.content_hash,
-            base_root_sha256=receipt.base_root_sha256,
-            storage_locator_hash=receipt.storage_locator_hash,
-        )
+        cert_hash = hashlib.sha256(cert_bytes).digest()
 
         # Store cert to filesystem
         self.cert_store.save(receipt_id, cert_bytes)
