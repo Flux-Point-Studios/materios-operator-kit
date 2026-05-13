@@ -162,6 +162,12 @@ def _make_full_daemon(
     daemon.pending = {}
     daemon._notified_ids = {}
     daemon._pruned_warned_blocks = set()
+    # spec-219: process_receipt requires the live chain genesis to build the
+    # SCALE-canonical cert. Real daemons set this from RPC before the poll
+    # loop ever calls process_receipt; in unit tests we pin a fixed value so
+    # the parallelization path doesn't bail out at the "genesis not set"
+    # guard.
+    daemon._live_chain_genesis = "0x" + "00" * 32
 
     # Concurrency primitives (lazy-init path will materialize on first use).
     daemon._chain_write_lock = None

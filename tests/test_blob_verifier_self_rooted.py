@@ -275,51 +275,53 @@ def test_self_rooted_short_circuit_does_not_change_cert_hash_inputs():
     any operator-local state into the verification result that could
     leak into cert_hash.
 
-    `cert_builder.build_cert` consumes `attestation_level` for API
-    compat but pins it to `CERT_ATTESTATION_LEVEL_PINNED` (HASH_VERIFIED)
-    inside the cert body. So even if our short-circuit returns
-    ROOT_VERIFIED, the cert_hash is identical to what HASH_VERIFIED
-    would produce. We verify this here so a future refactor of
-    cert_builder doesn't accidentally start using `attestation_level`
-    in the cert body.
+    Spec-219 fixed this structurally — `scale_cert_encode` takes ONLY
+    on-chain fields (chain_genesis, receipt_id, 3× hash fields). There
+    is no `attestation_level` or `epoch` parameter at all. So even if
+    the self-rooted short-circuit returns ROOT_VERIFIED for one attester
+    and HASH_VERIFIED for another, the cert_hash is identical by
+    construction. This test guards the contract: the signature must
+    never gain a parameter sourced from local verifier state.
     """
+    import inspect
     from daemon.cert_builder import (
-        CERT_ATTESTATION_LEVEL_PINNED,
+        CERT_ATTESTATION_LEVEL,
         CERT_EPOCH_PLACEHOLDER,
-        build_cert,
+        scale_cert_encode,
+        scale_cert_hash,
     )
 
-    common_args = dict(
-        chain_id="ab" * 32,
+    # The set of parameters accepted by scale_cert_encode MUST be
+    # exactly the on-chain field set — no attestation_level, no epoch,
+    # no retention_days, no cert_schema_version. If anyone adds one,
+    # this assertion fires and the M-of-N determinism rule is preserved.
+    sig = inspect.signature(scale_cert_encode)
+    assert set(sig.parameters.keys()) == {
+        "chain_genesis",
+        "receipt_id",
+        "content_hash",
+        "base_root_sha256",
+        "storage_locator_hash",
+    }, (
+        f"scale_cert_encode signature changed: {list(sig.parameters)}. "
+        "Adding any operator-local parameter (attestation_level, epoch, "
+        "retention_days, ...) re-opens the M-of-N CertHashMismatch class "
+        "that spec-219 closed. See feedback_mofn_hash_determinism.md."
+    )
+
+    # Sanity: produces a stable 32-byte hash regardless of which call
+    # site invoked it (positional or keyword).
+    common = dict(
+        chain_genesis="ab" * 32,
         receipt_id="0x" + "cd" * 32,
         content_hash=b"\x11" * 32,
         base_root_sha256=b"\x11" * 32,  # self-rooted: == content_hash
         storage_locator_hash=b"\x22" * 32,
-        attested_at_epoch=999,
-        retention_days=365,
-        cert_schema_version="1.0",
     )
+    assert len(scale_cert_hash(**common)) == 32
 
-    _, cert_hash_root = build_cert(
-        attestation_level=AttestationLevel.ROOT_VERIFIED, **common_args,
-    )
-    _, cert_hash_hash = build_cert(
-        attestation_level=AttestationLevel.HASH_VERIFIED, **common_args,
-    )
-    _, cert_hash_fetched = build_cert(
-        attestation_level=AttestationLevel.FETCHED, **common_args,
-    )
-
-    # cert_hash MUST be identical regardless of attestation_level. If
-    # this fails, the new self-rooted code path WILL break M-of-N
-    # threshold via CertHashMismatch.
-    assert cert_hash_root == cert_hash_hash == cert_hash_fetched, (
-        "cert_hash varies with attestation_level — adding ROOT_VERIFIED "
-        "via self-rooted shortcut would diverge from non-patched attesters. "
-        "This is the M-of-N determinism rule from "
-        "feedback_mofn_hash_determinism.md."
-    )
-    assert CERT_ATTESTATION_LEVEL_PINNED == AttestationLevel.HASH_VERIFIED
+    # Pinned-constants tripwire (cross-checked against pallet types.rs):
+    assert CERT_ATTESTATION_LEVEL == 2  # HASH_VERIFIED
     assert CERT_EPOCH_PLACEHOLDER == 0
 
 

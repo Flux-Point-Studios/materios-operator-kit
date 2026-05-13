@@ -1,61 +1,62 @@
-"""dCBOR availability certificate builder.
+"""SCALE-canonical availability certificate builder (spec-219).
 
-`build_cert` must be byte-deterministic across operators. The pallet's
-`attest_availability_cert` extrinsic rejects with `CertHashMismatch` if
-two attesters submit different cert_hashes for the same receipt — so any
-input variability (bytes vs str, with/without 0x prefix, retention_days
-chosen per-operator, etc.) silently wedges receipts at the chain.
+The cert was previously a canonical-CBOR Python construction whose hash
+the substrate runtime could not independently verify — any daemon with
+a stale `CHAIN_ID` could race the correctly-configured peers and lock
+new receipts at a wrong `availability_cert_hash`, stranding them
+forever (`CertHashMismatch` on every subsequent attest). Root cause +
+forensic at `feedback_cert_daemon_chain_id_must_be_set.md`.
 
-Strategy: every value that enters the CBOR cert body is normalized at
-this layer, AND all operator-tunable knobs are pinned to module
-constants. The function's signature accepts both bytes and hex strings
-for the hash fields, but coerces internally so all attesters produce
-byte-identical output regardless of how their upstream code (e.g. the
-substrate-interface RPC client across versions) happens to represent
-values.
+Spec-219 moves cert canonicalisation **into the runtime**: the cert is
+now a fixed-width 202-byte SCALE-encoded struct that the Rust pallet
+computes itself from on-chain state + pinned constants, and
+`attest_availability_cert` rejects any claim that disagrees with its
+own computation. This module is the daemon-side counterpart: it must
+produce byte-identical output to Rust's `<Cert as Encode>::encode()`,
+hashed with SHA-256.
 
-History: prior versions of this file pinned `attested_at_epoch` and
-`attestation_level` but still let `retention_days`, `cert_schema_version`,
-chain_id 0x-prefix, and bytes-vs-str hash representation float. The
-result: 7 of 18 compute_metering_v2 receipts on preprod stuck Pending
-forever because external attestors picked different retention_days /
-cert_schema_version values. See `feedback_cert_daemon_chain_id_must_be_set.md`
-and the 2026-05-11 forensic investigation.
+There is no CBOR bridge. `build_cert` has been deleted. Any consumer
+that still imports it will fail at module load — intentional per the
+design doc's hard-cut migration plan.
 """
 import hashlib
-import cbor2
-from daemon.models import AttestationLevel
 
 
-# ─── Pinned cert body fields ─────────────────────────────────────────────
-# All cert body fields that DON'T come from chain state are pinned here.
-# Changing any of these changes every future cert_hash → must be a
-# coordinated runtime upgrade across all operators.
+# ─── Pinned cert body fields (must match pallet-orinq-receipts) ───────────
+# These five constants are the byte-pinned cross-chain contract. Their
+# Rust counterparts live in `pallets/orinq-receipts/src/types.rs`:
 #
-# Epoch + attestation_level used to be locally-derived (Cardano epoch
-# from Ogmios; verification depth from blob check). retention_days +
-# cert_schema_version were operator-configurable, which silently
-# divided the committee into incompatible subsets. All four are now
-# constants in this module.
+#   pub const CERT_DOMAIN_BYTES: &[u8; 32] =
+#       b"materios-availability-cert-v1\x00\x00\x00";
+#   pub const CERT_EPOCH_PLACEHOLDER: u32 = 0;
+#   pub const CERT_RETENTION_DAYS: u32 = 365;
+#   pub const CERT_ATTESTATION_LEVEL: u8 = 2;     // HASH_VERIFIED
+#   pub const CERT_SCHEMA_VERSION: u8 = 1;
+#
+# Changing any of these requires a coordinated runtime upgrade (the
+# `Cert` SCALE layout changes → every fixture hash changes → CI red on
+# both repos before deploy).
+CERT_DOMAIN_BYTES = b"materios-availability-cert-v1" + b"\x00" * 3  # 32 bytes
+assert len(CERT_DOMAIN_BYTES) == 32, "domain separator must be exactly 32 bytes"
 CERT_EPOCH_PLACEHOLDER = 0
-CERT_ATTESTATION_LEVEL_PINNED = AttestationLevel.HASH_VERIFIED
-CERT_RETENTION_DAYS_PINNED = 365
-CERT_SCHEMA_VERSION_PINNED = "1.0"
+CERT_RETENTION_DAYS = 365
+CERT_ATTESTATION_LEVEL = 2     # HASH_VERIFIED
+CERT_SCHEMA_VERSION = 1
 
 
 def _to_bytes32(value, field_name: str) -> bytes:
-    """Coerce a hash field to canonical 32-byte form.
+    """Coerce a 32-byte field to canonical raw-bytes form.
 
     Accepted inputs:
       - `bytes` / `bytearray` of length 32 → returned as `bytes`
       - hex `str` of length 64 (no prefix) → decoded
-      - hex `str` of length 66 with `0x` prefix → prefix stripped + decoded
+      - hex `str` of length 66 with `0x` / `0X` prefix → prefix stripped + decoded
       - `None` → returned as 32 zero bytes (legacy storage_locator may be unset)
-      - `list[int]` (32 ints in 0-255) → packed as bytes (substrate-interface
-        sometimes returns Vec<u8> fields this way)
+      - `list[int]` / `tuple[int, ...]` of 32 ints in 0..255 → packed
+        (substrate-interface sometimes returns Vec<u8> fields this way)
 
-    Rejects everything else with a TypeError carrying `field_name` so the
-    caller's stack trace points at the broken input.
+    Anything else raises a clear `TypeError` / `ValueError` carrying
+    `field_name` so the caller's stack trace points at the broken input.
     """
     if value is None:
         return b"\x00" * 32
@@ -76,7 +77,9 @@ def _to_bytes32(value, field_name: str) -> bytes:
         except ValueError as e:
             raise ValueError(f"{field_name}: invalid hex: {e}") from e
     if isinstance(value, (list, tuple)):
-        if len(value) != 32 or not all(isinstance(x, int) and 0 <= x <= 255 for x in value):
+        if len(value) != 32 or not all(
+            isinstance(x, int) and 0 <= x <= 255 for x in value
+        ):
             raise ValueError(
                 f"{field_name}: list/tuple must be 32 ints in 0..255"
             )
@@ -87,94 +90,77 @@ def _to_bytes32(value, field_name: str) -> bytes:
     )
 
 
-def _to_bare_hex_chain_id(value: str) -> str:
-    """Coerce chain_id to bare lowercase hex (no 0x prefix).
+def scale_cert_encode(
+    chain_genesis,        # bytes(32) | hex str — live RPC chain_getBlockHash[0]
+    receipt_id,           # bytes(32) | hex str
+    content_hash,         # bytes(32) | hex str | list[int]
+    base_root_sha256,     # bytes(32) | hex str | list[int]
+    storage_locator_hash, # bytes(32) | hex str | list[int] | None -> zeros
+) -> bytes:
+    """Produce byte-identical output to Rust's `<Cert as Encode>::encode()`.
 
-    Accepts with or without 0x prefix, accepts mixed case. Rejects bytes
-    and anything that doesn't decode cleanly — chain_id is a known string
-    field in our system and accidentally passing bytes here used to
-    silently produce a different cert (because cbor2 encodes bytes and
-    str differently).
+    Returns exactly 202 bytes laid out as (per design doc §6):
+
+        offset  len  field
+        ------  ---  ---------------
+             0   32  domain (ASCII "materios-availability-cert-v1" + 3× 0x00)
+            32   32  chain_id          (H256, raw 32 bytes)
+            64   32  receipt_id        (H256, raw 32 bytes)
+            96   32  content_hash      (raw 32 bytes)
+           128   32  base_root         (raw 32 bytes)
+           160   32  storage_locator   (raw 32 bytes)
+           192    4  epoch             (u32 little-endian, pinned = 0)
+           196    4  retention_days    (u32 little-endian, pinned = 365)
+           200    1  attestation_level (u8, pinned = 2)
+           201    1  schema_version    (u8, pinned = 1)
+
+    None of these fields carry a SCALE length prefix; everything is
+    fixed-width and there is no representational ambiguity. That's the
+    point — CBOR's optional canonicalisation rules were the bug surface
+    we are eliminating.
     """
-    if not isinstance(value, str):
-        raise TypeError(f"chain_id must be str, got {type(value).__name__}")
-    s = value.removeprefix("0x").removeprefix("0X").lower()
-    if len(s) == 0:
-        raise ValueError("chain_id is empty — set CHAIN_ID env to the live chain genesis hash")
-    # Validate it's hex-shaped (lets us catch typos early; doesn't enforce length
-    # because genesis hashes can vary in repr across substrate versions).
-    if not all(c in "0123456789abcdef" for c in s):
-        raise ValueError(f"chain_id is not bare hex: {value!r}")
-    return s
-
-
-def _to_canonical_receipt_id(value) -> str:
-    """Coerce receipt_id to canonical 0x-prefixed lowercase hex.
-
-    Accepts bytes, with/without 0x prefix, mixed case. The cert body
-    embeds the receipt_id as a CBOR text string — same byte representation
-    on every attester is mandatory.
-    """
-    if isinstance(value, (bytes, bytearray)):
-        if len(value) != 32:
-            raise ValueError(f"receipt_id bytes must be 32 long, got {len(value)}")
-        return "0x" + value.hex()
-    if isinstance(value, str):
-        s = value.removeprefix("0x").removeprefix("0X").lower()
-        if len(s) != 64:
-            raise ValueError(f"receipt_id hex must be 64 chars, got {len(s)}")
-        if not all(c in "0123456789abcdef" for c in s):
-            raise ValueError(f"receipt_id is not hex: {value!r}")
-        return "0x" + s
-    raise TypeError(
-        f"receipt_id: unsupported type {type(value).__name__}; expected bytes or hex str"
-    )
-
-
-def build_cert(
-    chain_id: str,
-    receipt_id,                         # str (with or without 0x) or bytes(32)
-    content_hash,                        # bytes(32) | hex str | list[int]
-    base_root_sha256,                    # bytes(32) | hex str | list[int]
-    storage_locator_hash,                # bytes(32) | hex str | list[int] | None
-    attested_at_epoch: int = 0,          # IGNORED — pinned in body
-    retention_days: int = 0,             # IGNORED — pinned in body
-    attestation_level: AttestationLevel = AttestationLevel.HASH_VERIFIED,  # IGNORED
-    cert_schema_version: str = "",       # IGNORED — pinned in body
-) -> tuple[bytes, bytes]:
-    """Build a dCBOR availability certificate.
-
-    Returns `(dcbor_bytes, cert_hash)` where `cert_hash = sha256(dcbor_bytes)`.
-    The cert body is a canonical CBOR 10-element array per
-    AVAILABILITY_CERT_SPEC.md.
-
-    Determinism: cert_hash depends ONLY on (chain_id normalized to bare hex,
-    receipt_id normalized to 0x-prefixed lowercase hex, the three hash fields
-    coerced to bytes(32)). Everything else in the body is a pinned constant.
-
-    `attested_at_epoch`, `retention_days`, `attestation_level`, and
-    `cert_schema_version` are kept as keyword args for API stability with
-    older callers but their values are NOT read; the CBOR body uses the
-    module-level constants instead.
-    """
-    chain_id_norm = _to_bare_hex_chain_id(chain_id)
-    receipt_id_norm = _to_canonical_receipt_id(receipt_id)
-    content_hash_b = _to_bytes32(content_hash, "content_hash")
+    chain_id_b = _to_bytes32(chain_genesis, "chain_genesis")
+    receipt_id_b = _to_bytes32(receipt_id, "receipt_id")
+    content_b = _to_bytes32(content_hash, "content_hash")
     base_root_b = _to_bytes32(base_root_sha256, "base_root_sha256")
-    storage_locator_b = _to_bytes32(storage_locator_hash, "storage_locator_hash")
+    locator_b = _to_bytes32(storage_locator_hash, "storage_locator_hash")
+    return b"".join([
+        CERT_DOMAIN_BYTES,
+        chain_id_b,
+        receipt_id_b,
+        content_b,
+        base_root_b,
+        locator_b,
+        CERT_EPOCH_PLACEHOLDER.to_bytes(4, "little"),
+        CERT_RETENTION_DAYS.to_bytes(4, "little"),
+        CERT_ATTESTATION_LEVEL.to_bytes(1, "little"),
+        CERT_SCHEMA_VERSION.to_bytes(1, "little"),
+    ])
 
-    cert_array = [
-        "materios-availability-cert-v1",      # 0: domain separator
-        chain_id_norm,                         # 1: bare-hex genesis
-        receipt_id_norm,                       # 2: 0x-prefixed lowercase receipt id
-        content_hash_b,                        # 3: bytes32
-        base_root_b,                           # 4: bytes32
-        storage_locator_b,                     # 5: bytes32
-        CERT_EPOCH_PLACEHOLDER,                # 6: pinned
-        CERT_RETENTION_DAYS_PINNED,            # 7: pinned (was operator-tunable)
-        CERT_ATTESTATION_LEVEL_PINNED.value,   # 8: pinned
-        CERT_SCHEMA_VERSION_PINNED,            # 9: pinned (was operator-tunable)
-    ]
-    dcbor_bytes = cbor2.dumps(cert_array, canonical=True)
-    cert_hash = hashlib.sha256(dcbor_bytes).digest()
-    return dcbor_bytes, cert_hash
+
+def scale_cert_hash(
+    chain_genesis,
+    receipt_id,
+    content_hash,
+    base_root_sha256,
+    storage_locator_hash,
+) -> bytes:
+    """SHA-256 of `scale_cert_encode(...)`.
+
+    Returns the 32-byte canonical `cert_hash` that the runtime's
+    `canonical_cert_hash(receipt_id)` will compute from the same inputs.
+    Mismatch on `attest_availability_cert` = `CertHashMismatch` +
+    `BadAttestStrike` + (at threshold) auto-slash.
+
+    Signature mirrors `scale_cert_encode` so typos surface at the call
+    site, not buried inside the encoder.
+    """
+    return hashlib.sha256(
+        scale_cert_encode(
+            chain_genesis=chain_genesis,
+            receipt_id=receipt_id,
+            content_hash=content_hash,
+            base_root_sha256=base_root_sha256,
+            storage_locator_hash=storage_locator_hash,
+        )
+    ).digest()

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -11,7 +12,7 @@ from daemon.models import AttestationLevel, PendingReceipt
 from daemon.substrate_client import SubstrateClient
 from daemon.locator_registry import LocatorRegistry
 from daemon.blob_verifier import BlobVerifier
-from daemon.cert_builder import build_cert
+from daemon.cert_builder import scale_cert_encode
 from daemon.cert_store import CertStore
 from daemon.checkpoint import CardanoCheckpointer
 from daemon.content_validator import ContentValidator
@@ -257,7 +258,7 @@ class CertDaemon:
                 logger.warning(f"Failed to remove checkpoint state: {e}")
         self._live_chain_genesis = live
 
-        # As of 2026-05-12, both cert construction (`build_cert`) and the
+        # As of spec-219, both cert construction (`scale_cert_encode`) and the
         # checkpoint pipeline (`checkpoint.py::flush`) read
         # `self._live_chain_genesis` directly. `config.chain_id` is no longer
         # consulted on the hot path — env is decorative documentation only.
@@ -526,9 +527,6 @@ class CertDaemon:
                 )
                 return  # Don't certify — receipt stays with zero cert hash
 
-        # Get Cardano epoch (still passed for API-compat; build_cert ignores it)
-        epoch = self.get_cardano_epoch()
-
         # Source the chain_id from the LIVE genesis we queried via RPC, not
         # from the env-set config.chain_id. Operator env can drift stale
         # across chain resets (2026-05-11 preprod: 5 receipts stranded because
@@ -548,21 +546,22 @@ class CertDaemon:
             )
             return
 
-        # Build cert
-        dcbor_bytes, cert_hash = build_cert(
-            chain_id=live_chain_id,
+        # Build cert (spec-219 SCALE-canonical: byte-identical to runtime's
+        # `canonical_cert_hash(receipt_id)`). The runtime now verifies the
+        # claim against its own computation on every attest_availability_cert
+        # — drift = CertHashMismatch + BadAttestStrike + (at threshold)
+        # auto-slash. See design doc spec-219 §3.
+        cert_bytes = scale_cert_encode(
+            chain_genesis=live_chain_id,
             receipt_id=receipt_id,
             content_hash=receipt.content_hash,
             base_root_sha256=receipt.base_root_sha256,
             storage_locator_hash=receipt.storage_locator_hash,
-            attested_at_epoch=epoch,
-            retention_days=self.config.retention_days,
-            attestation_level=verification.attestation_level,
-            cert_schema_version=self.config.cert_schema_version,
         )
+        cert_hash = hashlib.sha256(cert_bytes).digest()
 
         # Store cert to filesystem
-        self.cert_store.save(receipt_id, dcbor_bytes)
+        self.cert_store.save(receipt_id, cert_bytes)
 
         # Submit on-chain. Two concerns:
         #
@@ -582,10 +581,10 @@ class CertDaemon:
         #       making progress on locator/blob fetches while one submit is
         #       pending. The lock keeps the chain-write path itself serial.
         async with self._chain_write_lock:
-            success = await asyncio.to_thread(
+            outcome = await asyncio.to_thread(
                 self.client.submit_availability_cert, receipt_id, cert_hash
             )
-        if success:
+        if outcome.success:
             health_server.increment_metric("certs_submitted_total")
             async with self._pending_lock:
                 self.pending.pop(receipt_id, None)
@@ -593,6 +592,36 @@ class CertDaemon:
                 f"Cert submitted for `{receipt_id[:16]}...` (L{verification.attestation_level})",
                 "info",
             )
+        elif outcome.bad_attest_strike:
+            # spec-219: runtime rejected our cert_hash as non-canonical.
+            # Strike is permanent for this receipt — retry would re-strike
+            # against the same canonical value. Drop from pending so we
+            # stop wasting submits; operator must fix the input drift
+            # (chain_id, locator-hash, base-root) before any new receipts
+            # can succeed.
+            health_server.increment_metric("bad_attest_strikes_total")
+            async with self._pending_lock:
+                self.pending.pop(receipt_id, None)
+            if outcome.auto_slashed:
+                health_server.increment_metric("auto_slashed_total")
+                await self.send_discord(
+                    f"AUTO-SLASHED for bad attest on `{receipt_id[:16]}...` — "
+                    f"strikes={outcome.strikes}, "
+                    f"amount={outcome.slashed_amount}. "
+                    f"Signer ejected from committee; re-bond required after "
+                    f"fixing cert-builder input drift.",
+                    "critical",
+                )
+            else:
+                claimed_hex = outcome.claimed.hex()[:16] if outcome.claimed else "?"
+                canonical_hex = outcome.canonical.hex()[:16] if outcome.canonical else "?"
+                await self.send_discord(
+                    f"BadAttestStrike on `{receipt_id[:16]}...` — "
+                    f"strikes={outcome.strikes}, claimed=`{claimed_hex}...` "
+                    f"vs canonical=`{canonical_hex}...`. "
+                    f"Check chain_id / cert_builder inputs.",
+                    "critical",
+                )
         else:
             health_server.increment_metric("verification_failures_total")
             await self.send_discord(

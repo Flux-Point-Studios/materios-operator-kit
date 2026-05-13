@@ -1,5 +1,6 @@
 import logging
 import time
+from dataclasses import dataclass
 from typing import Optional
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.exceptions import SubstrateRequestException
@@ -8,6 +9,38 @@ from daemon.config import DaemonConfig
 from daemon.models import ReceiptRecord
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SubmitCertOutcome:
+    """Result of `submit_availability_cert`.
+
+    Post-spec-219, the runtime returns `Ok(())` on cert-hash mismatch (so
+    `BadAttestStrike` + `AutoSlashedForBadAttest` side-effects persist),
+    which means `ExtrinsicReceipt.is_success` is a misleading indicator
+    of attestation acceptance — it's only an indicator of inclusion. The
+    daemon MUST inspect `triggered_events` for the strike/slash markers
+    matching its own signer to know whether the attest was counted. This
+    outcome carries the verdict explicitly so callers don't have to learn
+    the convention.
+
+    `success` is True iff the dispatch landed AND no `BadAttestStrike`
+    against our signer fired. A strike at threshold also triggers
+    `AutoSlashedForBadAttest` (committee ejection + bond slashed); we
+    surface that as a separate flag so the caller can fire a more urgent
+    operator alert.
+    """
+    success: bool
+    bad_attest_strike: bool = False
+    auto_slashed: bool = False
+    strikes: int = 0
+    claimed: Optional[bytes] = None
+    canonical: Optional[bytes] = None
+    slashed_amount: int = 0
+    error_message: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.success
 
 
 def _to_bytes32(val) -> bytes:
@@ -19,6 +52,20 @@ def _to_bytes32(val) -> bytes:
     if isinstance(val, (list, tuple)):
         return bytes(val)
     return bytes(val)
+
+
+def _maybe_bytes32(val) -> Optional[bytes]:
+    """Best-effort `_to_bytes32` — returns None on undecodable / missing input.
+
+    Used when surfacing event attributes for logs: we'd rather log "?" than
+    crash the strike-detection path on a malformed event field.
+    """
+    if val is None:
+        return None
+    try:
+        return _to_bytes32(val)
+    except (ValueError, TypeError):
+        return None
 
 
 class SubstrateClient:
@@ -184,8 +231,19 @@ class SubstrateClient:
             submitter=str(r["submitter"]),
         )
 
-    def submit_availability_cert(self, receipt_id: str, cert_hash: bytes) -> bool:
-        """Submit attest_availability_cert directly (no Sudo). Returns True on finalization."""
+    def submit_availability_cert(
+        self, receipt_id: str, cert_hash: bytes
+    ) -> SubmitCertOutcome:
+        """Submit `attest_availability_cert` directly (no Sudo).
+
+        Returns a `SubmitCertOutcome` describing the verdict. Post-spec-219
+        the runtime returns `Ok(())` on cert-hash mismatch (so strike + slash
+        writes persist), so we MUST scan `triggered_events` for our signer's
+        `BadAttestStrike` / `AutoSlashedForBadAttest` markers — `is_success`
+        alone would falsely report acceptance and silently rack up strikes
+        until auto-ejection.
+        """
+        last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
             try:
                 call = self.substrate.compose_call(
@@ -201,17 +259,106 @@ class SubstrateClient:
                     keypair=self.keypair,
                 )
                 receipt = self.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
-                if receipt.is_success:
-                    logger.info(f"Cert attested for {receipt_id}, block {receipt.block_hash}")
-                    return True
-                else:
-                    logger.error(f"Cert tx failed for {receipt_id}: {receipt.error_message}")
+                if not receipt.is_success:
+                    last_error = str(receipt.error_message)
+                    logger.error(f"Cert tx failed for {receipt_id}: {last_error}")
+                    continue
+                # Dispatch landed. Now check whether the runtime accepted our
+                # claim or struck us for misattestation.
+                strike_info = self._scan_for_bad_attest(receipt, receipt_id)
+                if strike_info is not None:
+                    return strike_info
+                logger.info(f"Cert attested for {receipt_id}, block {receipt.block_hash}")
+                return SubmitCertOutcome(success=True)
             except SubstrateRequestException as e:
+                last_error = f"{type(e).__name__}: {e}"
                 logger.error(f"Cert tx attempt {attempt + 1} failed for {receipt_id}: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
             except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
                 logger.error(f"Unexpected error submitting cert for {receipt_id}: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
-        return False
+        return SubmitCertOutcome(success=False, error_message=last_error)
+
+    def _scan_for_bad_attest(
+        self, receipt, receipt_id: str
+    ) -> Optional[SubmitCertOutcome]:
+        """Return a strike/slash outcome iff the included tx struck OUR signer.
+
+        Two events are relevant (per pallet-orinq-receipts spec-219):
+        - `BadAttestStrike { attester, receipt_id, claimed, canonical, strikes }`
+          — claim disagreed with runtime's canonical hash; strike persisted.
+        - `AutoSlashedForBadAttest { attester, amount, remaining_bond }`
+          — strike count crossed threshold; full bond slashed + committee
+          ejection. Always co-emitted with the final `BadAttestStrike`.
+
+        Both events carry an `attester: AccountId32`; we compare against
+        `self.keypair.ss58_address`. A foreign attester's strike in the
+        same block (rare but possible if two extrinsics share an inclusion
+        block) MUST be ignored — only our own strike should fail us.
+        """
+        our_ss58 = self.keypair.ss58_address
+        strike: Optional[dict] = None
+        slash: Optional[dict] = None
+        try:
+            triggered = receipt.triggered_events
+        except Exception:
+            # If substrate-interface failed to decode events we can't be
+            # sure — assume Ok dispatch == real success rather than fail
+            # closed (which would re-submit and double-strike).
+            logger.warning(
+                f"Could not enumerate triggered_events for {receipt_id}; "
+                "assuming Ok dispatch == accepted attest."
+            )
+            return None
+        for entry in triggered:
+            try:
+                ev = entry.value.get("event", entry.value)
+                if ev.get("module_id") != "OrinqReceipts":
+                    continue
+                event_id = ev.get("event_id")
+                attrs = ev.get("attributes") or {}
+                if event_id == "BadAttestStrike" and str(attrs.get("attester")) == our_ss58:
+                    strike = attrs
+                elif event_id == "AutoSlashedForBadAttest" and str(attrs.get("attester")) == our_ss58:
+                    slash = attrs
+            except (AttributeError, KeyError, TypeError):
+                # Defensive: skip any event we can't decode rather than
+                # falsely reporting success or failure on a parse error.
+                continue
+        if strike is None and slash is None:
+            return None
+        # Strike fired — surface the verdict structurally + log loudly. The
+        # caller (cert_daemon) is responsible for operator-facing Discord +
+        # health metrics; we log at error/critical so journalctl alone
+        # captures the incident even if Discord is down.
+        claimed = _maybe_bytes32(strike.get("claimed") if strike else None)
+        canonical = _maybe_bytes32(strike.get("canonical") if strike else None)
+        strikes = int(strike.get("strikes", 0)) if strike else 0
+        slashed_amount = int(slash.get("amount", 0)) if slash else 0
+        if slash is not None:
+            logger.critical(
+                f"AUTO-SLASHED for bad attest: receipt={receipt_id} "
+                f"strikes={strikes} amount={slashed_amount} "
+                f"claimed={claimed.hex() if claimed else '?'} "
+                f"canonical={canonical.hex() if canonical else '?'} "
+                f"— signer ejected from committee, re-bond required."
+            )
+        else:
+            logger.error(
+                f"BadAttestStrike for {receipt_id}: strikes={strikes} "
+                f"claimed={claimed.hex() if claimed else '?'} "
+                f"canonical={canonical.hex() if canonical else '?'} "
+                f"— check chain_id / cert_builder inputs."
+            )
+        return SubmitCertOutcome(
+            success=False,
+            bad_attest_strike=True,
+            auto_slashed=slash is not None,
+            strikes=strikes,
+            claimed=claimed,
+            canonical=canonical,
+            slashed_amount=slashed_amount,
+        )
