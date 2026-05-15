@@ -53,7 +53,12 @@ import pytest
 from substrateinterface import Keypair
 
 from daemon.settle_claim_attestor import (
+    CARDANO_MAINNET_GENESIS_HASH,
+    CARDANO_PREPROD_GENESIS_HASH,
+    CARDANO_PREVIEW_GENESIS_HASH,
     CardanoTxObservation,
+    CardanoTxObserver,
+    NETWORK_MAGIC_TO_GENESIS_HASH,
     PendingSettlementRequest,
     RefusalReason,
     SettleClaimAttestor,
@@ -410,6 +415,250 @@ class TestObserverHelpers:
         obs.cardano_tip_block_no = 50
         obs.tx_block_no = 100
         assert obs.depth == 0
+
+
+# ---------------------------------------------------------------------------
+# Observer.get_genesis_hash — networkMagic-keyed resolution (task #280).
+#
+# Ogmios `queryNetwork/genesisConfiguration` returns the SHELLEY GENESIS
+# PARAMETERS (`{era, networkMagic, startTime, slotLength, ...}`), NOT the
+# 32-byte blake2b-256 hash of the genesis file. Pre-task-#280 the daemon
+# searched for a `hash`/`genesisHash` field that does not exist in modern
+# Ogmios payloads and refused every attest_settle with
+# `ogmios_genesis_hash_unavailable`.
+#
+# The fix keys off `networkMagic` (which IS in the response) and looks
+# the canonical blake2b-256 up in a pinned table. This preserves the
+# preprod-vs-mainnet domain separation that the original mainchain_genesis_hash
+# check exists for, without depending on a non-existent Ogmios field.
+# ---------------------------------------------------------------------------
+
+
+class TestNetworkMagicGenesisTable:
+    """The pinned table is the trust anchor for the preprod/mainnet check.
+    These values are blake2b-256 of the canonical IOG-published Shelley
+    genesis JSON for each network. A wrong value here silently breaks
+    every settle attestation, so they are tested directly.
+    """
+
+    def test_preprod_hash_pinned(self):
+        # blake2b-256 of
+        # https://book.world.dev.cardano.org/environments/preprod/shelley-genesis.json
+        # (verified 2026-05-15 in task #280).
+        assert CARDANO_PREPROD_GENESIS_HASH == bytes.fromhex(
+            "162d29c4e1cf6b8a84f2d692e67a3ac6bc7851bc3e6e4afe64d15778bed8bd86"
+        )
+        assert len(CARDANO_PREPROD_GENESIS_HASH) == 32
+
+    def test_mainnet_hash_pinned(self):
+        # blake2b-256 of
+        # https://book.world.dev.cardano.org/environments/mainnet/shelley-genesis.json
+        assert CARDANO_MAINNET_GENESIS_HASH == bytes.fromhex(
+            "1a3be38bcbb7911969283716ad7aa550250226b76a61fc51cc9a9a35d9276d81"
+        )
+        assert len(CARDANO_MAINNET_GENESIS_HASH) == 32
+
+    def test_preview_hash_pinned(self):
+        # blake2b-256 of
+        # https://book.world.dev.cardano.org/environments/preview/shelley-genesis.json
+        assert CARDANO_PREVIEW_GENESIS_HASH == bytes.fromhex(
+            "363498d1024f84bb39d3fa9593ce391483cb40d479b87233f868d6e57c3a400d"
+        )
+        assert len(CARDANO_PREVIEW_GENESIS_HASH) == 32
+
+    def test_table_covers_three_networks(self):
+        # The three networks we operate against: preprod (1), preview (2),
+        # mainnet (764824073). Adding a new network (e.g. sanchonet) is a
+        # code change — not a runtime concern.
+        assert NETWORK_MAGIC_TO_GENESIS_HASH[1] == CARDANO_PREPROD_GENESIS_HASH
+        assert NETWORK_MAGIC_TO_GENESIS_HASH[2] == CARDANO_PREVIEW_GENESIS_HASH
+        assert (
+            NETWORK_MAGIC_TO_GENESIS_HASH[764824073]
+            == CARDANO_MAINNET_GENESIS_HASH
+        )
+
+
+class TestObserverGetGenesisHash:
+    """The Ogmios `queryNetwork/genesisConfiguration` parser, post-#280.
+
+    Each test patches `CardanoTxObserver._ogmios_rpc` to return a canned
+    Ogmios payload and asserts the function returns (a) the right 32-byte
+    blake2b-256 for known networkMagic values, (b) None for unknown
+    networkMagic, and (c) None for malformed payloads / transport errors.
+    """
+
+    def _patched_observer(self, rpc_return):
+        """Build a CardanoTxObserver with `_ogmios_rpc` replaced to return
+        `rpc_return` on every call (the real method is async)."""
+        observer = CardanoTxObserver(
+            ogmios_url="http://ogmios.test",
+            kupo_url="http://kupo.test",
+        )
+
+        async def fake_rpc(session, method, params=None):
+            return rpc_return
+
+        observer._ogmios_rpc = fake_rpc  # type: ignore[method-assign]
+        return observer
+
+    def test_returns_preprod_hash_for_networkMagic_1(self):
+        """The live preprod parity vector: Ogmios on Node-3 (192.168.0.133:1337)
+        returns `{networkMagic: 1, network: "testnet", ...}` (verified
+        2026-05-15). The function MUST resolve that to the pinned preprod
+        blake2b-256, NOT refuse with ogmios_genesis_hash_unavailable."""
+        live_preprod_payload = {
+            "era": "shelley",
+            "startTime": "2022-06-01T00:00:00Z",
+            "networkMagic": 1,
+            "network": "testnet",
+            "slotLength": {"milliseconds": 1000},
+        }
+        observer = self._patched_observer(live_preprod_payload)
+
+        async def driver():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                return await observer.get_genesis_hash(session)
+
+        result = _run(driver())
+        assert result == CARDANO_PREPROD_GENESIS_HASH
+        # And it caches: a second call should return the same bytes
+        # without re-querying.
+        assert observer._cached_genesis == CARDANO_PREPROD_GENESIS_HASH
+
+    def test_returns_mainnet_hash_for_networkMagic_764824073(self):
+        observer = self._patched_observer({
+            "era": "shelley",
+            "networkMagic": 764824073,
+            "network": "mainnet",
+        })
+
+        async def driver():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                return await observer.get_genesis_hash(session)
+
+        result = _run(driver())
+        assert result == CARDANO_MAINNET_GENESIS_HASH
+
+    def test_returns_preview_hash_for_networkMagic_2(self):
+        observer = self._patched_observer({
+            "era": "shelley",
+            "networkMagic": 2,
+            "network": "testnet",
+        })
+
+        async def driver():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                return await observer.get_genesis_hash(session)
+
+        result = _run(driver())
+        assert result == CARDANO_PREVIEW_GENESIS_HASH
+
+    def test_returns_none_for_unknown_networkMagic(self):
+        """An unknown magic (e.g. a private testnet, sanchonet before we
+        add it) MUST refuse to fabricate a hash. The caller treats None
+        as observer_unavailable and refuses the attest — the safe default."""
+        observer = self._patched_observer({
+            "era": "shelley",
+            "networkMagic": 999,
+            "network": "testnet",
+        })
+
+        async def driver():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                return await observer.get_genesis_hash(session)
+
+        result = _run(driver())
+        assert result is None
+        # Nothing got cached either — a later call could succeed if the
+        # operator points at a known network.
+        assert observer._cached_genesis is None
+
+    def test_returns_none_when_networkMagic_field_missing(self):
+        """A payload missing `networkMagic` (e.g. an unknown Ogmios
+        version) MUST refuse rather than silently treating it as
+        preprod or mainnet."""
+        observer = self._patched_observer({
+            "era": "shelley",
+            "network": "testnet",
+            # NO networkMagic field
+        })
+
+        async def driver():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                return await observer.get_genesis_hash(session)
+
+        result = _run(driver())
+        assert result is None
+
+    def test_returns_none_when_networkMagic_is_not_int(self):
+        """Defensive: a non-int networkMagic (string, dict, list) must
+        refuse — never try to index the table with a non-int."""
+        observer = self._patched_observer({
+            "era": "shelley",
+            "networkMagic": "1",  # str, not int — malformed
+            "network": "testnet",
+        })
+
+        async def driver():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                return await observer.get_genesis_hash(session)
+
+        result = _run(driver())
+        assert result is None
+
+    def test_returns_none_when_ogmios_call_fails(self):
+        """The RPC layer returns None on timeout/transport error; the
+        function MUST propagate that as None (preserves existing
+        refusal semantics — was the only behavior tested pre-#280)."""
+        observer = self._patched_observer(None)
+
+        async def driver():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                return await observer.get_genesis_hash(session)
+
+        result = _run(driver())
+        assert result is None
+        # Cache is NOT poisoned by a failed call — a retry can succeed.
+        assert observer._cached_genesis is None
+
+    def test_caches_successful_result_across_calls(self):
+        """Genesis hash is invariant per network — the resolver caches
+        after the first successful lookup so subsequent observations
+        don't re-roundtrip Ogmios. (Behavior preserved from pre-#280.)"""
+        call_count = 0
+        observer = CardanoTxObserver(
+            ogmios_url="http://ogmios.test",
+            kupo_url="http://kupo.test",
+        )
+
+        async def counting_rpc(session, method, params=None):
+            nonlocal call_count
+            call_count += 1
+            return {
+                "era": "shelley",
+                "networkMagic": 1,
+                "network": "testnet",
+            }
+
+        observer._ogmios_rpc = counting_rpc  # type: ignore[method-assign]
+
+        async def driver():
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                a = await observer.get_genesis_hash(session)
+                b = await observer.get_genesis_hash(session)
+                return (a, b)
+
+        a, b = _run(driver())
+        assert a == b == CARDANO_PREPROD_GENESIS_HASH
+        assert call_count == 1  # second call served from cache
 
 
 # ---------------------------------------------------------------------------

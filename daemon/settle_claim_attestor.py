@@ -95,6 +95,50 @@ STCA_PREIMAGE_LEN: int = 213
 STCA_CONTENT_LEN: int = 209  # for documentation/test alignment with memo
 
 
+# ---------------------------------------------------------------------------
+# Cardano network-identity table (task #280).
+#
+# Ogmios' `queryNetwork/genesisConfiguration` returns the Shelley genesis
+# PARAMETERS (era / networkMagic / startTime / slotLength / initialDelegates
+# / ...). It does NOT return the 32-byte blake2b-256 of the canonical
+# Shelley-genesis JSON file — there's no standard Ogmios method for that.
+#
+# Fact 5 of the eight (preprod-vs-mainnet domain separation) only needs
+# the network identity to be cryptographically pinned to the on-chain
+# `MainchainGenesisHash` constant. Ogmios' `networkMagic` field is just
+# as authoritative for that purpose as long as we trust our own pinned
+# table (which we control). Approach A from the task-#280 brief.
+#
+# Values below are blake2b-256 of the IOG-published Shelley-genesis JSON
+# at
+#   https://book.world.dev.cardano.org/environments/<network>/shelley-genesis.json
+# verified 2026-05-15. They match the values that
+# `cardano-node --shelley-genesis-hash` prints for each network and the
+# values pinned in the pallet's `MainchainGenesisHash` runtime constant.
+#
+# To add a new Cardano network (e.g. sanchonet):
+#   1. Fetch the network's shelley-genesis.json
+#   2. Compute `blake2b(file_bytes, digest_size=32).hexdigest()`
+#   3. Add the (networkMagic, hash) pair to the table below
+#   4. Add a matching test in tests/test_settle_claim_attestor.py
+# ---------------------------------------------------------------------------
+CARDANO_PREPROD_GENESIS_HASH: bytes = bytes.fromhex(
+    "162d29c4e1cf6b8a84f2d692e67a3ac6bc7851bc3e6e4afe64d15778bed8bd86"
+)
+CARDANO_PREVIEW_GENESIS_HASH: bytes = bytes.fromhex(
+    "363498d1024f84bb39d3fa9593ce391483cb40d479b87233f868d6e57c3a400d"
+)
+CARDANO_MAINNET_GENESIS_HASH: bytes = bytes.fromhex(
+    "1a3be38bcbb7911969283716ad7aa550250226b76a61fc51cc9a9a35d9276d81"
+)
+
+NETWORK_MAGIC_TO_GENESIS_HASH: dict[int, bytes] = {
+    1: CARDANO_PREPROD_GENESIS_HASH,
+    2: CARDANO_PREVIEW_GENESIS_HASH,
+    764824073: CARDANO_MAINNET_GENESIS_HASH,
+}
+
+
 def build_stca_preimage(
     chain_id: bytes,
     claim_id: bytes,
@@ -366,35 +410,77 @@ class CardanoTxObserver:
     async def get_genesis_hash(
         self, session: aiohttp.ClientSession
     ) -> Optional[bytes]:
-        """Query Ogmios for the Cardano network genesis hash. Cached for
-        the lifetime of the observer (genesis hash is invariant per
-        network). Returns 32 raw bytes or None on failure."""
+        """Resolve the Cardano network genesis hash for the network this
+        Ogmios endpoint is following.
+
+        Strategy (task #280): query Ogmios `queryNetwork/genesisConfiguration`
+        for the Shelley genesis PARAMETERS — that payload reliably contains
+        `networkMagic` — and map the magic to the canonical blake2b-256 of
+        the shelley-genesis JSON via :data:`NETWORK_MAGIC_TO_GENESIS_HASH`.
+
+        Why not the actual `hash` / `genesisHash` field? Modern Ogmios
+        (6.x and earlier) does NOT include a 32-byte blake2b-256 in this
+        payload — the response carries era / startTime / networkMagic /
+        slotLength / initialDelegates / etc. Pre-task-#280 the parser
+        looked for a `hash` field that never arrived and refused every
+        settlement with `ogmios_genesis_hash_unavailable`. See task brief
+        for the bug trace.
+
+        The on-chain `MainchainGenesisHash` constant is the canonical
+        pin for preprod-vs-mainnet domain separation; this function
+        returns the value the caller will COMPARE that pin against. Our
+        own pinned table is the trust anchor — same threat model as the
+        on-chain constant (a malicious operator could supply a wrong
+        Ogmios URL, but they can't make our table lie about which 32
+        bytes correspond to networkMagic=1).
+
+        Returns: 32-byte blake2b-256 of the network's shelley-genesis,
+        or None on (a) Ogmios call failure, (b) malformed payload,
+        (c) unknown networkMagic. None is treated as observer_unavailable
+        upstream — the safe refusal default.
+        """
         if self._cached_genesis is not None:
             return self._cached_genesis
-        # Ogmios 6.x exposes:
-        #   queryNetwork/genesisConfiguration {"era": "shelley"} →
-        #     {"hash": "<hex>", ...}
         result = await self._ogmios_rpc(
             session,
             "queryNetwork/genesisConfiguration",
             {"era": "shelley"},
         )
-        if isinstance(result, dict):
-            h = result.get("hash") or result.get("genesisHash")
-            if isinstance(h, str):
-                s = h[2:] if h.startswith("0x") else h
-                try:
-                    raw = bytes.fromhex(s)
-                except ValueError:
-                    raw = b""
-                if len(raw) == 32:
-                    self._cached_genesis = raw
-                    return raw
-        logger.warning(
-            f"settle_attestor: Ogmios genesis-hash query returned "
-            f"unusable result: {result!r}"
+        if not isinstance(result, dict):
+            # Either Ogmios returned an error or transport failed; the
+            # underlying _ogmios_rpc already logged WARNING. Don't poison
+            # the cache — a retry can succeed.
+            logger.warning(
+                f"settle_attestor: Ogmios genesis-config query returned "
+                f"non-dict result: {result!r}"
+            )
+            return None
+        network_magic = result.get("networkMagic")
+        if not isinstance(network_magic, int):
+            logger.warning(
+                f"settle_attestor: Ogmios genesis-config payload missing "
+                f"or non-int networkMagic field: keys={list(result.keys())} "
+                f"networkMagic={network_magic!r}"
+            )
+            return None
+        genesis_hash = NETWORK_MAGIC_TO_GENESIS_HASH.get(network_magic)
+        if genesis_hash is None:
+            logger.warning(
+                f"settle_attestor: unknown Cardano networkMagic="
+                f"{network_magic} — refusing to fabricate a genesis hash. "
+                f"Add the (magic, blake2b-256) pair to "
+                f"NETWORK_MAGIC_TO_GENESIS_HASH if this is a new network "
+                f"we should support."
+            )
+            return None
+        self._cached_genesis = genesis_hash
+        logger.info(
+            f"settle_attestor: resolved Cardano genesis hash for "
+            f"networkMagic={network_magic} "
+            f"(network={result.get('network', 'unknown')!r}): "
+            f"{genesis_hash.hex()[:16]}..."
         )
-        return None
+        return genesis_hash
 
     async def _kupo_get(
         self, session: aiohttp.ClientSession, path: str, params: dict
