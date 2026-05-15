@@ -20,6 +20,10 @@ from daemon.evidence_submitter import (
     EvidenceSubmitter,
     maybe_create_evidence_submitter,
 )
+from daemon.settle_claim_attestor import (
+    SettleClaimAttestor,
+    maybe_create_settle_claim_attestor,
+)
 from daemon import health_server
 from daemon.health_server import drain_notifications
 
@@ -161,6 +165,12 @@ class CertDaemon:
         # event loop is alive (in `run()`), since it depends on the same
         # `_chain_write_lock` the receipt path uses for nonce safety.
         self.evidence_submitter: Optional[EvidenceSubmitter] = None
+        # Task #266 — settle_claim Cardano-tx attestor (third job type for
+        # the same sr25519 committee key). Lazy-initialised after the event
+        # loop is alive; reuses `_chain_write_lock` so its attest_settle
+        # extrinsic submissions can't race the receipt-cert / TEE-evidence
+        # paths on the signer's nonce.
+        self.settle_claim_attestor: Optional[SettleClaimAttestor] = None
 
     def _ensure_concurrency_primitives(self):
         """Lazy-init asyncio Lock / Semaphore inside the running event loop.
@@ -186,6 +196,11 @@ class CertDaemon:
         try:
             if self.evidence_submitter is not None:
                 self.evidence_submitter.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self.settle_claim_attestor is not None:
+                self.settle_claim_attestor.stop()
         except Exception:  # noqa: BLE001
             pass
 
@@ -876,6 +891,16 @@ class CertDaemon:
         )
         if self.evidence_submitter is not None:
             self.evidence_submitter.start()
+
+        # Task #266 — settle_claim Cardano-tx attestor (third job type).
+        # Soft-disabled when OGMIOS_URL or KUPO_URL is unset. Shares the
+        # same chain_write_lock as the other two submission paths so the
+        # sr25519 signer's nonce stays monotonic across all three.
+        self.settle_claim_attestor = maybe_create_settle_claim_attestor(
+            self.config, self.client, self._chain_write_lock
+        )
+        if self.settle_claim_attestor is not None:
+            self.settle_claim_attestor.start()
 
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
 

@@ -6,6 +6,12 @@ from dataclasses import dataclass
 class DaemonConfig:
     rpc_url: str = "ws://materios-rpc.materios.svc.cluster.local:9944"
     ogmios_url: str = "http://materios-ogmios.materios.svc.cluster.local:1337"
+    # Task #266 — Kupo (Cardano tx indexer) URL. Used by the
+    # `settle_claim_attestor` to look up a Cardano tx by hash and
+    # enumerate its outputs. Unset disables the third attestation type
+    # (settle_claim cardano-tx confirmation); receipt-cert + TEE-evidence
+    # paths continue to run normally.
+    kupo_url: str = ""
     poll_interval: int = 12  # seconds
     signer_uri: str = "//Alice"
     chain_id: str = ""  # Materios genesis hash, set via CHAIN_ID env
@@ -64,6 +70,7 @@ class DaemonConfig:
         return cls(
             rpc_url=os.environ.get("MATERIOS_RPC_URL", cls.rpc_url),
             ogmios_url=os.environ.get("OGMIOS_URL", cls.ogmios_url),
+            kupo_url=os.environ.get("KUPO_URL", cls.kupo_url),
             poll_interval=int(os.environ.get("POLL_INTERVAL", cls.poll_interval)),
             signer_uri=os.environ.get("SIGNER_URI", cls.signer_uri),
             chain_id=os.environ.get("CHAIN_ID", cls.chain_id),
