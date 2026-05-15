@@ -477,17 +477,20 @@ class TestDispatcherHappyPath:
         assert len(call_args.args[1]) == 32
         assert len(call_args.args[2]) == 64
 
-    def test_signs_with_observer_depth_not_request_depth(self):
-        """PR #34 §3.2 makes ``observed_at_depth`` the attestor's
-        independent observation. The dispatcher MUST commit to its own
-        observer.depth, NOT echo back request.observed_at_depth.
+    def test_signs_with_request_depth_not_observer_depth(self):
+        """Task #287: the EXPP preimage's ``observed_at_depth`` MUST be
+        ``request.observed_at_depth`` (pinned on chain at
+        request_expire_policy time), NOT the daemon's fresh
+        ``obs.depth``. The pallet rebuilds the preimage from the pinned
+        value; signing over a different one produces InvalidSignature.
 
-        Mirrors the same property the STCA path established. An
-        attacker who lied about their observed depth cannot influence
-        the EXPP digest the committee signs — the digest binds to
-        what the attestor saw, not what the requester claimed.
+        The daemon's local obs.depth is used as INDEPENDENT
+        reality-verification (``obs.depth >= request.observed_at_depth``
+        must hold), not as the signed input.
         """
-        # observer reports depth = 30, request says 20.
+        # observer reports depth = 30, request says 20. Reality has
+        # caught up, so the daemon signs over depth=20 (the pinned
+        # value), not 30.
         observer = _make_observer_stub(
             tip_block_no=1_000_000, tx_block_no=1_000_000 - 30,
         )
@@ -495,30 +498,39 @@ class TestDispatcherHappyPath:
         attestor = _make_attestor(
             substrate_client=client, observer=observer,
         )
-        # Request says 20 but observer sees 30. Both are >= 15
-        # MinFinalityDepth so the attestor signs — but it signs over a
-        # preimage with depth=30, not 20.
         req = _default_pending_request(observed_at_depth=20)
         verdict = _run(attestor.process_one(req, CHAIN_ID))
         assert verdict.signed is True
 
-        # Reconstruct what the dispatcher SHOULD have signed and verify
-        # the signature is valid against that preimage.
         expected_preimage = build_expp_preimage(
             chain_id=CHAIN_ID, intent_id=INTENT_ID,
             policy_id=POLICY_ID, cardano_tx_hash=CARDANO_TX_HASH,
-            observed_at_depth=30,  # attestor's observation, NOT 20
+            observed_at_depth=20,  # request.observed_at_depth, NOT 30
             observed_slot=OBSERVED_SLOT,
             mainchain_genesis_hash=PREPROD_GENESIS,
         )
         expected_digest = compute_expp_digest(expected_preimage)
-        # Pull the signature off submit_attest_expire_policy's call args.
         call_args = client.submit_attest_expire_policy.call_args
         sig = call_args.args[2]
         pubkey = call_args.args[1]
-        # Verify sig over the digest using the same Keypair.
         kp = Keypair(public_key=pubkey, ss58_format=42)
         assert kp.verify(expected_digest, sig) is True
+
+    def test_refuses_when_reality_below_pinned_depth(self):
+        """Task #287: if reality hasn't caught up to the requester's
+        pinned depth, REFUSE rather than sign over a stale claim."""
+        observer = _make_observer_stub(
+            tip_block_no=1_000_000, tx_block_no=1_000_000 - 10,
+        )
+        client = _make_substrate_client_stub()
+        attestor = _make_attestor(
+            substrate_client=client, observer=observer,
+        )
+        req = _default_pending_request(observed_at_depth=25)
+        verdict = _run(attestor.process_one(req, CHAIN_ID))
+        assert verdict.signed is False
+        assert verdict.refusal_reason == RefusalReason.DEPTH_UNDERSHOOT
+        assert "reality has not caught up" in (verdict.refusal_detail or "")
 
     def test_signs_with_chain_resolved_policy_id_not_request_witness(self):
         """The EXPP digest commits to the chain-state-resolved policy_id
@@ -592,7 +604,10 @@ class TestDispatcherRefusals:
         client.submit_attest_expire_policy.assert_not_called()
 
     def test_refuses_when_depth_below_min_finality(self):
-        # Observer reports depth = 5 (= 1000 tip - 995 tx).
+        # Observer reports depth = 5 (= 1000 tip - 995 tx). Pin the
+        # request depth to 5 so the depth-undershoot check passes and
+        # the min-finality refusal underneath is exposed (task #287
+        # layered the two checks).
         observer = _make_observer_stub(
             tip_block_no=1_000, tx_block_no=995,
         )
@@ -601,7 +616,7 @@ class TestDispatcherRefusals:
             substrate_client=client, observer=observer,
             min_finality_depth=15,
         )
-        req = _default_pending_request()
+        req = _default_pending_request(observed_at_depth=5)
         verdict = _run(attestor.process_one(req, CHAIN_ID))
         assert verdict.signed is False
         assert verdict.refusal_reason == RefusalReason.FINALITY_BELOW_MIN

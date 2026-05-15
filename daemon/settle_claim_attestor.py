@@ -973,6 +973,7 @@ class RefusalReason:
     CHAIN_ID_UNAVAILABLE = "chain_id_unavailable"        # fact 7
     OBSERVER_UNAVAILABLE = "observer_unavailable"        # tooling, not safety
     DEPTH_OBSERVATION_UNAVAILABLE = "depth_observation_unavailable"
+    DEPTH_UNDERSHOOT = "depth_undershoot"  # task #287: reality < pinned
 
 
 @dataclass
@@ -1161,6 +1162,22 @@ class SettleClaimAttestor:
             )
             self._log_refusal(verdict)
             return verdict
+        # Task #287: the daemon must INDEPENDENTLY verify that reality is
+        # at least as deep as the requester claimed. The pallet rebuilds
+        # the STCA preimage from `request.observed_at_depth` (pinned at
+        # request_settle time), so the daemon signs over that value
+        # below — but ONLY after confirming reality has caught up. This
+        # catches a requester who pinned a future-depth that the chain
+        # hasn't actually reached yet.
+        if obs.depth < int(request.observed_at_depth):
+            verdict.refusal_reason = RefusalReason.DEPTH_UNDERSHOOT
+            verdict.refusal_detail = (
+                f"observed_depth={obs.depth} < "
+                f"request_observed_at_depth={request.observed_at_depth} "
+                f"(reality has not caught up to pinned depth)"
+            )
+            self._log_refusal(verdict)
+            return verdict
         if obs.depth < self.min_finality_depth:
             verdict.refusal_reason = RefusalReason.FINALITY_BELOW_MIN
             verdict.refusal_detail = (
@@ -1250,8 +1267,16 @@ class SettleClaimAttestor:
                 return verdict
 
         # All eight facts agree. Build the STCA preimage, sign, submit.
-        # The preimage commits to OUR observed depth (obs.depth) — that
-        # is the falsifiable claim per memo §3.2.
+        # Task #287: the preimage commits to the REQUEST-pinned depth +
+        # slot, NOT our fresh local observation. Reasoning:
+        #   - The pallet rebuilds the STCA preimage at verify time using
+        #     `request.observed_at_depth` and `request.observed_slot`
+        #     (the values pinned by //Alice at request_settle time).
+        #   - Daemon's job is to (a) INDEPENDENTLY verify reality matches
+        #     those pinned values (depth check at line 1164 above; slot
+        #     check at line 1142 above) and (b) sign over the EXACT same
+        #     bytes the pallet sees. Signing over fresh obs.depth would
+        #     produce a digest the pallet can't reproduce → InvalidSig.
         preimage = build_stca_preimage(
             chain_id=live_chain_id,
             claim_id=request.claim_id,
@@ -1260,8 +1285,8 @@ class SettleClaimAttestor:
             settled_direct=request.settled_direct,
             beneficiary_addr_blake2_224=request.beneficiary_addr_hash,
             amount_lovelace=request.amount_lovelace,
-            observed_at_depth=int(obs.depth),
-            observed_slot=int(obs.observed_slot),
+            observed_at_depth=int(request.observed_at_depth),
+            observed_slot=int(request.observed_slot),
             mainchain_genesis_hash=request.mainchain_genesis_hash,
         )
         digest = compute_stca_digest(preimage)
