@@ -24,6 +24,10 @@ from daemon.settle_claim_attestor import (
     SettleClaimAttestor,
     maybe_create_settle_claim_attestor,
 )
+from daemon.expire_policy_attestor import (
+    ExpirePolicyAttestor,
+    maybe_create_expire_policy_attestor,
+)
 from daemon import health_server
 from daemon.health_server import drain_notifications
 
@@ -171,6 +175,13 @@ class CertDaemon:
         # extrinsic submissions can't race the receipt-cert / TEE-evidence
         # paths on the signer's nonce.
         self.settle_claim_attestor: Optional[SettleClaimAttestor] = None
+        # Task #284 — expire_policy Cardano-tx attestor (fourth job type
+        # for the same sr25519 committee key, sister to settle_claim).
+        # Mirrors the settle path's lifecycle: lazy-initialised after the
+        # event loop is alive; reuses `_chain_write_lock` so its
+        # attest_expire_policy extrinsic submissions can't race the other
+        # three submission paths on the signer's nonce.
+        self.expire_policy_attestor: Optional[ExpirePolicyAttestor] = None
 
     def _ensure_concurrency_primitives(self):
         """Lazy-init asyncio Lock / Semaphore inside the running event loop.
@@ -201,6 +212,11 @@ class CertDaemon:
         try:
             if self.settle_claim_attestor is not None:
                 self.settle_claim_attestor.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self.expire_policy_attestor is not None:
+                self.expire_policy_attestor.stop()
         except Exception:  # noqa: BLE001
             pass
 
@@ -901,6 +917,17 @@ class CertDaemon:
         )
         if self.settle_claim_attestor is not None:
             self.settle_claim_attestor.start()
+
+        # Task #284 — expire_policy Cardano-tx attestor (fourth job
+        # type). Soft-disabled when OGMIOS_URL or KUPO_URL is unset
+        # (same env-var gating as the settle path). Shares the same
+        # chain_write_lock so the sr25519 signer's nonce stays
+        # monotonic across all four submission paths.
+        self.expire_policy_attestor = maybe_create_expire_policy_attestor(
+            self.config, self.client, self._chain_write_lock
+        )
+        if self.expire_policy_attestor is not None:
+            self.expire_policy_attestor.start()
 
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
 

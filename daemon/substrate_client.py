@@ -729,6 +729,310 @@ class SubstrateClient:
         )
         return None
 
+    # --- Expire-policy helpers (task #284 / spec-221) ------------------------
+    # These power `daemon.expire_policy_attestor` — the second M-of-N
+    # attested expire path (PR #34). They mirror the settle helpers shape
+    # for shape (read pending row, fetch chain-state field, submit attest
+    # with a single sig) so an auditor can grep both blocks side by side
+    # and confirm the same contract.
+
+    def list_pending_expiry_requests(self) -> list:
+        """Enumerate `IntentSettlement::PolicyExpireRequests` storage and
+        return one dict per pending row. Mirrors
+        :meth:`list_pending_settlement_requests` for shape.
+
+        Returns a list of plain dicts (NOT `PendingExpiryRequest`
+        dataclasses — kept loose so the attestor module can be tested
+        without import-coupling the schema). The dispatcher converts to
+        a dataclass on consumption.
+
+        Output shape per row:
+            {
+              "intent_id": bytes32,
+              "requester": ss58_str,
+              "submitted_block": int,
+              "cardano_tx_hash": bytes32,
+              "observed_at_depth": int,
+              "observed_slot": int,
+              "mainchain_genesis_hash": bytes32,
+              "policy_id_witness": bytes32,
+            }
+        """
+        out: list[dict] = []
+        try:
+            rows = self.substrate.query_map(
+                module="IntentSettlement",
+                storage_function="PolicyExpireRequests",
+            )
+        except SubstrateRequestException as e:
+            logger.warning(
+                f"list_pending_expiry_requests: query_map raised "
+                f"{type(e).__name__}: {e}"
+            )
+            return out
+        except Exception as e:  # noqa: BLE001
+            # Older runtime versions without the pallet wired return a
+            # "module not found" — that's a soft-disable, not an error.
+            # Same shape as list_pending_settlement_requests.
+            logger.info(
+                f"list_pending_expiry_requests: no IntentSettlement "
+                f"module on chain ({type(e).__name__}: {e}); skipping tick"
+            )
+            return out
+        for key, value in rows:
+            try:
+                intent_id_b = _to_bytes32(key.value)
+            except (ValueError, TypeError):
+                continue
+            record = value.value if hasattr(value, "value") else value
+            if not isinstance(record, dict):
+                continue
+            evidence = record.get("evidence") or {}
+            if not isinstance(evidence, dict):
+                continue
+            try:
+                out.append({
+                    "intent_id": intent_id_b,
+                    "requester": str(record.get("requester")),
+                    "submitted_block": int(record.get("submitted_block", 0)),
+                    "cardano_tx_hash": _to_bytes32(
+                        evidence.get("cardano_tx_hash")
+                    ),
+                    "observed_at_depth": int(
+                        evidence.get("observed_at_depth", 0)
+                    ),
+                    "observed_slot": int(evidence.get("observed_slot", 0)),
+                    "mainchain_genesis_hash": _to_bytes32(
+                        evidence.get("mainchain_genesis_hash")
+                    ),
+                    "policy_id_witness": _to_bytes32(
+                        evidence.get("policy_id_witness")
+                    ),
+                })
+            except (ValueError, TypeError, KeyError) as e:
+                logger.warning(
+                    f"list_pending_expiry_requests: malformed row "
+                    f"for intent {intent_id_b.hex()[:16]}...: "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+        return out
+
+    def get_intent_status(self, intent_id: bytes) -> Optional[str]:
+        """Return the `IntentStatus` for an on-chain intent as a string
+        (one of: ``"Pending"``, ``"Attested"``, ``"Vouchered"``,
+        ``"Settled"``, ``"Expired"``, ``"Refunded"``).
+
+        Returns ``None`` when the intent row is absent — the
+        ``expire_policy_attestor`` treats that as ``INTENT_NOT_FOUND``
+        and refuses to sign.
+
+        substrate-interface decodes a SCALE enum as either a bare string
+        (variant name) or a dict ``{"VariantName": null}``. We normalize
+        both shapes to a plain string.
+        """
+        intent_param = "0x" + intent_id.hex()
+        try:
+            result = self.substrate.query(
+                module="IntentSettlement",
+                storage_function="Intents",
+                params=[intent_param],
+            )
+        except SubstrateRequestException as e:
+            logger.warning(
+                f"get_intent_status: Intents query raised "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+        if result is None or result.value is None:
+            return None
+        intent = result.value
+        if not isinstance(intent, dict):
+            return None
+        status = intent.get("status")
+        if status is None:
+            return None
+        if isinstance(status, str):
+            return status
+        if isinstance(status, dict):
+            # SCALE-decoded enum variant is sometimes shaped as
+            # {"VariantName": None}; first key wins.
+            keys = list(status.keys())
+            if keys:
+                return str(keys[0])
+        # Numeric encoding (rare); map to enum order
+        # 0=Pending, 1=Attested, 2=Vouchered, 3=Settled, 4=Expired, 5=Refunded.
+        if isinstance(status, int):
+            mapping = {
+                0: "Pending",
+                1: "Attested",
+                2: "Vouchered",
+                3: "Settled",
+                4: "Expired",
+                5: "Refunded",
+            }
+            return mapping.get(status)
+        return None
+
+    def get_policy_id_for_intent(self, intent_id: bytes) -> Optional[bytes]:
+        """Return the chain-state-resolved 32-byte policy id for an
+        on-chain intent, mirroring the pallet's
+        ``Pallet::<T>::resolve_intent_policy_id`` (see
+        ``materios-intent-settlement/pallets/intent-settlement/src/lib.rs``).
+
+        Mapping:
+          * ``BuyPolicy { product_id, .. }`` → ``product_id`` (the
+            product_id IS the policy_id from the Aegis-side perspective).
+          * ``RequestPayout { policy_id, .. }`` → ``policy_id``.
+          * ``RefundCredit { .. }`` → ``None`` (no Cardano-side policy
+            — `expire_policy_attestor` refuses these with
+            ``POLICY_ID_WITNESS_MISMATCH`` / detail
+            ``intent_kind_has_no_policy_id``).
+
+        Returns ``None`` also when the intent row is absent or the
+        decoded ``kind`` field is malformed.
+        """
+        intent_param = "0x" + intent_id.hex()
+        try:
+            result = self.substrate.query(
+                module="IntentSettlement",
+                storage_function="Intents",
+                params=[intent_param],
+            )
+        except SubstrateRequestException as e:
+            logger.warning(
+                f"get_policy_id_for_intent: Intents query raised "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+        if result is None or result.value is None:
+            return None
+        intent = result.value
+        if not isinstance(intent, dict):
+            return None
+        kind = intent.get("kind")
+        if kind is None:
+            return None
+        # substrate-interface decodes a SCALE enum like
+        # IntentKind as a dict {"VariantName": <inner_dict>} where the
+        # inner dict carries the variant fields.
+        if isinstance(kind, dict):
+            for variant_name, payload in kind.items():
+                if variant_name == "BuyPolicy":
+                    if isinstance(payload, dict):
+                        product_id = payload.get("product_id")
+                        if product_id is not None:
+                            try:
+                                return _to_bytes32(product_id)
+                            except (ValueError, TypeError):
+                                return None
+                elif variant_name == "RequestPayout":
+                    if isinstance(payload, dict):
+                        policy_id = payload.get("policy_id")
+                        if policy_id is not None:
+                            try:
+                                return _to_bytes32(policy_id)
+                            except (ValueError, TypeError):
+                                return None
+                elif variant_name == "RefundCredit":
+                    # No Cardano-side policy — refund-credit intents
+                    # are not expire-able via this path.
+                    return None
+                # Unknown variant — same effect as "no policy" (the
+                # daemon refuses).
+                return None
+        return None
+
+    def submit_attest_expire_policy(
+        self,
+        intent_id: bytes,
+        my_pubkey: bytes,
+        my_sig: bytes,
+    ) -> Optional[str]:
+        """Submit `IntentSettlement::attest_expire_policy(intent_id,
+        [(my_pubkey, my_sig)])`. Each attestor calls this with a single-
+        element sig list — the pallet accumulates sigs across calls
+        until the threshold is reached and the intent flips to
+        ``Expired`` (PR #34 §3.1, same semantic as ``attest_settle``).
+
+        Returns the extrinsic hash (0x-prefixed hex) on inclusion, None
+        otherwise. Retries on transport failure are bounded by
+        ``tx_max_retries`` (same knob receipt-cert + settle paths use).
+        """
+        if len(intent_id) != 32:
+            raise ValueError(
+                f"intent_id must be 32 bytes, got {len(intent_id)}"
+            )
+        if len(my_pubkey) != 32:
+            raise ValueError(
+                f"my_pubkey must be 32 bytes, got {len(my_pubkey)}"
+            )
+        if len(my_sig) != 64:
+            raise ValueError(f"my_sig must be 64 bytes, got {len(my_sig)}")
+        last_error: Optional[str] = None
+        for attempt in range(self.config.tx_max_retries):
+            try:
+                call = self.substrate.compose_call(
+                    call_module="IntentSettlement",
+                    call_function="attest_expire_policy",
+                    call_params={
+                        "intent_id": "0x" + intent_id.hex(),
+                        "signatures": [
+                            (
+                                "0x" + my_pubkey.hex(),
+                                "0x" + my_sig.hex(),
+                            )
+                        ],
+                    },
+                )
+                extrinsic = self.substrate.create_signed_extrinsic(
+                    call=call, keypair=self.keypair,
+                )
+                receipt = self.substrate.submit_extrinsic(
+                    extrinsic, wait_for_inclusion=True
+                )
+                if not receipt.is_success:
+                    last_error = str(receipt.error_message)
+                    logger.warning(
+                        f"attest_expire_policy failed for "
+                        f"{intent_id.hex()[:16]}...: {last_error}"
+                    )
+                    # Non-retryable: the pallet's invariant errors
+                    # (ExpiryRequestMissing, IntentNotEligibleForExpiry,
+                    # etc.) won't resolve on retry — return None so the
+                    # caller treats this attempt as terminal for the
+                    # tick.
+                    return None
+                ext_hash = (
+                    getattr(receipt, "extrinsic_hash", None)
+                    or getattr(receipt, "block_hash", None)
+                    or ""
+                )
+                return str(ext_hash) if ext_hash else None
+            except SubstrateRequestException as e:
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"attest_expire_policy attempt {attempt + 1} raised: {e}"
+                )
+                if attempt < self.config.tx_max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except Exception as e:  # noqa: BLE001
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"attest_expire_policy unexpected error for "
+                    f"{intent_id.hex()[:16]}...: {e}"
+                )
+                return None
+        logger.warning(
+            f"attest_expire_policy gave up after {self.config.tx_max_retries} "
+            f"attempts for {intent_id.hex()[:16]}...: {last_error}"
+        )
+        return None
+
     def get_block_events(self, block_number: int) -> list:
         block_hash = self.substrate.get_block_hash(block_number)
         events = self.substrate.get_events(block_hash=block_hash)
