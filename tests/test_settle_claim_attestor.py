@@ -348,14 +348,29 @@ class TestStcaDigest:
 
 
 class TestObserverHelpers:
-    def test_blake2_224_is_28_bytes(self):
-        h = blake2_224_of_cardano_address(
-            "addr_test1qpsfvvev..."  # arbitrary bech32-shaped bytes
+    def test_address_extraction_is_28_bytes_and_matches_payment_hash(self):
+        """Post-PR #272 the legacy `blake2_224_of_cardano_address` is a
+        thin shim that delegates to `extract_payment_hash_from_cardano_address`.
+        The returned bytes are the 28-byte payment-key hash from
+        CIP-0019 [1..29], NOT a blake2_224 hash of the bech32 string.
+
+        Verified via round-trip: construct a known CIP-0019 type-0
+        testnet address with payment_hash = 0x11*28, encode to bech32,
+        decode via the shim, assert we get back exactly 0x11*28.
+        """
+        # Construct a CIP-0019 type-0 testnet address: header(1) + payment(28) + stake(28) = 57B.
+        from tests.test_cardano_address import _bech32_encode_addr_test
+        header = bytes([0x00])  # type 0 base address, testnet (network nibble = 0)
+        payment_hash = b"\x11" * 28
+        stake_hash = b"\x22" * 28
+        raw = header + payment_hash + stake_hash
+        addr = _bech32_encode_addr_test(raw)
+        got = blake2_224_of_cardano_address(addr)
+        assert len(got) == 28
+        assert got == payment_hash, (
+            f"expected payment-key extraction at [1..29], "
+            f"got {got.hex()} vs {payment_hash.hex()}"
         )
-        assert len(h) == 28
-        assert h == hashlib.blake2b(
-            b"addr_test1qpsfvvev...", digest_size=28
-        ).digest()
 
     def test_observation_ok_property_when_complete(self):
         obs = CardanoTxObservation(tx_hash_hex="aa" * 32)
