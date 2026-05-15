@@ -360,6 +360,10 @@ class ExpirePolicyAttestor:
         min_finality_depth: int,
         poll_interval: int = 12,
         max_concurrent: Optional[int] = None,
+        # Task #286: gateway-mediated peer-sig aggregator. Same contract
+        # as `SettleClaimAttestor` (see substrate_client docstring).
+        aggregator: Optional[Any] = None,
+        min_signer_threshold: Optional[int] = None,
     ):
         self.config = config
         self.client = substrate_client
@@ -381,6 +385,17 @@ class ExpirePolicyAttestor:
         self._sem = asyncio.Semaphore(sem_value)
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self.aggregator = aggregator
+        if min_signer_threshold is None and aggregator is not None:
+            try:
+                min_signer_threshold = substrate_client.get_min_signer_threshold()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"expire_attestor: MinSignerThreshold query failed "
+                    f"({type(e).__name__}); defaulting to 2"
+                )
+                min_signer_threshold = 2
+        self.min_signer_threshold = max(1, int(min_signer_threshold or 1))
 
     async def process_one(
         self, request: PendingExpiryRequest, live_chain_id: bytes
@@ -558,27 +573,72 @@ class ExpirePolicyAttestor:
         sig_bytes = self.client.keypair.sign(digest)
         pubkey_bytes = self.client.keypair.public_key
 
-        # Submit on-chain. Hold the SHARED chain-write lock for the full
-        # nonce + sign + submit triplet so we don't race with the
-        # receipt-cert, TEE-evidence, or settle_claim_attestor paths on
-        # the signer's nonce.
-        async with self._chain_write_lock:
-            try:
-                ext_hash = await asyncio.to_thread(
-                    self.client.submit_attest_expire_policy,
-                    request.intent_id,
-                    pubkey_bytes,
-                    sig_bytes,
+        # Task #286: gateway-mediated envelope assembly. Same shape as
+        # settle_claim_attestor; falls back to 1-sig submit on chains
+        # where MinSignerThreshold == 1.
+        if self.aggregator is not None and self.min_signer_threshold > 1:
+            async with aiohttp.ClientSession() as session:
+                envelope = await self.aggregator.assemble_envelope(
+                    session,
+                    kind="expire",
+                    key=request.intent_id,
+                    digest=digest,
+                    my_pubkey=pubkey_bytes,
+                    my_sig=sig_bytes,
                 )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    f"expire_attestor: submit_attest_expire_policy raised "
-                    f"for {request.intent_id.hex()[:16]}...: "
-                    f"{type(e).__name__}: {e}"
+            if len(envelope) < self.min_signer_threshold:
+                logger.info(
+                    f"expire_attestor: {len(envelope)}/{self.min_signer_threshold} "
+                    f"sigs assembled for intent_id="
+                    f"{request.intent_id.hex()[:16]}... — deferring submit "
+                    f"until more peers share. Next tick will retry."
                 )
                 verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
-                verdict.refusal_detail = f"submit_raised: {type(e).__name__}"
+                verdict.refusal_detail = (
+                    f"awaiting_peer_sigs:{len(envelope)}/"
+                    f"{self.min_signer_threshold}"
+                )
                 return verdict
+            logger.info(
+                f"expire_attestor: assembled {len(envelope)}/"
+                f"{self.min_signer_threshold} sigs for "
+                f"{request.intent_id.hex()[:16]}... — submitting envelope"
+            )
+            async with self._chain_write_lock:
+                try:
+                    ext_hash = await asyncio.to_thread(
+                        self.client.submit_attest_expire_policy_envelope,
+                        request.intent_id,
+                        envelope,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"expire_attestor: submit_attest_expire_policy_envelope "
+                        f"raised for {request.intent_id.hex()[:16]}...: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
+                    verdict.refusal_detail = f"submit_raised: {type(e).__name__}"
+                    return verdict
+        else:
+            # 1-sig fallback (test chains).
+            async with self._chain_write_lock:
+                try:
+                    ext_hash = await asyncio.to_thread(
+                        self.client.submit_attest_expire_policy,
+                        request.intent_id,
+                        pubkey_bytes,
+                        sig_bytes,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"expire_attestor: submit_attest_expire_policy raised "
+                        f"for {request.intent_id.hex()[:16]}...: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
+                    verdict.refusal_detail = f"submit_raised: {type(e).__name__}"
+                    return verdict
 
         if not ext_hash:
             logger.warning(
@@ -785,6 +845,22 @@ def maybe_create_expire_policy_attestor(
         ogmios_url=ogmios_url,
         kupo_url=kupo_url,
     )
+    # Task #286: gateway-mediated peer-sig aggregator (same contract as
+    # settle path). Disabled when blob_gateway_url is unset.
+    aggregator = None
+    gateway_url = (getattr(config, "blob_gateway_url", "") or "").strip()
+    if gateway_url:
+        from daemon.multisig_aggregator import MultisigAggregator
+        aggregator = MultisigAggregator(gateway_url=gateway_url)
+        logger.info(
+            f"expire_attestor: multisig aggregator wired (gateway={gateway_url})"
+        )
+    else:
+        logger.warning(
+            "expire_attestor: BLOB_GATEWAY_URL unset — aggregator disabled. "
+            "Submits will use 1-sig envelope; pallet rejects with "
+            "InsufficientSignatures on MinSignerThreshold >= 2 chains."
+        )
     return ExpirePolicyAttestor(
         config=config,
         substrate_client=substrate_client,
@@ -793,6 +869,7 @@ def maybe_create_expire_policy_attestor(
         min_finality_depth=min_finality_depth,
         poll_interval=poll_interval,
         max_concurrent=max_concurrent,
+        aggregator=aggregator,
     )
 
 

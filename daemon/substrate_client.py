@@ -652,14 +652,18 @@ class SubstrateClient:
         my_pubkey: bytes,
         my_sig: bytes,
     ) -> Optional[str]:
-        """Submit `IntentSettlement::attest_settle(claim_id, [(my_pubkey,
-        my_sig)])`. Each attestor calls this with a single-element sig
-        list — the pallet accumulates sigs across calls until the
-        threshold is reached and the claim settles (memo §3.1).
+        """Submit ``IntentSettlement::attest_settle(claim_id, [(my_pubkey,
+        my_sig)])`` with a 1-sig envelope.
 
-        Returns the extrinsic hash (0x-prefixed hex) on inclusion, None
-        otherwise. Retries on transport failure are bounded by
-        ``tx_max_retries`` (same knob receipt-cert path uses).
+        DEPRECATED for the daemon's autopilot path (task #286). The pallet's
+        ``ensure_threshold_signatures`` does NOT accumulate sigs across
+        calls — it requires M sigs in ONE envelope. A 1-sig submit against
+        a chain with ``MinSignerThreshold >= 2`` always returns
+        ``InsufficientSignatures``. Use ``submit_attest_settle_envelope``
+        instead, paired with the gateway-mediated aggregator.
+
+        Kept for back-compat with single-threshold test chains
+        (``MinSignerThreshold == 1``).
         """
         if len(claim_id) != 32:
             raise ValueError(f"claim_id must be 32 bytes, got {len(claim_id)}")
@@ -728,6 +732,180 @@ class SubstrateClient:
             f"attempts for {claim_id.hex()[:16]}...: {last_error}"
         )
         return None
+
+    # --- Multi-sig envelope variants (task #286 — autopilot path) ------------
+    # The pallet's `ensure_threshold_signatures` requires the full M-sig
+    # bundle in ONE call. Each cert-daemon assembles the bundle via the
+    # gateway-mediated `multisig_aggregator` and then calls one of these
+    # envelope methods. The 1-sig methods above remain only for
+    # `MinSignerThreshold == 1` test chains.
+
+    def submit_attest_settle_envelope(
+        self,
+        claim_id: bytes,
+        sigs: list,  # list[tuple[bytes, bytes]]: (pubkey, sig)
+    ) -> Optional[str]:
+        """Submit ``IntentSettlement::attest_settle(claim_id, sigs)`` with
+        an M-sig envelope. ``sigs`` is ``[(pubkey, sig), ...]``; the caller
+        is responsible for assembling, deduping, and sorting the entries
+        (the gateway aggregator does this).
+
+        The caller's own pubkey MUST appear in the envelope or the pallet's
+        caller-binding check rejects with ``InsufficientSignatures``. The
+        aggregator's ``assemble_envelope`` guarantees this.
+
+        Returns the extrinsic hash (0x-prefixed hex) on inclusion, None on
+        any non-success (including ``InsufficientSignatures`` if the caller
+        passes too few sigs — that's treated as terminal for the tick;
+        retry happens on the next poll if peer sigs land later).
+        """
+        if len(claim_id) != 32:
+            raise ValueError(f"claim_id must be 32 bytes, got {len(claim_id)}")
+        if not sigs:
+            raise ValueError("sigs must be non-empty")
+        for i, (pub, sig) in enumerate(sigs):
+            if len(pub) != 32:
+                raise ValueError(f"sigs[{i}].pubkey must be 32 bytes, got {len(pub)}")
+            if len(sig) != 64:
+                raise ValueError(f"sigs[{i}].sig must be 64 bytes, got {len(sig)}")
+        sigs_param = [("0x" + pub.hex(), "0x" + sig.hex()) for pub, sig in sigs]
+        last_error: Optional[str] = None
+        for attempt in range(self.config.tx_max_retries):
+            try:
+                call = self.substrate.compose_call(
+                    call_module="IntentSettlement",
+                    call_function="attest_settle",
+                    call_params={
+                        "claim_id": "0x" + claim_id.hex(),
+                        "signatures": sigs_param,
+                    },
+                )
+                extrinsic = self.substrate.create_signed_extrinsic(
+                    call=call, keypair=self.keypair,
+                )
+                receipt = self.substrate.submit_extrinsic(
+                    extrinsic, wait_for_inclusion=True
+                )
+                if not receipt.is_success:
+                    last_error = str(receipt.error_message)
+                    logger.warning(
+                        f"attest_settle_envelope failed for "
+                        f"{claim_id.hex()[:16]}... (sigs={len(sigs)}): "
+                        f"{last_error}"
+                    )
+                    return None
+                ext_hash = (
+                    getattr(receipt, "extrinsic_hash", None)
+                    or getattr(receipt, "block_hash", None)
+                    or ""
+                )
+                return str(ext_hash) if ext_hash else None
+            except SubstrateRequestException as e:
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"attest_settle_envelope attempt {attempt + 1} raised: {e}"
+                )
+                if attempt < self.config.tx_max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except Exception as e:  # noqa: BLE001
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"attest_settle_envelope attempt {attempt + 1} unexpected: {e}"
+                )
+                return None
+        logger.error(
+            f"attest_settle_envelope gave up after {self.config.tx_max_retries} "
+            f"attempts for {claim_id.hex()[:16]}...: {last_error}"
+        )
+        return None
+
+    def submit_attest_expire_policy_envelope(
+        self,
+        intent_id: bytes,
+        sigs: list,  # list[tuple[bytes, bytes]]
+    ) -> Optional[str]:
+        """Sister to ``submit_attest_settle_envelope`` for the spec-221
+        attested-expire path. Same envelope contract."""
+        if len(intent_id) != 32:
+            raise ValueError(f"intent_id must be 32 bytes, got {len(intent_id)}")
+        if not sigs:
+            raise ValueError("sigs must be non-empty")
+        for i, (pub, sig) in enumerate(sigs):
+            if len(pub) != 32:
+                raise ValueError(f"sigs[{i}].pubkey must be 32 bytes, got {len(pub)}")
+            if len(sig) != 64:
+                raise ValueError(f"sigs[{i}].sig must be 64 bytes, got {len(sig)}")
+        sigs_param = [("0x" + pub.hex(), "0x" + sig.hex()) for pub, sig in sigs]
+        last_error: Optional[str] = None
+        for attempt in range(self.config.tx_max_retries):
+            try:
+                call = self.substrate.compose_call(
+                    call_module="IntentSettlement",
+                    call_function="attest_expire_policy",
+                    call_params={
+                        "intent_id": "0x" + intent_id.hex(),
+                        "signatures": sigs_param,
+                    },
+                )
+                extrinsic = self.substrate.create_signed_extrinsic(
+                    call=call, keypair=self.keypair,
+                )
+                receipt = self.substrate.submit_extrinsic(
+                    extrinsic, wait_for_inclusion=True
+                )
+                if not receipt.is_success:
+                    last_error = str(receipt.error_message)
+                    logger.warning(
+                        f"attest_expire_policy_envelope failed for "
+                        f"{intent_id.hex()[:16]}... (sigs={len(sigs)}): "
+                        f"{last_error}"
+                    )
+                    return None
+                ext_hash = (
+                    getattr(receipt, "extrinsic_hash", None)
+                    or getattr(receipt, "block_hash", None)
+                    or ""
+                )
+                return str(ext_hash) if ext_hash else None
+            except SubstrateRequestException as e:
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"attest_expire_policy_envelope attempt {attempt + 1} raised: {e}"
+                )
+                if attempt < self.config.tx_max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except Exception as e:  # noqa: BLE001
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"attest_expire_policy_envelope attempt {attempt + 1} "
+                    f"unexpected: {e}"
+                )
+                return None
+        logger.error(
+            f"attest_expire_policy_envelope gave up after "
+            f"{self.config.tx_max_retries} attempts for "
+            f"{intent_id.hex()[:16]}...: {last_error}"
+        )
+        return None
+
+    def get_min_signer_threshold(self) -> int:
+        """Read ``IntentSettlement::MinSignerThreshold`` (governance-set;
+        0 = use ``DefaultMinSignerThreshold``). Returns the effective
+        threshold (storage value if >0, else 2 which is the pallet default).
+        Used by daemon attestors to know how many envelope sigs to assemble
+        before submitting via the multi-sig envelope methods."""
+        try:
+            stored = self.substrate.query(
+                "IntentSettlement", "MinSignerThreshold"
+            ).value
+            stored_int = int(stored or 0)
+            return stored_int if stored_int > 0 else 2
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"get_min_signer_threshold: query failed ({type(e).__name__}: {e}); "
+                f"falling back to 2"
+            )
+            return 2
 
     # --- Expire-policy helpers (task #284 / spec-221) ------------------------
     # These power `daemon.expire_policy_attestor` — the second M-of-N
@@ -953,15 +1131,13 @@ class SubstrateClient:
         my_pubkey: bytes,
         my_sig: bytes,
     ) -> Optional[str]:
-        """Submit `IntentSettlement::attest_expire_policy(intent_id,
-        [(my_pubkey, my_sig)])`. Each attestor calls this with a single-
-        element sig list — the pallet accumulates sigs across calls
-        until the threshold is reached and the intent flips to
-        ``Expired`` (PR #34 §3.1, same semantic as ``attest_settle``).
+        """Submit ``IntentSettlement::attest_expire_policy(intent_id,
+        [(my_pubkey, my_sig)])`` with a 1-sig envelope.
 
-        Returns the extrinsic hash (0x-prefixed hex) on inclusion, None
-        otherwise. Retries on transport failure are bounded by
-        ``tx_max_retries`` (same knob receipt-cert + settle paths use).
+        DEPRECATED for the daemon's autopilot path (task #286) — same
+        reasoning as ``submit_attest_settle``. Use
+        ``submit_attest_expire_policy_envelope`` paired with the gateway
+        aggregator for chains where ``MinSignerThreshold >= 2``.
         """
         if len(intent_id) != 32:
             raise ValueError(
