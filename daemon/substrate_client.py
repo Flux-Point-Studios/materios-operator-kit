@@ -7,6 +7,11 @@ from substrateinterface.exceptions import SubstrateRequestException
 
 from daemon.config import DaemonConfig
 from daemon.models import ReceiptRecord
+from daemon.voucher_canonicalize import (
+    AddressDecodeError,
+    ChainIdentity,
+    compute_voucher_digest_with_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +92,53 @@ def _maybe_bytes32(val) -> Optional[bytes]:
         return _to_bytes32(val)
     except (ValueError, TypeError):
         return None
+
+
+def _bytes_from_scale_value(val) -> bytes:
+    """Convert SCALE-decoded variable-length bytes to a Python ``bytes``.
+
+    substrate-interface decodes ``BoundedVec<u8, ...>`` as either a
+    ``"0x..."`` hex string or a list of ints, depending on the type
+    registry. Both shapes need to round-trip to the same bytes for the
+    voucher-digest derivation to work regardless of decoder mood.
+    """
+    if isinstance(val, bytes):
+        return val
+    if isinstance(val, str):
+        return bytes.fromhex(val.removeprefix("0x"))
+    if isinstance(val, (list, tuple)):
+        return bytes(val)
+    raise TypeError(f"can't convert {type(val).__name__} to bytes")
+
+
+def _extract_voucher_fields_for_digest(row: dict) -> dict:
+    """Pluck the fields required by :func:`compute_voucher_digest_with_address`
+    out of a ``Vouchers[claim_id]`` storage row.
+
+    The pallet's ``Voucher`` struct (``pallets/intent-settlement/src/types.rs``):
+
+      - ``policy_id``: H256 (32B)
+      - ``beneficiary_cardano_addr``: BoundedVec<u8, MAX_CARDANO_ADDR>
+      - ``amount_ada``: u64
+      - ``batch_fairness_proof_digest``: [u8; 32]
+      - ``issued_block``: u32
+      - ``expiry_slot_cardano``: u64
+
+    Raises ``KeyError`` / ``TypeError`` / ``ValueError`` for malformed
+    rows so the caller logs the specific shape mismatch.
+    """
+    return {
+        "policy_id": _to_bytes_exact(row["policy_id"], 32),
+        "beneficiary_cardano_addr": _bytes_from_scale_value(
+            row["beneficiary_cardano_addr"]
+        ),
+        "amount_ada": int(row["amount_ada"]),
+        "batch_fairness_proof_digest": _to_bytes_exact(
+            row["batch_fairness_proof_digest"], 32
+        ),
+        "issued_block": int(row["issued_block"]),
+        "expiry_slot_cardano": int(row["expiry_slot_cardano"]),
+    }
 
 
 class SubstrateClient:
@@ -305,21 +357,125 @@ class SubstrateClient:
                 continue
         return out
 
+    def get_chain_identity(self) -> Optional[ChainIdentity]:
+        """Read the four IntentSettlement chain-identity constants via
+        runtime metadata and assemble a :class:`ChainIdentity`.
+
+        Returns ``None`` if any of the four constants is unreadable
+        (typically because the runtime doesn't expose
+        ``IntentSettlement::*`` — e.g. an older spec without
+        ``pallet-intent-settlement`` wired in). Callers MUST treat
+        ``None`` as "cannot derive voucher digest" rather than
+        fabricate a default — a stale or zeroed chain-identity would
+        produce wrong-domain digests and silently break attest_settle.
+
+        We fetch these on every call rather than cache them in
+        ``self`` because the cache invalidation rules
+        (``feedback_cert_daemon_chain_id_must_be_set.md``) require
+        re-fetch on every genesis-hash change anyway, and the four
+        ``get_constant`` calls are decoded from already-cached
+        metadata so the cost is negligible relative to a single
+        ``query``.
+        """
+        try:
+            chain_id_const = self.substrate.get_constant(
+                "IntentSettlement", "MateriosChainId"
+            )
+            network_magic_const = self.substrate.get_constant(
+                "IntentSettlement", "NetworkMagic"
+            )
+            script_hash_const = self.substrate.get_constant(
+                "IntentSettlement", "AegisPolicyV1ScriptHash"
+            )
+            settlement_version_const = self.substrate.get_constant(
+                "IntentSettlement", "SettlementVersion"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.info(
+                f"get_chain_identity: get_constant raised "
+                f"{type(e).__name__}: {e}; skipping derive-from-state"
+            )
+            return None
+        consts = (
+            chain_id_const,
+            network_magic_const,
+            script_hash_const,
+            settlement_version_const,
+        )
+        if any(c is None for c in consts):
+            return None
+        try:
+            chain_id_raw = _to_bytes_exact(
+                getattr(chain_id_const, "value", chain_id_const), 32
+            )
+            network_magic_raw = int(
+                getattr(network_magic_const, "value", network_magic_const)
+            )
+            script_hash_raw = _to_bytes_exact(
+                getattr(script_hash_const, "value", script_hash_const), 28
+            )
+            settlement_version_raw = int(
+                getattr(
+                    settlement_version_const,
+                    "value",
+                    settlement_version_const,
+                )
+            )
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                f"get_chain_identity: failed to decode constants: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+        try:
+            return ChainIdentity(
+                materios_chain_id=chain_id_raw,
+                network_magic=network_magic_raw,
+                aegis_policy_script_hash=script_hash_raw,
+                settlement_version=settlement_version_raw,
+            )
+        except ValueError as e:
+            logger.warning(f"get_chain_identity: invalid constant values: {e}")
+            return None
+
     def get_voucher_digest(self, claim_id: bytes) -> Optional[bytes]:
         """Return the chain-state voucher_digest for ``claim_id`` (the
         binding committed in the STCA preimage, memo §3.2).
 
-        The pallet computes this digest at voucher-mint time and stores
-        it as part of the ``Voucher`` row (or on a dedicated
-        ``VoucherDigests`` map). We try the dedicated map first (the
-        zero-RPC-cost path), then fall back to deriving from
-        ``Vouchers[claim_id]`` if needed. Returns None when no voucher
-        is on chain for this claim.
+        Resolution order:
+
+        1. **Preferred** — dedicated ``IntentSettlement::VoucherDigests``
+           storage map. Doesn't exist in the current runtime; kept
+           ahead of the fallback for forward-compat with a future
+           pallet revision that publishes the digest as a separate
+           value.
+        2. **Preferred** — ``voucher_digest`` field on the
+           ``Vouchers[claim_id]`` row. Doesn't exist either today; same
+           forward-compat reason.
+        3. **Live fallback (task #278)** — read the full
+           ``Vouchers[claim_id]`` row + the four chain-identity
+           runtime constants via metadata, then recompute the digest
+           via :func:`daemon.voucher_canonicalize.compute_voucher_digest_with_address`.
+           This is the only path that actually returns a value on the
+           current chain. Byte-for-byte mirrors the pallet's
+           ``compute_canonical_voucher_digest`` — the pinned parity
+           vector in ``tests/test_voucher_canonicalize.py`` guards
+           drift.
+
+        Returns ``None`` when:
+          - No voucher row exists for ``claim_id``.
+          - The voucher row exists but the chain-identity constants
+            aren't readable (e.g. older spec without
+            ``pallet-intent-settlement``).
+          - The beneficiary address isn't a CIP-0019 type-0 form
+            (v1 vouchers don't support enterprise/script addresses).
+
+        ``None`` causes the dispatcher to drop the settle request
+        rather than sign a wrong-domain digest — falsifiability is the
+        whole point of the STCA preimage (memo §2.4).
         """
         claim_param = "0x" + claim_id.hex()
-        # Preferred path: dedicated `VoucherDigests` map (most pallets
-        # surface the digest separately for cheap reads). If the storage
-        # is absent we fall through to the Voucher row.
+        # Path 1: dedicated VoucherDigests map (forward-compat).
         try:
             result = self.substrate.query(
                 module="IntentSettlement",
@@ -328,16 +484,22 @@ class SubstrateClient:
             )
             if result is not None and result.value is not None:
                 try:
-                    return _to_bytes32(result.value)
+                    digest = _to_bytes32(result.value)
+                    logger.debug(
+                        f"get_voucher_digest: VoucherDigests hit for "
+                        f"claim={claim_id.hex()[:16]}..."
+                    )
+                    return digest
                 except (ValueError, TypeError):
                     pass
         except SubstrateRequestException:
-            # No dedicated map — fall through to Voucher row.
+            # No dedicated map on this runtime — fall through.
             pass
         except Exception:  # noqa: BLE001
             pass
-        # Fallback: read Voucher row + recompute the digest using the
-        # pallet's `voucher_digest` field if present.
+
+        # Read Voucher row once; both path-2 (voucher_digest field) and
+        # path-3 (derive-from-state) consume it.
         try:
             result = self.substrate.query(
                 module="IntentSettlement",
@@ -357,19 +519,73 @@ class SubstrateClient:
         v = result.value
         if not isinstance(v, dict):
             return None
-        # A `voucher_digest` field is the canonical place if the
-        # pallet exposes it directly.
+
+        # Path 2: explicit voucher_digest field on the Voucher row
+        # (forward-compat). batch_fairness_proof_digest is deliberately
+        # NOT treated as an alias — it's a different domain hash.
         vd = v.get("voucher_digest")
         if vd is not None:
             try:
-                return _to_bytes32(vd)
+                digest = _to_bytes32(vd)
+                logger.debug(
+                    f"get_voucher_digest: voucher_digest field hit for "
+                    f"claim={claim_id.hex()[:16]}..."
+                )
+                return digest
             except (ValueError, TypeError):
                 pass
-        # `batch_fairness_proof_digest` is NOT the voucher digest —
-        # different field with different semantics. We deliberately do
-        # NOT fall back to it: returning a wrong-domain hash here
-        # would silently produce mis-bound STCA signatures.
-        return None
+
+        # Path 3 (task #278): derive byte-for-byte via the canonicalizer.
+        chain_identity = self.get_chain_identity()
+        if chain_identity is None:
+            logger.warning(
+                f"get_voucher_digest: chain-identity constants "
+                f"unreadable; cannot derive digest for "
+                f"claim={claim_id.hex()[:16]}..."
+            )
+            return None
+        try:
+            voucher_fields = _extract_voucher_fields_for_digest(v)
+        except (KeyError, TypeError, ValueError) as e:
+            logger.warning(
+                f"get_voucher_digest: voucher row malformed for "
+                f"claim={claim_id.hex()[:16]}...: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+        try:
+            digest = compute_voucher_digest_with_address(
+                chain_identity=chain_identity,
+                claim_id=claim_id,
+                policy_id=voucher_fields["policy_id"],
+                beneficiary_cardano_addr_raw=voucher_fields[
+                    "beneficiary_cardano_addr"
+                ],
+                amount_ada=voucher_fields["amount_ada"],
+                bfpr_digest=voucher_fields["batch_fairness_proof_digest"],
+                issued_block=voucher_fields["issued_block"],
+                expiry_slot_cardano=voucher_fields["expiry_slot_cardano"],
+            )
+        except AddressDecodeError as e:
+            # Non-type-0 beneficiary address — v1 vouchers only support
+            # type-0. Don't fabricate a digest; drop the request.
+            logger.warning(
+                f"get_voucher_digest: beneficiary address not type-0 for "
+                f"claim={claim_id.hex()[:16]}...: {e}"
+            )
+            return None
+        except ValueError as e:
+            logger.warning(
+                f"get_voucher_digest: derive failed for "
+                f"claim={claim_id.hex()[:16]}...: {e}"
+            )
+            return None
+        logger.debug(
+            f"get_voucher_digest: derived from chain state for "
+            f"claim={claim_id.hex()[:16]}... → "
+            f"digest=0x{digest.hex()[:16]}..."
+        )
+        return digest
 
     def get_voucher(self, claim_id: bytes) -> Optional[dict]:
         """Return a slimmed-down voucher row for cert-daemon refusal
