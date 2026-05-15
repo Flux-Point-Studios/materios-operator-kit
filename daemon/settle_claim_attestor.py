@@ -333,6 +333,14 @@ class CardanoTxObserver:
         # we use it for every observation. Refreshed lazily if it ever
         # comes back None.
         self._cached_genesis: Optional[bytes] = None
+        # Cache (header_hash → block_height) lookups (task #283). The
+        # mapping is immutable on Cardano — once a block reaches a
+        # height, it stays there — so caching after first successful
+        # resolution avoids paying the WS round-trip per attestation
+        # poll cycle. Failures are NEVER cached (a later retry against
+        # a healthy Ogmios must be able to succeed) — same shape as
+        # ``_cached_genesis`` in PR #29.
+        self._block_height_cache: dict[str, int] = {}
 
     async def _ogmios_rpc(
         self, session: aiohttp.ClientSession, method: str, params: Optional[dict] = None
@@ -482,6 +490,232 @@ class CardanoTxObserver:
         )
         return genesis_hash
 
+    async def get_block_height_by_hash(
+        self,
+        session: aiohttp.ClientSession,
+        slot: int,
+        header_hash_hex: str,
+        *,
+        chain_sync_timeout_seconds: float = 8.0,
+    ) -> Optional[int]:
+        """Resolve a Cardano block (slot, hash) → block height via the
+        Ogmios chain-sync mini-protocol over WebSocket.
+
+        Why this exists (task #283)
+        ---------------------------
+        Kupo's ``GET /matches/*`` response (Kupo 2.x and current) carries
+        ``created_at: {slot_no, header_hash}`` but NOT a block number /
+        height. Ogmios 6.x has no direct ``queryNetwork/blockHash`` or
+        ``queryLedgerState/blockHeight(hash)`` method — its
+        ``queryNetwork/blockHeight`` returns the chain tip only. Without
+        a height we cannot compute ``depth = tip - tx_block`` and the
+        attestor refuses every settle with
+        ``depth_observation_unavailable``.
+
+        The chain-sync mini-protocol (``findIntersection`` +
+        ``nextBlock``) DOES carry block height: after intersecting at
+        the target ``(slot, hash)``, the first ``nextBlock`` returns a
+        RollBackward acknowledgement (the cursor confirming "you are
+        here"), and the second returns a RollForward whose
+        ``block.ancestor`` equals our hash and whose ``block.height``
+        equals our height + 1. We verify the ancestor match
+        cryptographically before returning the answer — an
+        attacker-supplied Ogmios endpoint cannot fabricate a chain
+        that descends from a block it didn't produce.
+
+        Returns the resolved height on success. Returns ``None`` on:
+
+        - WS connection failure (Ogmios down, bad URL, network)
+        - ``findIntersection`` error (e.g. hash not on this network)
+        - ``nextBlock`` malformed or missing expected fields
+        - ``block.ancestor != header_hash_hex`` (cryptographic mismatch)
+        - timeout (our block is at the tip → no successor to walk into;
+          the daemon's outer poll loop retries next tick when depth has
+          grown)
+
+        The caller treats ``None`` as ``observer_unavailable`` upstream
+        — the existing safe-refusal default.
+
+        Args:
+            session: An open aiohttp ClientSession (its ``ws_connect``
+                method is used to upgrade to WebSocket; the Ogmios URL
+                accepts ``http://`` and aiohttp performs the upgrade
+                internally — no scheme rewrite needed).
+            slot: Cardano slot number of the target block (from Kupo's
+                ``created_at.slot_no``).
+            header_hash_hex: 64-char hex of the target block's
+                ``header_hash`` (from Kupo's ``created_at.header_hash``).
+            chain_sync_timeout_seconds: Per-frame WS receive timeout.
+                Defaults to 8s — long enough to cover network jitter on
+                preprod (~20s block time) but short enough that hitting
+                the tip doesn't stall the outer poll loop.
+
+        Cache: successful resolutions are cached in
+        ``self._block_height_cache`` keyed by lowercased
+        ``header_hash_hex``. Failures are NEVER cached.
+        """
+        # Normalise the cache key — Cardano hex is conventionally
+        # lowercase but accept either casing from callers.
+        key = (header_hash_hex or "").lower()
+        if not key or len(key) != 64:
+            logger.warning(
+                f"settle_attestor: get_block_height_by_hash got "
+                f"malformed header_hash_hex (len={len(key)}); refusing."
+            )
+            return None
+        cached = self._block_height_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            async with session.ws_connect(
+                self.ogmios_url,
+                timeout=self._timeout.total or 10.0,
+                heartbeat=None,
+            ) as ws:
+                # Step 1: findIntersection at (slot, hash). Confirms the
+                # block exists on the chain Ogmios is following.
+                await ws.send_json({
+                    "jsonrpc": "2.0",
+                    "method": "findIntersection",
+                    "params": {
+                        "points": [{"slot": int(slot), "id": key}],
+                    },
+                    "id": "fi",
+                })
+                fi_resp = await ws.receive_json(
+                    timeout=chain_sync_timeout_seconds
+                )
+                if not isinstance(fi_resp, dict):
+                    logger.warning(
+                        f"settle_attestor: chain-sync findIntersection "
+                        f"non-dict response: {fi_resp!r}"
+                    )
+                    return None
+                if "error" in fi_resp:
+                    # Expected refusal path: Ogmios doesn't know this
+                    # point (wrong network, pre-genesis, future block).
+                    # Log at INFO — it's a safety property, not a
+                    # tooling failure.
+                    err = fi_resp.get("error") or {}
+                    logger.info(
+                        f"settle_attestor: chain-sync no intersection "
+                        f"for (slot={slot}, hash={key[:16]}...): "
+                        f"{err.get('message', err)!r}"
+                    )
+                    return None
+                if not isinstance(fi_resp.get("result"), dict):
+                    logger.warning(
+                        f"settle_attestor: chain-sync findIntersection "
+                        f"missing result: {fi_resp!r}"
+                    )
+                    return None
+
+                # Step 2: nextBlock — the chain-sync protocol returns
+                # RollBackward to the intersection point on the first
+                # call (the cursor acknowledging "you are here").
+                await ws.send_json({
+                    "jsonrpc": "2.0",
+                    "method": "nextBlock",
+                    "params": {},
+                    "id": "nb1",
+                })
+                nb1_resp = await ws.receive_json(
+                    timeout=chain_sync_timeout_seconds
+                )
+                if not isinstance(nb1_resp, dict) or "result" not in nb1_resp:
+                    logger.warning(
+                        f"settle_attestor: chain-sync nextBlock #1 "
+                        f"malformed: {nb1_resp!r}"
+                    )
+                    return None
+
+                # Step 3: nextBlock again — this RollForward returns the
+                # NEXT block after our target. block.ancestor MUST equal
+                # our header_hash and block.height = our_height + 1.
+                # Bounded by chain_sync_timeout_seconds — if our block
+                # IS the tip, this hangs waiting for the next block to
+                # be produced. Better to fail-fast and let the poll
+                # loop retry next tick. (receive_json's own timeout
+                # arg doesn't always cover the case where the WS is
+                # responsive but the protocol is waiting for new
+                # blocks; wrap with asyncio.wait_for as a
+                # belt-and-suspenders cap.)
+                await ws.send_json({
+                    "jsonrpc": "2.0",
+                    "method": "nextBlock",
+                    "params": {},
+                    "id": "nb2",
+                })
+                try:
+                    nb2_resp = await asyncio.wait_for(
+                        ws.receive_json(timeout=chain_sync_timeout_seconds),
+                        timeout=chain_sync_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        f"settle_attestor: chain-sync nextBlock #2 "
+                        f"timed out for hash={key[:16]}... — block is "
+                        f"likely at chain tip; will retry next poll."
+                    )
+                    return None
+                if not isinstance(nb2_resp, dict):
+                    logger.warning(
+                        f"settle_attestor: chain-sync nextBlock #2 "
+                        f"non-dict: {nb2_resp!r}"
+                    )
+                    return None
+                nb2_result = nb2_resp.get("result")
+                if not isinstance(nb2_result, dict):
+                    logger.warning(
+                        f"settle_attestor: chain-sync nextBlock #2 "
+                        f"missing result: {nb2_resp!r}"
+                    )
+                    return None
+                if nb2_result.get("direction") != "forward":
+                    logger.warning(
+                        f"settle_attestor: chain-sync nextBlock #2 "
+                        f"direction={nb2_result.get('direction')!r} "
+                        f"(expected 'forward')"
+                    )
+                    return None
+                block = nb2_result.get("block") or {}
+                ancestor = block.get("ancestor")
+                if not isinstance(ancestor, str) or ancestor.lower() != key:
+                    logger.warning(
+                        f"settle_attestor: chain-sync nextBlock #2 "
+                        f"ancestor mismatch: expected {key[:16]}..., "
+                        f"got {(ancestor or '')[:16]}... — refusing to "
+                        f"fabricate a height."
+                    )
+                    return None
+                next_height = block.get("height")
+                if not isinstance(next_height, int) or next_height <= 0:
+                    logger.warning(
+                        f"settle_attestor: chain-sync nextBlock #2 "
+                        f"missing/invalid block.height: {next_height!r}"
+                    )
+                    return None
+                our_height = next_height - 1
+                self._block_height_cache[key] = our_height
+                logger.info(
+                    f"settle_attestor: resolved Cardano block height "
+                    f"hash={key[:16]}... → height={our_height} "
+                    f"(via Ogmios chain-sync; cached)"
+                )
+                return our_height
+        except asyncio.TimeoutError:
+            logger.info(
+                f"settle_attestor: chain-sync timed out resolving "
+                f"hash={key[:16]}... — will retry next poll."
+            )
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"settle_attestor: chain-sync raised "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+
     async def _kupo_get(
         self, session: aiohttp.ClientSession, path: str, params: dict
     ) -> Optional[list]:
@@ -570,11 +804,12 @@ class CardanoTxObserver:
 
             # Sum lovelace across outputs whose address blake2_224
             # matches ``expected_beneficiary_blake2_224``. Also pin
-            # the slot/block_no from the first matched entry — all
-            # outputs of one tx share the same created_at.
+            # the slot/block_no/header_hash from the first matched
+            # entry — all outputs of one tx share the same created_at.
             total_to_beneficiary: int = 0
             slot_seen: Optional[int] = None
             block_seen: Optional[int] = None
+            header_hash_seen: Optional[str] = None
             for m in matches:
                 created_at = m.get("created_at") or {}
                 if isinstance(created_at, dict):
@@ -588,6 +823,16 @@ class CardanoTxObserver:
                     )
                     if isinstance(b, int):
                         block_seen = b
+                    # Kupo 2.x carries the block hash here under
+                    # ``header_hash`` but NOT a block number. We
+                    # resolve hash → height via Ogmios chain-sync
+                    # below when Kupo doesn't supply the height
+                    # directly. Pre-#283 the daemon refused every
+                    # settle with depth_observation_unavailable
+                    # because of this gap.
+                    hh = created_at.get("header_hash")
+                    if isinstance(hh, str) and len(hh) == 64:
+                        header_hash_seen = hh
                 address = m.get("address")
                 if not isinstance(address, str):
                     continue
@@ -626,10 +871,28 @@ class CardanoTxObserver:
             else:
                 obs.observed_slot = slot_seen
 
-            if block_seen is None:
-                obs.mismatches.append("kupo_match_missing_block_no")
-            else:
+            if block_seen is not None:
+                # Legacy Kupo / custom forks that emit ``block_no``
+                # directly in ``created_at`` — use it without a WS
+                # roundtrip.
                 obs.tx_block_no = block_seen
+            elif header_hash_seen is not None and slot_seen is not None:
+                # Modern Kupo (2.x) emits only ``header_hash`` — resolve
+                # to a height via Ogmios chain-sync (task #283). On
+                # failure leave tx_block_no None and surface the
+                # ``kupo_match_missing_block_no`` mismatch so the
+                # dispatcher refuses via
+                # ``depth_observation_unavailable`` (the safe default
+                # — same shape as pre-#283 refusals).
+                resolved = await self.get_block_height_by_hash(
+                    session, slot_seen, header_hash_seen,
+                )
+                if resolved is not None:
+                    obs.tx_block_no = resolved
+                else:
+                    obs.mismatches.append("kupo_match_missing_block_no")
+            else:
+                obs.mismatches.append("kupo_match_missing_block_no")
 
             obs.beneficiary_addr_blake2_224 = expected_beneficiary_blake2_224
             obs.matched_address_lovelace = total_to_beneficiary

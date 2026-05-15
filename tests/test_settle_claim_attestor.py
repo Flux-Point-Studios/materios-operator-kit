@@ -1169,3 +1169,570 @@ class TestTickDictToDataclassConversion:
         assert isinstance(captured[0], PendingSettlementRequest)
         assert captured[0].claim_id == CLAIM_ID
         assert captured[0].cardano_tx_hash == CARDANO_TX_HASH
+
+
+# ---------------------------------------------------------------------------
+# get_block_height_by_hash (task #283).
+#
+# Kupo's /matches/* response carries `created_at: {slot_no, header_hash}` —
+# but NOT a block number / height. Pre-#283 the daemon scanned for a
+# `block_no` / `blockNo` / `height` field that does not exist in Kupo 2.x
+# payloads and refused every settle attestation with
+# `depth_observation_unavailable` because tx_block_no stayed None.
+#
+# Ogmios 6.x does NOT expose a direct "block-hash → height" RPC under
+# queryNetwork/* or queryLedgerState/*. But the chain-sync mini-protocol
+# DOES carry block height: findIntersection at the target (slot, hash)
+# confirms the block exists, then nextBlock x2 yields a RollForward whose
+# block.height = our_height + 1 and whose block.ancestor MUST equal our
+# header_hash (cryptographic verification: an attacker-supplied Ogmios
+# can't fake a chain that descends from a block it didn't produce).
+#
+# This avoids a new pip dep (aiohttp already supports ws_connect) and
+# any new env var (the existing OGMIOS_URL upgrades to ws via the same
+# host:port). No operator action required to activate.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWebSocket:
+    """Records sent JSON-RPC requests and replays a scripted response
+    sequence. Mirrors the methods of ``aiohttp.ClientWebSocketResponse``
+    that ``get_block_height_by_hash`` calls.
+
+    Each ``send_json`` call pops the next entry from ``response_script``
+    and stashes it for the next ``receive_json`` to return — that
+    one-in/one-out sequencing matches Ogmios's request-correlated id
+    semantics.
+    """
+
+    def __init__(self, response_script):
+        self.sent = []
+        self._script = list(response_script)
+        self._pending = None
+        self.closed = False
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+        nxt = self._script.pop(0)
+        if callable(nxt):
+            nxt = nxt(payload)
+        self._pending = nxt
+
+    async def receive_json(self, timeout=None):  # noqa: ARG002
+        if self._pending is None:
+            raise AssertionError("receive_json called before send_json")
+        out = self._pending
+        self._pending = None
+        if isinstance(out, BaseException):
+            raise out
+        return out
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeWsContextManager:
+    """Async context manager wrapping a _FakeWebSocket so tests can use
+    ``async with session.ws_connect(...) as ws: ...``."""
+
+    def __init__(self, ws_or_exc):
+        self._inner = ws_or_exc
+
+    async def __aenter__(self):
+        if isinstance(self._inner, BaseException):
+            raise self._inner
+        return self._inner
+
+    async def __aexit__(self, *args):
+        if not isinstance(self._inner, BaseException):
+            await self._inner.close()
+        return False
+
+
+class _FakeSession:
+    """Stub ``aiohttp.ClientSession`` that returns a scripted WS handle
+    from ``.ws_connect(...)``. We bypass the real network by overriding
+    just the one method the SUT calls."""
+
+    def __init__(self, ws_or_exc):
+        self._ws_or_exc = ws_or_exc
+        self.connect_url = None
+
+    def ws_connect(self, url, **kwargs):
+        self.connect_url = url
+        return _FakeWsContextManager(self._ws_or_exc)
+
+
+# A pinned live-preprod parity vector (Node-3 Ogmios @ 192.168.0.133:1337,
+# verified 2026-05-15). The Kupo /matches/* lookup for the existing
+# attest_settle exemplar tx returns this header_hash + slot pair; the
+# Ogmios chain-sync walk-forward returns the next block whose ancestor
+# is the same header_hash and whose height is OUR height + 1.
+LIVE_TX_HASH_HEX = "157a215d8eb9dae711dc3044741875947baf23400f0bba7be1d8ee1c0afe0609"
+LIVE_HEADER_HASH_HEX = "d1742ce015040d48327608969b7a8b9dffe5b8c67e63911d93015394478d096d"
+LIVE_SLOT = 123170608
+LIVE_NEXT_BLOCK_HEIGHT = 4712149  # Ogmios block AFTER the one carrying our tx
+LIVE_OUR_HEIGHT = LIVE_NEXT_BLOCK_HEIGHT - 1  # = 4712148
+
+
+def _intersection_ok_response(req):
+    return {
+        "jsonrpc": "2.0",
+        "method": "findIntersection",
+        "result": {
+            "intersection": {
+                "slot": LIVE_SLOT,
+                "id": LIVE_HEADER_HASH_HEX,
+            },
+            "tip": {
+                "slot": LIVE_SLOT + 1000,
+                "id": "ff" * 32,
+                "height": LIVE_OUR_HEIGHT + 100,
+            },
+        },
+        "id": req.get("id", "f"),
+    }
+
+
+def _intersection_not_found_response(req):
+    return {
+        "jsonrpc": "2.0",
+        "method": "findIntersection",
+        "error": {
+            "code": 1000,
+            "message": "No intersection found.",
+            "data": {
+                "tip": {
+                    "slot": LIVE_SLOT + 2000,
+                    "id": "ff" * 32,
+                    "height": LIVE_OUR_HEIGHT + 200,
+                },
+            },
+        },
+        "id": req.get("id", "f"),
+    }
+
+
+def _next_block_backward_response(req):
+    return {
+        "jsonrpc": "2.0",
+        "method": "nextBlock",
+        "result": {
+            "direction": "backward",
+            "point": {"slot": LIVE_SLOT, "id": LIVE_HEADER_HASH_HEX},
+            "tip": {
+                "slot": LIVE_SLOT + 1000,
+                "id": "ff" * 32,
+                "height": LIVE_OUR_HEIGHT + 100,
+            },
+        },
+        "id": req.get("id", "n1"),
+    }
+
+
+def _next_block_forward_response(req, *, ancestor_hex=LIVE_HEADER_HASH_HEX,
+                                  next_height=LIVE_NEXT_BLOCK_HEIGHT):
+    return {
+        "jsonrpc": "2.0",
+        "method": "nextBlock",
+        "result": {
+            "direction": "forward",
+            "block": {
+                "type": "praos",
+                "era": "conway",
+                "id": "ab" * 32,
+                "height": next_height,
+                "slot": LIVE_SLOT + 16,
+                "ancestor": ancestor_hex,
+            },
+            "tip": {
+                "slot": LIVE_SLOT + 1000,
+                "id": "ff" * 32,
+                "height": next_height + 100,
+            },
+        },
+        "id": req.get("id", "n2"),
+    }
+
+
+def _make_testnet_addr_with_payment_hash(payment_hash: bytes) -> str:
+    """CIP-0019 type-0 testnet base address whose payment hash is the
+    supplied 28-byte value. Used by the observe() integration tests to
+    confirm the address-decoder path still works end-to-end."""
+    assert len(payment_hash) == 28
+    from tests.test_cardano_address import _bech32_encode_addr_test
+    header = bytes([0x00])
+    stake_hash = b"\x99" * 28
+    return _bech32_encode_addr_test(header + payment_hash + stake_hash)
+
+
+class TestGetBlockHeightByHash:
+    """Resolve a Cardano block-hash to block-height via Ogmios chain-sync.
+
+    The pre-#283 implementation scanned Kupo's ``created_at`` for a
+    ``block_no``/``blockNo``/``height`` field — none of which exist in
+    Kupo 2.x output (only ``slot_no`` + ``header_hash``). This left
+    ``tx_block_no`` None, made ``obs.depth`` always None, and the
+    daemon refused every settle with ``depth_observation_unavailable``.
+
+    The fix opens a WS to the same Ogmios URL, performs a chain-sync
+    ``findIntersection`` at the target (slot, hash), then ``nextBlock``
+    twice (first RollBackward = "you are here", second RollForward = the
+    block AFTER ours, whose ``block.ancestor`` MUST equal our hash and
+    whose ``block.height - 1`` IS our height).
+    """
+
+    def _observer(self):
+        return CardanoTxObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+
+    def test_happy_path_resolves_height_from_ogmios_chain_sync(self):
+        ws = _FakeWebSocket([
+            _intersection_ok_response,
+            _next_block_backward_response,
+            _next_block_forward_response,
+        ])
+        session = _FakeSession(ws)
+        observer = self._observer()
+
+        async def driver():
+            return await observer.get_block_height_by_hash(
+                session, LIVE_SLOT, LIVE_HEADER_HASH_HEX,
+            )
+
+        height = _run(driver())
+        assert height == LIVE_OUR_HEIGHT
+        # Verify the JSON-RPC sequence is correct.
+        assert len(ws.sent) == 3
+        assert ws.sent[0]["method"] == "findIntersection"
+        points = ws.sent[0]["params"]["points"]
+        assert points[0]["slot"] == LIVE_SLOT
+        assert points[0]["id"] == LIVE_HEADER_HASH_HEX
+        assert ws.sent[1]["method"] == "nextBlock"
+        assert ws.sent[2]["method"] == "nextBlock"
+
+    def test_returns_none_when_intersection_not_found(self):
+        ws = _FakeWebSocket([_intersection_not_found_response])
+        session = _FakeSession(ws)
+        observer = self._observer()
+
+        async def driver():
+            return await observer.get_block_height_by_hash(
+                session, LIVE_SLOT, "00" * 32,
+            )
+
+        result = _run(driver())
+        assert result is None
+        assert "00" * 32 not in getattr(observer, "_block_height_cache", {})
+
+    def test_returns_none_when_next_block_ancestor_mismatches(self):
+        ws = _FakeWebSocket([
+            _intersection_ok_response,
+            _next_block_backward_response,
+            lambda req: _next_block_forward_response(
+                req, ancestor_hex="de" * 32,
+            ),
+        ])
+        session = _FakeSession(ws)
+        observer = self._observer()
+
+        async def driver():
+            return await observer.get_block_height_by_hash(
+                session, LIVE_SLOT, LIVE_HEADER_HASH_HEX,
+            )
+
+        result = _run(driver())
+        assert result is None
+
+    def test_returns_none_on_ws_connection_error(self):
+        session = _FakeSession(ConnectionRefusedError("ogmios down"))
+        observer = self._observer()
+
+        async def driver():
+            return await observer.get_block_height_by_hash(
+                session, LIVE_SLOT, LIVE_HEADER_HASH_HEX,
+            )
+
+        result = _run(driver())
+        assert result is None
+
+    def test_returns_none_on_timeout_at_tip(self):
+        ws = _FakeWebSocket([
+            _intersection_ok_response,
+            _next_block_backward_response,
+            asyncio.TimeoutError(),
+        ])
+        session = _FakeSession(ws)
+        observer = self._observer()
+
+        async def driver():
+            return await observer.get_block_height_by_hash(
+                session, LIVE_SLOT, LIVE_HEADER_HASH_HEX,
+            )
+
+        result = _run(driver())
+        assert result is None
+
+    def test_returns_none_on_malformed_header_hash_hex(self):
+        """Defensive: a non-64-char or empty hex string must short-circuit
+        to None without opening a WS — protects against arg-drift bugs
+        upstream."""
+        observer = self._observer()
+        bad_session = _FakeSession(ConnectionRefusedError("must not call"))
+
+        async def driver():
+            return await observer.get_block_height_by_hash(
+                bad_session, LIVE_SLOT, "abc123",
+            )
+
+        result = _run(driver())
+        assert result is None
+        assert bad_session.connect_url is None
+
+    def test_caches_successful_result_across_calls(self):
+        observer = self._observer()
+        ws1 = _FakeWebSocket([
+            _intersection_ok_response,
+            _next_block_backward_response,
+            _next_block_forward_response,
+        ])
+        session1 = _FakeSession(ws1)
+
+        async def first_call():
+            return await observer.get_block_height_by_hash(
+                session1, LIVE_SLOT, LIVE_HEADER_HASH_HEX,
+            )
+
+        first = _run(first_call())
+        assert first == LIVE_OUR_HEIGHT
+        assert len(ws1.sent) == 3
+
+        # Cache must serve the next call WITHOUT opening a connection.
+        bad_session = _FakeSession(ConnectionRefusedError("must not call"))
+
+        async def second_call():
+            return await observer.get_block_height_by_hash(
+                bad_session, LIVE_SLOT, LIVE_HEADER_HASH_HEX,
+            )
+
+        second = _run(second_call())
+        assert second == LIVE_OUR_HEIGHT
+        assert bad_session.connect_url is None
+
+    def test_failed_resolution_is_not_cached(self):
+        observer = self._observer()
+        ws1 = _FakeWebSocket([_intersection_not_found_response])
+        session1 = _FakeSession(ws1)
+
+        async def first_call():
+            return await observer.get_block_height_by_hash(
+                session1, LIVE_SLOT, LIVE_HEADER_HASH_HEX,
+            )
+
+        first = _run(first_call())
+        assert first is None
+
+        ws2 = _FakeWebSocket([
+            _intersection_ok_response,
+            _next_block_backward_response,
+            _next_block_forward_response,
+        ])
+        session2 = _FakeSession(ws2)
+
+        async def second_call():
+            return await observer.get_block_height_by_hash(
+                session2, LIVE_SLOT, LIVE_HEADER_HASH_HEX,
+            )
+
+        second = _run(second_call())
+        assert second == LIVE_OUR_HEIGHT
+        assert len(ws2.sent) == 3
+
+
+class TestObserveResolvesTxBlockNoViaOgmiosWalk:
+    """End-to-end of observe() with a Kupo response that has only
+    ``header_hash`` (the modern Kupo 2.x shape — no ``block_no``).
+    Pre-#283 this returned tx_block_no=None and the dispatcher refused
+    with depth_observation_unavailable. Post-#283 observe() falls back
+    to the Ogmios chain-sync walk.
+    """
+
+    def test_observe_populates_tx_block_no_from_ogmios_when_kupo_lacks_height(self):
+        observer = CardanoTxObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        observer._ogmios_rpc = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"slot": LIVE_SLOT + 1000, "id": "ff" * 32},
+                LIVE_OUR_HEIGHT + 100,
+                {
+                    "era": "shelley",
+                    "networkMagic": 1,
+                    "network": "testnet",
+                },
+            ]
+        )
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "transaction_id": LIVE_TX_HASH_HEX,
+                    "output_index": 0,
+                    "address": _make_testnet_addr_with_payment_hash(BENE_HASH_28),
+                    "value": {"coins": AMOUNT_LOVELACE, "assets": {}},
+                    "created_at": {
+                        "slot_no": LIVE_SLOT,
+                        "header_hash": LIVE_HEADER_HASH_HEX,
+                    },
+                    "spent_at": None,
+                },
+            ]
+        )
+        observer.get_block_height_by_hash = AsyncMock(  # type: ignore[method-assign]
+            return_value=LIVE_OUR_HEIGHT,
+        )
+
+        async def driver():
+            return await observer.observe(LIVE_TX_HASH_HEX, BENE_HASH_28)
+
+        obs = _run(driver())
+        assert obs.tx_block_no == LIVE_OUR_HEIGHT, (
+            f"observe() failed to resolve tx_block_no via the new "
+            f"chain-sync path; got tx_block_no={obs.tx_block_no}, "
+            f"mismatches={obs.mismatches}"
+        )
+        assert obs.observed_slot == LIVE_SLOT
+        assert obs.cardano_tip_block_no == LIVE_OUR_HEIGHT + 100
+        assert obs.matched_address_lovelace == AMOUNT_LOVELACE
+        observer.get_block_height_by_hash.assert_called_once()
+        call = observer.get_block_height_by_hash.call_args
+        assert call.args[1] == LIVE_SLOT
+        assert call.args[2] == LIVE_HEADER_HASH_HEX
+
+    def test_observe_refuses_when_kupo_has_no_header_hash(self):
+        observer = CardanoTxObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        observer._ogmios_rpc = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"slot": LIVE_SLOT + 1000, "id": "ff" * 32},
+                LIVE_OUR_HEIGHT + 100,
+                {"era": "shelley", "networkMagic": 1, "network": "testnet"},
+            ]
+        )
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "transaction_id": LIVE_TX_HASH_HEX,
+                    "output_index": 0,
+                    "address": _make_testnet_addr_with_payment_hash(BENE_HASH_28),
+                    "value": {"coins": AMOUNT_LOVELACE, "assets": {}},
+                    "created_at": {
+                        "slot_no": LIVE_SLOT,
+                    },
+                    "spent_at": None,
+                },
+            ]
+        )
+        observer.get_block_height_by_hash = AsyncMock(  # type: ignore[method-assign]
+            return_value=None,
+        )
+
+        async def driver():
+            return await observer.observe(LIVE_TX_HASH_HEX, BENE_HASH_28)
+
+        obs = _run(driver())
+        assert obs.tx_block_no is None
+        assert "kupo_match_missing_block_no" in obs.mismatches
+        # No header_hash means nothing to resolve — resolver MUST NOT be called.
+        observer.get_block_height_by_hash.assert_not_called()
+
+    def test_observe_uses_legacy_block_no_when_kupo_provides_one(self):
+        """Backwards-compat: if a Kupo build DOES emit ``block_no`` in
+        ``created_at`` (older versions, custom forks), observe() takes
+        that directly without the WS roundtrip."""
+        observer = CardanoTxObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        observer._ogmios_rpc = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"slot": LIVE_SLOT + 1000, "id": "ff" * 32},
+                LIVE_OUR_HEIGHT + 100,
+                {"era": "shelley", "networkMagic": 1, "network": "testnet"},
+            ]
+        )
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "transaction_id": LIVE_TX_HASH_HEX,
+                    "output_index": 0,
+                    "address": _make_testnet_addr_with_payment_hash(BENE_HASH_28),
+                    "value": {"coins": AMOUNT_LOVELACE, "assets": {}},
+                    "created_at": {
+                        "slot_no": LIVE_SLOT,
+                        "block_no": LIVE_OUR_HEIGHT,
+                        "header_hash": LIVE_HEADER_HASH_HEX,
+                    },
+                    "spent_at": None,
+                },
+            ]
+        )
+        observer.get_block_height_by_hash = AsyncMock(  # type: ignore[method-assign]
+            return_value=999_999,
+        )
+
+        async def driver():
+            return await observer.observe(LIVE_TX_HASH_HEX, BENE_HASH_28)
+
+        obs = _run(driver())
+        assert obs.tx_block_no == LIVE_OUR_HEIGHT
+        observer.get_block_height_by_hash.assert_not_called()
+
+    def test_observe_refuses_when_chain_sync_resolution_fails(self):
+        """If ``header_hash`` IS present but the chain-sync resolver
+        fails (Ogmios down, intersection-not-found, ancestor mismatch,
+        tip timeout) — observe() must surface the same
+        ``kupo_match_missing_block_no`` mismatch as if there were no
+        ``header_hash`` at all. The dispatcher then refuses safely with
+        ``depth_observation_unavailable`` on the next gate."""
+        observer = CardanoTxObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        observer._ogmios_rpc = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"slot": LIVE_SLOT + 1000, "id": "ff" * 32},
+                LIVE_OUR_HEIGHT + 100,
+                {"era": "shelley", "networkMagic": 1, "network": "testnet"},
+            ]
+        )
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "transaction_id": LIVE_TX_HASH_HEX,
+                    "output_index": 0,
+                    "address": _make_testnet_addr_with_payment_hash(BENE_HASH_28),
+                    "value": {"coins": AMOUNT_LOVELACE, "assets": {}},
+                    "created_at": {
+                        "slot_no": LIVE_SLOT,
+                        "header_hash": LIVE_HEADER_HASH_HEX,
+                    },
+                    "spent_at": None,
+                },
+            ]
+        )
+        observer.get_block_height_by_hash = AsyncMock(  # type: ignore[method-assign]
+            return_value=None,
+        )
+
+        async def driver():
+            return await observer.observe(LIVE_TX_HASH_HEX, BENE_HASH_28)
+
+        obs = _run(driver())
+        assert obs.tx_block_no is None
+        assert "kupo_match_missing_block_no" in obs.mismatches
+        observer.get_block_height_by_hash.assert_called_once()
