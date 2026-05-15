@@ -25,7 +25,11 @@ The eight facts every attestor verifies before signing
 2. ``observed_at_depth >= MinFinalityDepth`` Cardano blocks
 3. ``observed_slot`` matches the slot Kupo reports for the tx
 4. The tx pays ``amount_lovelace`` lovelace to an address whose
-   blake2_224 matches ``beneficiary_addr_hash``
+   **28-byte payment-key hash** (extracted from CIP-0019 type-0 bytes
+   ``[1..29]`` — i.e., raw key hash, NOT a blake2_224 of anything)
+   matches ``beneficiary_addr_hash``. The pre-#272 implementation
+   computed ``blake2_224(bech32_string_bytes)`` and was wrong — see
+   ``daemon/cardano_address.py``.
 5. The Cardano network's genesis hash matches ``mainchain_genesis_hash``
    (preprod vs mainnet domain separation)
 6. The requester-supplied evidence agrees with on-chain
@@ -63,6 +67,10 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import aiohttp
+
+from daemon.cardano_address import (
+    extract_payment_hash_from_cardano_address,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -497,7 +505,28 @@ class CardanoTxObserver:
                 address = m.get("address")
                 if not isinstance(address, str):
                     continue
-                addr_hash = blake2_224_of_cardano_address(address)
+                # Extract the 28-byte payment-key hash from the Cardano
+                # address. The pallet's `beneficiary_addr_hash` is the
+                # 28-byte payment-key hash at `[1..29]` of the
+                # CIP-0019 type-0 address bytes (see
+                # `voucher_canonicalize::split_type0_address_bytes` in
+                # materios-intent-settlement), NOT a blake2_224 of any
+                # string. Pre-PR #272 this was computed as
+                # `blake2_224(bech32_string_bytes)` and produced wrong
+                # bytes; every attestation sig would have been rejected
+                # silently in production.
+                try:
+                    addr_hash = extract_payment_hash_from_cardano_address(
+                        address
+                    )
+                except ValueError:
+                    # Address not a CIP-0019 type-0/type-6 base/enterprise
+                    # address — treat as "did not pay our beneficiary"
+                    # (an external script address or a type we don't
+                    # support). Skip rather than refuse-the-tx; the
+                    # outer loop's amount-summing logic handles
+                    # zero-payment-to-beneficiary cases.
+                    continue
                 if addr_hash != expected_beneficiary_blake2_224:
                     continue
                 value = m.get("value") or {}
@@ -523,21 +552,24 @@ class CardanoTxObserver:
 
 
 def blake2_224_of_cardano_address(address: str) -> bytes:
-    """Compute blake2_224 (28-byte) digest of a Cardano address.
+    """DEPRECATED — kept only as a backwards-compatibility shim.
 
-    Kupo returns the address in bech32 form (``addr1...`` mainnet,
-    ``addr_test1...`` preprod/preview). We blake2_224 the bech32
-    string bytes directly because the SettlementEvidence's
-    ``beneficiary_addr_blake2_224`` is the same hashing-of-the-display-
-    form pattern the pallet uses (memo §3.2 — "blake2_224 of address
-    bytes"). Returns 28 raw bytes.
+    This function previously computed
+    ``hashlib.blake2b(address.encode("utf-8"), digest_size=28)``,
+    which DID NOT MATCH the pallet's `voucher_canonicalize::
+    split_type0_address_bytes` output (the pallet extracts the 28-byte
+    payment-key hash from the raw CIP-0019 address bytes — no hashing).
+    Pre-PR #272 every attestation sig would have been rejected silently
+    in production.
 
-    Note: blake2b with ``digest_size=28`` gives blake2_224 (subtle but
-    matches Cardano's address-hash convention).
+    New callers MUST use
+    `extract_payment_hash_from_cardano_address(address)` from
+    `daemon.cardano_address`. This shim is preserved temporarily so the
+    test suite's address-decoding import keeps resolving — the test
+    body asserts the new semantic (payment-hash extraction). To be
+    removed in a follow-up cleanup after one deploy soak.
     """
-    return hashlib.blake2b(
-        address.encode("utf-8"), digest_size=28
-    ).digest()
+    return extract_payment_hash_from_cardano_address(address)
 
 
 # ---------------------------------------------------------------------------
