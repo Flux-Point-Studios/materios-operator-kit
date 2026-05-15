@@ -940,10 +940,23 @@ class SettleClaimAttestor:
             f"request(s) — processing under sem cap "
             f"{self._sem._value}"  # type: ignore[attr-defined]
         )
-        # Per-request coroutines run concurrently bounded by ``_sem``.
-        # We use ``return_exceptions=True`` so one bad row doesn't kill
-        # the rest of the batch.
-        coros = [self.process_one(r, live_chain_id) for r in requests]
+        # SubstrateClient.list_pending_settlement_requests returns a list[dict]
+        # (deliberately loose — see its docstring). Convert to the
+        # PendingSettlementRequest dataclass here at the dispatcher boundary
+        # before process_one consumes it via attribute access. A malformed row
+        # (missing field) is logged and skipped rather than killing the batch.
+        coros = []
+        for r in requests:
+            try:
+                req = PendingSettlementRequest(**r)
+            except TypeError as e:
+                logger.warning(
+                    f"settle_attestor: skipping malformed pending request row "
+                    f"(claim_id={r.get('claim_id', b'').hex()[:16] if isinstance(r, dict) else '?'}...): "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+            coros.append(self.process_one(req, live_chain_id))
         await asyncio.gather(*coros, return_exceptions=True)
 
     async def _run_forever(self) -> None:

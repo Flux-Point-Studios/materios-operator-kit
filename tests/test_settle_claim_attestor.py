@@ -810,3 +810,98 @@ class TestSubstrateClientSettleHelpers:
 
         h = _to_bytes_exact(bytes.fromhex("cd" * 28), 28)
         assert h == bytes.fromhex("cd" * 28)
+
+
+# ---------------------------------------------------------------------------
+# Regression: _tick converts dicts from substrate_client to dataclass at the
+# dispatcher boundary. The pre-fix code passed dicts straight to process_one,
+# which accesses attributes — daemon would AttributeError on first real
+# pending request from chain. Caught in security review.
+# ---------------------------------------------------------------------------
+class TestTickDictToDataclassConversion:
+
+    def test_tick_converts_dict_rows_to_pending_settlement_request(self):
+        """_tick must convert each list_pending_settlement_requests dict
+        into a PendingSettlementRequest before calling process_one — the
+        substrate_client deliberately returns dicts (see its docstring)
+        but process_one is typed as the dataclass and uses attribute access.
+
+        Without this conversion, the daemon AttributeErrors on every real
+        pending request from chain (caught by sec-review, not by the earlier
+        tests which all bypass _tick).
+        """
+        observer = _make_observer_stub()
+        client = _make_substrate_client_stub()
+        dict_row = dict(
+            claim_id=CLAIM_ID,
+            requester="5DummyAccountId1",
+            submitted_block=100,
+            settled_direct=True,
+            cardano_tx_hash=CARDANO_TX_HASH,
+            observed_at_depth=OBSERVED_DEPTH,
+            observed_slot=OBSERVED_SLOT,
+            beneficiary_addr_hash=BENE_HASH_28,
+            amount_lovelace=AMOUNT_LOVELACE,
+            mainchain_genesis_hash=PREPROD_GENESIS,
+            voucher_digest=VOUCHER_DIGEST,
+        )
+        client.list_pending_settlement_requests = MagicMock(return_value=[dict_row])
+        attestor = _make_attestor(substrate_client=client, observer=observer)
+
+        captured: list = []
+        original_process_one = attestor.process_one
+
+        async def capture(req, chain_id):
+            captured.append(req)
+            return await original_process_one(req, chain_id)
+
+        attestor.process_one = capture  # type: ignore[method-assign]
+
+        _run(attestor._tick(CHAIN_ID))
+
+        assert len(captured) == 1
+        assert isinstance(captured[0], PendingSettlementRequest)
+        assert captured[0].claim_id == CLAIM_ID
+        assert captured[0].cardano_tx_hash == CARDANO_TX_HASH
+        assert captured[0].voucher_digest == VOUCHER_DIGEST
+
+    def test_tick_skips_malformed_row_without_killing_batch(self):
+        """A dict missing required dataclass fields is logged + skipped;
+        well-formed rows in the same batch still get processed."""
+        observer = _make_observer_stub()
+        client = _make_substrate_client_stub()
+        good_row = dict(
+            claim_id=CLAIM_ID,
+            requester="5DummyAccountId1",
+            submitted_block=100,
+            settled_direct=True,
+            cardano_tx_hash=CARDANO_TX_HASH,
+            observed_at_depth=OBSERVED_DEPTH,
+            observed_slot=OBSERVED_SLOT,
+            beneficiary_addr_hash=BENE_HASH_28,
+            amount_lovelace=AMOUNT_LOVELACE,
+            mainchain_genesis_hash=PREPROD_GENESIS,
+            voucher_digest=VOUCHER_DIGEST,
+        )
+        bad_row = {"claim_id": CLAIM_ID}  # missing every other field
+        client.list_pending_settlement_requests = MagicMock(
+            return_value=[bad_row, good_row]
+        )
+        attestor = _make_attestor(substrate_client=client, observer=observer)
+
+        captured: list = []
+        original_process_one = attestor.process_one
+
+        async def capture(req, chain_id):
+            captured.append(req)
+            return await original_process_one(req, chain_id)
+
+        attestor.process_one = capture  # type: ignore[method-assign]
+
+        _run(attestor._tick(CHAIN_ID))
+
+        # bad row was skipped, good row processed
+        assert len(captured) == 1
+        assert isinstance(captured[0], PendingSettlementRequest)
+        assert captured[0].claim_id == CLAIM_ID
+        assert captured[0].cardano_tx_hash == CARDANO_TX_HASH
