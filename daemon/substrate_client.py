@@ -54,6 +54,27 @@ def _to_bytes32(val) -> bytes:
     return bytes(val)
 
 
+def _to_bytes_exact(val, expected_len: int) -> bytes:
+    """Convert SCALE-decoded [u8; N] to bytes, validating the length.
+
+    Like ``_to_bytes32`` but for arbitrary fixed widths (the settlement
+    pallet exposes a 28-byte ``beneficiary_addr_blake2_224`` field that
+    we have to thread through without silently widening).
+    Raises ``ValueError`` if the decoded value's length doesn't match.
+    """
+    raw = _to_bytes32(val) if expected_len == 32 else (
+        val if isinstance(val, bytes) else (
+            bytes.fromhex(val.removeprefix("0x")) if isinstance(val, str)
+            else bytes(val)
+        )
+    )
+    if len(raw) != expected_len:
+        raise ValueError(
+            f"expected {expected_len}-byte value, got {len(raw)} bytes"
+        )
+    return raw
+
+
 def _maybe_bytes32(val) -> Optional[bytes]:
     """Best-effort `_to_bytes32` — returns None on undecodable / missing input.
 
@@ -174,6 +195,323 @@ class SubstrateClient:
         else:
             logger.error(f"bond({amount}) failed: {receipt.error_message}")
             return False, None
+
+    # --- Intent-settlement helpers (task #266) --------------------------------
+    # These power `daemon.settle_claim_attestor` — the Cardano-tx-confirmed
+    # attestation type. They're read/write helpers against
+    # `pallet-intent-settlement` storage and extrinsics. Pure RPC; no Cardano
+    # I/O happens here (that's in `daemon.settle_claim_attestor.CardanoTxObserver`).
+
+    def list_pending_settlement_requests(self) -> list:
+        """Enumerate `IntentSettlement::ClaimSettlementRequests` storage and
+        return one dict per pending row, augmented with the corresponding
+        `Vouchers[claim_id]` chain-state voucher_digest.
+
+        Returns a list of plain dicts (NOT `PendingSettlementRequest`
+        dataclasses — kept loose so the attestor module can be tested
+        without import-coupling the schema). The dispatcher converts to
+        a dataclass on consumption.
+
+        Missing voucher rows are SILENTLY DROPPED here — the pallet
+        invariant is that a settle request can only exist for a
+        Vouchered claim, so a request without a voucher is a chain bug
+        and the attestor's refusal logic would just produce a noisy
+        VOUCHER_DIGEST_MISMATCH. Dropping keeps the noise floor low.
+
+        Output shape per row:
+            {
+              "claim_id": bytes32,
+              "requester": ss58_str,
+              "submitted_block": int,
+              "settled_direct": bool,
+              "cardano_tx_hash": bytes32,
+              "observed_at_depth": int,
+              "observed_slot": int,
+              "beneficiary_addr_hash": bytes28,
+              "amount_lovelace": int,
+              "mainchain_genesis_hash": bytes32,
+              "voucher_digest": bytes32,           # from on-chain Vouchers[claim_id]
+            }
+        """
+        out: list[dict] = []
+        try:
+            rows = self.substrate.query_map(
+                module="IntentSettlement",
+                storage_function="ClaimSettlementRequests",
+            )
+        except SubstrateRequestException as e:
+            logger.warning(
+                f"list_pending_settlement_requests: query_map raised "
+                f"{type(e).__name__}: {e}"
+            )
+            return out
+        except Exception as e:  # noqa: BLE001
+            # Older runtime versions without the pallet wired return a
+            # "module not found" — that's a soft-disable, not an error.
+            logger.info(
+                f"list_pending_settlement_requests: no IntentSettlement "
+                f"module on chain ({type(e).__name__}: {e}); skipping tick"
+            )
+            return out
+        for key, value in rows:
+            try:
+                claim_id_b = _to_bytes32(key.value)
+            except (ValueError, TypeError):
+                continue
+            record = value.value if hasattr(value, "value") else value
+            if not isinstance(record, dict):
+                continue
+            evidence = record.get("evidence") or {}
+            if not isinstance(evidence, dict):
+                continue
+            voucher_digest = self.get_voucher_digest(claim_id_b)
+            if voucher_digest is None:
+                logger.info(
+                    f"settle_request {claim_id_b.hex()[:16]}... has no "
+                    f"matching voucher — dropping (chain invariant "
+                    f"violation, see pallet docs)"
+                )
+                continue
+            try:
+                out.append({
+                    "claim_id": claim_id_b,
+                    "requester": str(record.get("requester")),
+                    "submitted_block": int(record.get("submitted_block", 0)),
+                    "settled_direct": bool(record.get("settled_direct", False)),
+                    "cardano_tx_hash": _to_bytes32(
+                        evidence.get("cardano_tx_hash")
+                    ),
+                    "observed_at_depth": int(
+                        evidence.get("observed_at_depth", 0)
+                    ),
+                    "observed_slot": int(evidence.get("observed_slot", 0)),
+                    "beneficiary_addr_hash": _to_bytes_exact(
+                        evidence.get("beneficiary_addr_hash"), 28
+                    ),
+                    "amount_lovelace": int(
+                        evidence.get("amount_lovelace", 0)
+                    ),
+                    "mainchain_genesis_hash": _to_bytes32(
+                        evidence.get("mainchain_genesis_hash")
+                    ),
+                    "voucher_digest": voucher_digest,
+                })
+            except (ValueError, TypeError, KeyError) as e:
+                logger.warning(
+                    f"list_pending_settlement_requests: malformed row "
+                    f"for claim {claim_id_b.hex()[:16]}...: "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+        return out
+
+    def get_voucher_digest(self, claim_id: bytes) -> Optional[bytes]:
+        """Return the chain-state voucher_digest for ``claim_id`` (the
+        binding committed in the STCA preimage, memo §3.2).
+
+        The pallet computes this digest at voucher-mint time and stores
+        it as part of the ``Voucher`` row (or on a dedicated
+        ``VoucherDigests`` map). We try the dedicated map first (the
+        zero-RPC-cost path), then fall back to deriving from
+        ``Vouchers[claim_id]`` if needed. Returns None when no voucher
+        is on chain for this claim.
+        """
+        claim_param = "0x" + claim_id.hex()
+        # Preferred path: dedicated `VoucherDigests` map (most pallets
+        # surface the digest separately for cheap reads). If the storage
+        # is absent we fall through to the Voucher row.
+        try:
+            result = self.substrate.query(
+                module="IntentSettlement",
+                storage_function="VoucherDigests",
+                params=[claim_param],
+            )
+            if result is not None and result.value is not None:
+                try:
+                    return _to_bytes32(result.value)
+                except (ValueError, TypeError):
+                    pass
+        except SubstrateRequestException:
+            # No dedicated map — fall through to Voucher row.
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+        # Fallback: read Voucher row + recompute the digest using the
+        # pallet's `voucher_digest` field if present.
+        try:
+            result = self.substrate.query(
+                module="IntentSettlement",
+                storage_function="Vouchers",
+                params=[claim_param],
+            )
+        except SubstrateRequestException as e:
+            logger.warning(
+                f"get_voucher_digest: Vouchers query raised "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+        except Exception:  # noqa: BLE001
+            return None
+        if result is None or result.value is None:
+            return None
+        v = result.value
+        if not isinstance(v, dict):
+            return None
+        # A `voucher_digest` field is the canonical place if the
+        # pallet exposes it directly.
+        vd = v.get("voucher_digest")
+        if vd is not None:
+            try:
+                return _to_bytes32(vd)
+            except (ValueError, TypeError):
+                pass
+        # `batch_fairness_proof_digest` is NOT the voucher digest —
+        # different field with different semantics. We deliberately do
+        # NOT fall back to it: returning a wrong-domain hash here
+        # would silently produce mis-bound STCA signatures.
+        return None
+
+    def get_voucher(self, claim_id: bytes) -> Optional[dict]:
+        """Return a slimmed-down voucher row for cert-daemon refusal
+        cross-checks. Only the fields the attestor compares against
+        evidence are surfaced; the rest of the row is ignored.
+
+        Returns None if no voucher row exists.
+        """
+        claim_param = "0x" + claim_id.hex()
+        try:
+            result = self.substrate.query(
+                module="IntentSettlement",
+                storage_function="Vouchers",
+                params=[claim_param],
+            )
+        except (SubstrateRequestException, Exception):  # noqa: BLE001
+            return None
+        if result is None or result.value is None:
+            return None
+        v = result.value
+        if not isinstance(v, dict):
+            return None
+        out: dict = {}
+        if "amount_ada" in v:
+            try:
+                out["amount_lovelace"] = int(v["amount_ada"])
+            except (TypeError, ValueError):
+                pass
+        if "beneficiary_addr_blake2_224" in v:
+            try:
+                out["beneficiary_addr_blake2_224"] = _to_bytes_exact(
+                    v["beneficiary_addr_blake2_224"], 28
+                )
+            except (ValueError, TypeError):
+                pass
+        # If the pallet stores the raw address but not the hash, the
+        # cert-daemon's cross-check skips this voucher field rather
+        # than computing a hash that might disagree with the pallet's
+        # canonical form. The chain-state voucher digest binding
+        # (fact 8) is the authoritative guard; this fact 6
+        # cross-check is purely advisory.
+        return out
+
+    def get_min_finality_depth(self) -> Optional[int]:
+        """Return the runtime constant `IntentSettlement::MinFinalityDepth`.
+
+        Falls back to None on any error — caller should use its env
+        default.
+        """
+        try:
+            consts = self.substrate.get_constant(
+                "IntentSettlement", "MinFinalityDepth"
+            )
+            if consts is None:
+                return None
+            val = getattr(consts, "value", consts)
+            return int(val) if val is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def submit_attest_settle(
+        self,
+        claim_id: bytes,
+        my_pubkey: bytes,
+        my_sig: bytes,
+    ) -> Optional[str]:
+        """Submit `IntentSettlement::attest_settle(claim_id, [(my_pubkey,
+        my_sig)])`. Each attestor calls this with a single-element sig
+        list — the pallet accumulates sigs across calls until the
+        threshold is reached and the claim settles (memo §3.1).
+
+        Returns the extrinsic hash (0x-prefixed hex) on inclusion, None
+        otherwise. Retries on transport failure are bounded by
+        ``tx_max_retries`` (same knob receipt-cert path uses).
+        """
+        if len(claim_id) != 32:
+            raise ValueError(f"claim_id must be 32 bytes, got {len(claim_id)}")
+        if len(my_pubkey) != 32:
+            raise ValueError(
+                f"my_pubkey must be 32 bytes, got {len(my_pubkey)}"
+            )
+        if len(my_sig) != 64:
+            raise ValueError(f"my_sig must be 64 bytes, got {len(my_sig)}")
+        last_error: Optional[str] = None
+        for attempt in range(self.config.tx_max_retries):
+            try:
+                call = self.substrate.compose_call(
+                    call_module="IntentSettlement",
+                    call_function="attest_settle",
+                    call_params={
+                        "claim_id": "0x" + claim_id.hex(),
+                        "signatures": [
+                            (
+                                "0x" + my_pubkey.hex(),
+                                "0x" + my_sig.hex(),
+                            )
+                        ],
+                    },
+                )
+                extrinsic = self.substrate.create_signed_extrinsic(
+                    call=call, keypair=self.keypair,
+                )
+                receipt = self.substrate.submit_extrinsic(
+                    extrinsic, wait_for_inclusion=True
+                )
+                if not receipt.is_success:
+                    last_error = str(receipt.error_message)
+                    logger.warning(
+                        f"attest_settle failed for "
+                        f"{claim_id.hex()[:16]}...: {last_error}"
+                    )
+                    # Non-retryable: the pallet's invariant errors
+                    # (SettlementRequestMissing, AlreadySettled, etc.)
+                    # won't resolve on retry — return None so the
+                    # caller treats this attempt as terminal for the
+                    # tick.
+                    return None
+                ext_hash = (
+                    getattr(receipt, "extrinsic_hash", None)
+                    or getattr(receipt, "block_hash", None)
+                    or ""
+                )
+                return str(ext_hash) if ext_hash else None
+            except SubstrateRequestException as e:
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"attest_settle attempt {attempt + 1} raised: {e}"
+                )
+                if attempt < self.config.tx_max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except Exception as e:  # noqa: BLE001
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"attest_settle unexpected error for "
+                    f"{claim_id.hex()[:16]}...: {e}"
+                )
+                return None
+        logger.warning(
+            f"attest_settle gave up after {self.config.tx_max_retries} "
+            f"attempts for {claim_id.hex()[:16]}...: {last_error}"
+        )
+        return None
 
     def get_block_events(self, block_number: int) -> list:
         block_hash = self.substrate.get_block_hash(block_number)
