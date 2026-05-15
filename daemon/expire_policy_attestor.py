@@ -296,6 +296,7 @@ class RefusalReason:
     POLICY_ID_WITNESS_MISMATCH = "policy_id_witness_mismatch"  # fact 7
     OBSERVER_UNAVAILABLE = "observer_unavailable"       # tooling, not safety
     DEPTH_OBSERVATION_UNAVAILABLE = "depth_observation_unavailable"
+    DEPTH_UNDERSHOOT = "depth_undershoot"  # task #287: reality < pinned
 
 
 @dataclass
@@ -536,14 +537,26 @@ class ExpirePolicyAttestor:
             self._log_refusal(verdict)
             return verdict
 
-        # Fact 2: finality depth — attestor's OWN observed depth, not
-        # the requester's. PR #34 §3.2 makes ``observed_at_depth`` the
-        # attestor's value (committed in the EXPP preimage).
+        # Fact 2: finality depth — verify reality has caught up to the
+        # depth the requester pinned. Task #287: the pallet rebuilds the
+        # EXPP preimage from `request.observed_at_depth` (pinned at
+        # request_expire_policy time), so the daemon signs over that
+        # pinned value below, NOT a fresh obs.depth. This block is the
+        # independent reality check that gates whether signing is safe.
         if obs.depth is None:
             verdict.refusal_reason = RefusalReason.DEPTH_OBSERVATION_UNAVAILABLE
             verdict.refusal_detail = (
                 f"tip_block_no={obs.cardano_tip_block_no} "
                 f"tx_block_no={obs.tx_block_no}"
+            )
+            self._log_refusal(verdict)
+            return verdict
+        if obs.depth < int(request.observed_at_depth):
+            verdict.refusal_reason = RefusalReason.DEPTH_UNDERSHOOT
+            verdict.refusal_detail = (
+                f"observed_depth={obs.depth} < "
+                f"request_observed_at_depth={request.observed_at_depth} "
+                f"(reality has not caught up to pinned depth)"
             )
             self._log_refusal(verdict)
             return verdict
@@ -557,16 +570,16 @@ class ExpirePolicyAttestor:
             return verdict
 
         # All seven facts agree. Build the EXPP preimage, sign, submit.
-        # The preimage commits to OUR observed depth (obs.depth) and to
-        # the chain-state-resolved policy_id (not the requester's
-        # witness) — both are falsifiable claims per PR #34 §3.2.
+        # Task #287: preimage commits to REQUEST-pinned depth + slot,
+        # matching what the pallet rebuilds at verify time. Daemon's
+        # `obs` fields are independent verification only.
         preimage = build_expp_preimage(
             chain_id=live_chain_id,
             intent_id=request.intent_id,
             policy_id=resolved_policy_id,
             cardano_tx_hash=request.cardano_tx_hash,
-            observed_at_depth=int(obs.depth),
-            observed_slot=int(obs.observed_slot),
+            observed_at_depth=int(request.observed_at_depth),
+            observed_slot=int(request.observed_slot),
             mainchain_genesis_hash=request.mainchain_genesis_hash,
         )
         digest = compute_expp_digest(preimage)
