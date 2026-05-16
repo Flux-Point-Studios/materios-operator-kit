@@ -629,12 +629,24 @@ class CardanoSlashObserver(CardanoTxObserver):
         ``most_recent_checkpoint`` as either a scalar slot number or a
         sub-dict carrying ``slot_no``. We parse both shapes
         defensively to stay forward-compatible.
+
+        Live-prod note (2026-05-15): Kupo 2.9 content-negotiates the
+        ``/health`` response body — without an explicit
+        ``Accept: application/json`` request header it falls back to
+        Prometheus text format (either as 200 with text body or 406
+        depending on version). The slash watcher then can't parse
+        the structured shape, returns None, and the dispatcher defers
+        TxNotFound prosecution per the Vuln 3 fail-safe contract. The
+        ``Accept`` header below is load-bearing — do NOT remove without
+        confirming current Kupo continues to serve JSON by default.
         """
         url = f"{self.kupo_url}/health"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    url, timeout=self._timeout,
+                    url,
+                    timeout=self._timeout,
+                    headers={"Accept": "application/json"},
                 ) as resp:
                     if resp.status != 200:
                         body_preview = (await resp.text())[:200]

@@ -1922,3 +1922,130 @@ class TestKupoSyncGate:
         assert _extract_kupo_checkpoint_slot(
             {"most_recent_checkpoint": {"wrong_key": 1}}
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# Regression: Kupo /health Accept-header parse bug (2026-05-15 prod).
+#
+# Kupo 2.9 defaults the /health response body to Prometheus text format.
+# Without an explicit `Accept: application/json` request header, Kupo
+# returns HTTP 406 with a text body, or HTTP 200 with a non-JSON body
+# depending on Kupo version. Either way, `await resp.json()` raises
+# `aiohttp.ContentTypeError`/`JSONDecodeError`, the helper falls through
+# to its blanket `except Exception` arm, returns None, and the classifier's
+# fail-safe contract forever defers TxNotFound slashes.
+#
+# Caught during the live preprod e2e smoke when a bonded fraudulent
+# `request_settle` posted by Nate sat un-prosecuted past the watcher's
+# poll cycle. Direct curl confirmed Kupo serves JSON only when the
+# `Accept: application/json` header is set.
+#
+# The fix is one keyword arg on `session.get()`. The regression test
+# asserts the header is set on EVERY /health call so a future
+# refactor cannot silently regress.
+# ---------------------------------------------------------------------------
+
+
+class TestKupoCheckpointAcceptHeader:
+    """Pin the Accept-header contract on the live /health path.
+
+    Without `Accept: application/json`, Kupo's default content-negotiation
+    drops back to Prometheus text and the JSON parse raises — silently
+    converted to None by the helper's blanket except. The slash watcher
+    then defers TxNotFound classifications forever per Vuln 3 fail-safe
+    contract.
+    """
+
+    def test_kupo_checkpoint_slot_sends_accept_json_header(self):
+        """The aiohttp GET request to Kupo /health MUST carry
+        `Accept: application/json` so Kupo serves the structured
+        body instead of falling back to Prometheus text.
+        """
+        from aiohttp import web
+
+        captured_headers: dict = {}
+
+        async def health_handler(request):
+            # Snapshot the Accept header for assertion.
+            captured_headers["Accept"] = request.headers.get(
+                "Accept", "<missing>",
+            )
+            # Mirror Kupo 2.9's real JSON shape so the helper completes
+            # the happy path and we can also assert the parse worked.
+            return web.json_response({
+                "connection_status": "connected",
+                "most_recent_checkpoint": 123_456_789,
+                "most_recent_node_tip": 123_456_789,
+                "configuration": {"indexes": "installed"},
+                "version": "v2.9.0+61ad7e",
+            })
+
+        async def run_test():
+            app = web.Application()
+            app.router.add_get("/health", health_handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            try:
+                port = site._server.sockets[0].getsockname()[1]
+                base_url = f"http://127.0.0.1:{port}"
+                observer = CardanoSlashObserver(
+                    ogmios_url="ws://ogmios.test",
+                    kupo_url=base_url,
+                )
+                slot = await observer.kupo_checkpoint_slot()
+                # Sanity: the parse round-tripped — slot reflects payload.
+                assert slot == 123_456_789
+            finally:
+                await runner.cleanup()
+
+        _run(run_test())
+
+        # The whole point: the request MUST advertise it wants JSON.
+        # Anything else (missing, `*/*`, `text/plain`, etc.) is a
+        # regression — Kupo will silently serve Prometheus text and
+        # break the slash watcher in production.
+        assert captured_headers.get("Accept") == "application/json", (
+            f"Kupo /health request missing Accept: application/json "
+            f"(got {captured_headers.get('Accept')!r}). This breaks the "
+            f"slash watcher in production — Kupo defaults to Prometheus "
+            f"text without the JSON Accept header."
+        )
+
+    def test_kupo_checkpoint_slot_returns_none_on_406(self):
+        """Defense-in-depth: even if the gateway/proxy strips the Accept
+        header for some reason and Kupo responds 406, the helper must
+        still NOT raise — it logs and returns None so the caller defers
+        (per fail-safe contract) instead of crashing the slash watcher
+        poll loop.
+        """
+        from aiohttp import web
+
+        async def health_handler(request):
+            return web.Response(
+                text="prometheus_text_format_not_json",
+                status=406,
+                content_type="text/plain",
+            )
+
+        async def run_test():
+            app = web.Application()
+            app.router.add_get("/health", health_handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            try:
+                port = site._server.sockets[0].getsockname()[1]
+                base_url = f"http://127.0.0.1:{port}"
+                observer = CardanoSlashObserver(
+                    ogmios_url="ws://ogmios.test",
+                    kupo_url=base_url,
+                )
+                slot = await observer.kupo_checkpoint_slot()
+                assert slot is None
+            finally:
+                await runner.cleanup()
+
+        _run(run_test())

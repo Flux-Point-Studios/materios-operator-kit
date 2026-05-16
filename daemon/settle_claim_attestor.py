@@ -951,6 +951,17 @@ class PendingSettlementRequest:
     mainchain_genesis_hash: bytes  # 32B
     # Chain-state-derived (fetched by SubstrateClient, NOT from the request)
     voucher_digest: bytes        # 32B
+    # Spec-225 (live 2026-05-15) added an optional bond_amount field
+    # to the ``SettlementRequestRecord``. The post-spec-225
+    # substrate_client surfaces this in every dict it returns from
+    # ``list_pending_settlement_requests``. The settle attestor itself
+    # does NOT consume the field — that's the slash watcher's
+    # business — but the dispatcher unpacks rows via ``**r`` so we
+    # MUST accept the kwarg here or every tick logs TypeError and
+    # the daemon attests nothing. Default = 0 keeps pre-spec-225
+    # callers (tests, replay fixtures) working without touching every
+    # call-site. Mirrors slash_watcher.py:357 ``PendingBondedRequest``.
+    bond_amount: int = 0
 
 
 # ---------------------------------------------------------------------------

@@ -1758,3 +1758,127 @@ class TestObserveResolvesTxBlockNoViaOgmiosWalk:
         assert obs.tx_block_no is None
         assert "kupo_match_missing_block_no" in obs.mismatches
         observer.get_block_height_by_hash.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Regression: PendingSettlementRequest must accept post-spec-225 bond_amount.
+#
+# After spec-225 went live (2026-05-15 block hash 0x14389692...), the
+# substrate_client helper started surfacing a new ``bond_amount`` key in
+# every dict it returns from ``list_pending_settlement_requests``. The
+# settle dispatcher does ``PendingSettlementRequest(**row)`` at the
+# boundary, which previously threw TypeError on the new kwarg because
+# the dataclass did not know about it.
+#
+# Result in production: every settle attestor tick logged
+#   settle_attestor: skipping malformed pending request row
+#   (claim_id=...): TypeError: PendingSettlementRequest.__init__() got
+#   an unexpected keyword argument 'bond_amount'
+# and the daemon never attested a single settle.
+#
+# The slash watcher's ``PendingBondedRequest`` already has the field
+# (see slash_watcher.py:357). This regression mirrors the contract so
+# both daemon paths converge on the same dict shape from
+# substrate_client. The bond_amount default of 0 keeps the field
+# optional so pre-spec-225 callers (tests, replay fixtures) still pass.
+# ---------------------------------------------------------------------------
+
+
+class TestPendingSettlementRequestBondAmount:
+    """Pin the dataclass contract: it must accept the spec-225 bond_amount
+    surfaced by the post-spec-225 substrate_client without TypeError, and
+    callers that don't supply it must still work (default = 0).
+    """
+
+    def test_pending_settlement_request_accepts_bond_amount_kwarg(self):
+        """Spec-225's substrate_client emits dicts with bond_amount; the
+        dispatcher unpacks them with ``**row``. The dataclass MUST accept
+        this kwarg — otherwise every tick logs TypeError + skips every
+        pending request, breaking the autopilot in production.
+        """
+        req = PendingSettlementRequest(
+            claim_id=CLAIM_ID,
+            requester="5DummyAccountId1",
+            submitted_block=100,
+            settled_direct=True,
+            cardano_tx_hash=CARDANO_TX_HASH,
+            observed_at_depth=OBSERVED_DEPTH,
+            observed_slot=OBSERVED_SLOT,
+            beneficiary_addr_hash=BENE_HASH_28,
+            amount_lovelace=AMOUNT_LOVELACE,
+            mainchain_genesis_hash=PREPROD_GENESIS,
+            voucher_digest=VOUCHER_DIGEST,
+            bond_amount=1_000_000,
+        )
+        assert req.bond_amount == 1_000_000
+
+    def test_pending_settlement_request_bond_amount_defaults_to_zero(self):
+        """Pre-spec-225 callers (and the existing test corpus) construct
+        the dataclass WITHOUT bond_amount. Keep the field optional so
+        we don't have to touch every existing call-site.
+        """
+        req = PendingSettlementRequest(
+            claim_id=CLAIM_ID,
+            requester="5DummyAccountId1",
+            submitted_block=100,
+            settled_direct=True,
+            cardano_tx_hash=CARDANO_TX_HASH,
+            observed_at_depth=OBSERVED_DEPTH,
+            observed_slot=OBSERVED_SLOT,
+            beneficiary_addr_hash=BENE_HASH_28,
+            amount_lovelace=AMOUNT_LOVELACE,
+            mainchain_genesis_hash=PREPROD_GENESIS,
+            voucher_digest=VOUCHER_DIGEST,
+        )
+        assert req.bond_amount == 0
+
+    def test_tick_unpacks_post_spec_225_dict_with_bond_amount(self):
+        """End-to-end regression: a row shaped like what the live
+        substrate_client returns post-spec-225 (with bond_amount) must
+        flow through _tick → PendingSettlementRequest(**r) → process_one
+        without raising TypeError.
+
+        Pre-fix this would have logged 'skipping malformed pending request
+        row' and captured nothing.
+        """
+        observer = _make_observer_stub()
+        client = _make_substrate_client_stub()
+        # Mirror the dict shape from substrate_client.py:336-363 verbatim.
+        live_shape_row = dict(
+            claim_id=CLAIM_ID,
+            requester="5DummyAccountId1",
+            submitted_block=100,
+            settled_direct=True,
+            cardano_tx_hash=CARDANO_TX_HASH,
+            observed_at_depth=OBSERVED_DEPTH,
+            observed_slot=OBSERVED_SLOT,
+            beneficiary_addr_hash=BENE_HASH_28,
+            amount_lovelace=AMOUNT_LOVELACE,
+            mainchain_genesis_hash=PREPROD_GENESIS,
+            voucher_digest=VOUCHER_DIGEST,
+            bond_amount=1_000_000,
+        )
+        client.list_pending_settlement_requests = MagicMock(
+            return_value=[live_shape_row]
+        )
+        attestor = _make_attestor(substrate_client=client, observer=observer)
+
+        captured: list = []
+        original_process_one = attestor.process_one
+
+        async def capture(req, chain_id):
+            captured.append(req)
+            return await original_process_one(req, chain_id)
+
+        attestor.process_one = capture  # type: ignore[method-assign]
+
+        _run(attestor._tick(CHAIN_ID))
+
+        assert len(captured) == 1, (
+            "_tick must convert the post-spec-225 dict into a dataclass "
+            "without skipping it — the bond_amount field is the new "
+            "spec-225 trigger and the settle attestor must tolerate it."
+        )
+        assert isinstance(captured[0], PendingSettlementRequest)
+        assert captured[0].claim_id == CLAIM_ID
+        assert captured[0].bond_amount == 1_000_000
