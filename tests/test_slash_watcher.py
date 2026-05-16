@@ -62,6 +62,7 @@ from daemon.slash_watcher import (
     FRAUD_DISCRIMINANT_TX_NOT_FOUND,
     FRAUD_DISCRIMINANT_WRONG_AMOUNT,
     FRAUD_DISCRIMINANT_WRONG_BENEFICIARY,
+    KUPO_SYNC_SAFETY_MARGIN_SLOTS,
     PendingBondedRequest,
     SlashObservation,
     SlashVerdict,
@@ -442,8 +443,10 @@ class TestFrauPreimage:
 class TestClassifyFraud:
     def test_classify_tx_not_found(self):
         """The observer signals `kupo_no_matches_for_tx` only when
-        Kupo successfully returned an empty match list. The classifier
-        returns TxNotFound.
+        Kupo successfully returned an empty match list AND the
+        follower is demonstrably caught up. The classifier returns
+        TxNotFound only when both conditions hold (sec-review round-1
+        Vuln 3 — sync gate).
         """
         req = _default_pending_request()
         obs = _make_observation(
@@ -451,7 +454,14 @@ class TestClassifyFraud:
             matched_lovelace=None,
             actual_beneficiary_hash=None,
         )
-        proof = classify_fraud(req, obs)
+        # Supply a checkpoint slot well above
+        # request.observed_slot + KUPO_SYNC_SAFETY_MARGIN_SLOTS so
+        # the sync gate clears and the classifier promotes to
+        # TxNotFound.
+        proof = classify_fraud(
+            req, obs,
+            kupo_checkpoint_slot=OBSERVED_SLOT + 10_000,
+        )
         assert isinstance(proof, TxNotFound)
 
     def test_classify_wrong_amount(self):
@@ -1124,3 +1134,694 @@ class TestSubstrateClientBondAmountSurface:
             # bond_amount intentionally omitted
         )
         assert req.bond_amount == 0
+
+
+# ---------------------------------------------------------------------------
+# sec-review round-1 Vuln 1 — slash channel namespace round-trip against
+# the real MultisigAggregator (NOT the stubbed dispatcher).
+#
+# Round-1 finding: `MultisigAggregator._url` whitelisted only
+# "settle" + "expire"; the watcher's `kind="slash"` call raised
+# ValueError that was swallowed by `asyncio.gather(return_exceptions=
+# True)` in `_tick`. The fix extends the whitelist to include
+# KIND_SLASH and adds structured error logging when the aggregator
+# call raises so a future namespace rejection is loud, not silent.
+#
+# This test wires the REAL MultisigAggregator against an in-proc
+# aiohttp server (the existing settle/expire test pattern from
+# test_multisig_aggregator.py::FakeGateway), confirms a kind="slash"
+# round-trip closes the loop, and asserts the slash extrinsic is
+# composed end-to-end through the watcher.
+# ---------------------------------------------------------------------------
+
+
+class TestSlashDispatchAgainstRealAggregator:
+    """Vuln 1 — slash kind round-trips through a REAL aggregator
+    against a stand-in gateway. The pre-fix `_url` whitelist rejected
+    "slash" with ValueError → silent failure in `asyncio.gather`. This
+    test catches that regression byte-exact.
+    """
+
+    def test_slash_dispatch_against_real_aggregator(self):
+        """Real :class:`daemon.multisig_aggregator.MultisigAggregator`
+        against an aiohttp gateway that accepts the new "slash"
+        namespace. The watcher's slash path closes — kind="slash"
+        round-trip completes, sigs converge, and the slash extrinsic
+        gets composed by the substrate client stub.
+        """
+        from aiohttp import web
+        from daemon.multisig_aggregator import (
+            KIND_SLASH,
+            MultisigAggregator,
+        )
+
+        # In-proc gateway that mirrors the production
+        # /v2/multisig_sigs/{kind}/{key} contract.
+        store: dict = {}
+
+        async def post_handler(request):
+            kind = request.match_info["kind"]
+            key = request.match_info["key"]
+            body = await request.json()
+            store[(kind, key, body["digest"], body["pubkey"])] = body[
+                "sig"
+            ]
+            return web.json_response({"ok": True, "stored": True})
+
+        async def get_handler(request):
+            kind = request.match_info["kind"]
+            key = request.match_info["key"]
+            digest = request.query.get("digest")
+            sigs = []
+            # Seed two peer sigs at the same digest so the daemon
+            # crosses the M=3 threshold after adding its own.
+            sigs.append({
+                "pubkey": ("01" * 32),
+                "sig": ("01" * 64),
+                "digest": digest,
+            })
+            sigs.append({
+                "pubkey": ("02" * 32),
+                "sig": ("02" * 64),
+                "digest": digest,
+            })
+            # Include the daemon's own sig if it has posted.
+            for (k, key_h, dig_h, pub_h), sig_h in store.items():
+                if k != kind or key_h != key:
+                    continue
+                if dig_h != digest:
+                    continue
+                sigs.append({
+                    "pubkey": pub_h, "sig": sig_h, "digest": dig_h,
+                })
+            # Dedupe by pubkey.
+            seen = set()
+            out = []
+            for entry in sigs:
+                if entry["pubkey"] in seen:
+                    continue
+                seen.add(entry["pubkey"])
+                out.append(entry)
+            return web.json_response({
+                "kind": kind, "key": key, "sigs": out, "count": len(out),
+            })
+
+        async def run_test():
+            app = web.Application()
+            app.router.add_post(
+                "/v2/multisig_sigs/{kind}/{key}", post_handler,
+            )
+            app.router.add_get(
+                "/v2/multisig_sigs/{kind}/{key}", get_handler,
+            )
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            try:
+                port = site._server.sockets[0].getsockname()[1]
+                base_url = f"http://127.0.0.1:{port}"
+                # Real aggregator — no stubs.
+                aggregator = MultisigAggregator(gateway_url=base_url)
+
+                client = _make_substrate_client_stub(
+                    submit_ext_hash="0x" + ("cc" * 32),
+                )
+                # Observer reports fraud (wrong amount).
+                observer = _make_observer_stub(
+                    _make_observation(
+                        matched_lovelace=9_000_000,
+                        actual_beneficiary_hash=BENE_HASH_28,
+                    )
+                )
+                req = _default_pending_request(amount_lovelace=5_000_000)
+
+                watcher = _make_watcher(
+                    substrate_client=client, observer=observer,
+                    aggregator=aggregator,
+                    # Threshold 3 = us + 2 seeded peers.
+                    min_signer_threshold=3,
+                )
+                verdict = await watcher.process_one(req, CHAIN_ID)
+
+                # The slash extrinsic landed — proving kind="slash"
+                # is accepted by the real aggregator's URL whitelist.
+                assert verdict.outcome == ClassifierOutcome.SLASH_WRONG_AMOUNT
+                assert verdict.extrinsic_hash == "0x" + ("cc" * 32)
+                client.submit_slash_bad_settlement_evidence.assert_called_once()
+                call_args = (
+                    client.submit_slash_bad_settlement_evidence.call_args
+                )
+                envelope = call_args.args[2]
+                assert len(envelope) >= 3
+                # Confirm the gateway saw a "slash"-namespaced POST
+                # from the daemon's own pubkey.
+                slash_namespaces = {k[0] for k in store.keys()}
+                assert KIND_SLASH in slash_namespaces, (
+                    f"daemon must POST under kind='slash' namespace; "
+                    f"gateway saw kinds={slash_namespaces!r}"
+                )
+            finally:
+                await runner.cleanup()
+
+        _run(run_test())
+
+    def test_aggregator_namespace_rejection_logs_loudly_and_defers(self):
+        """If the aggregator's URL builder rejects the kind (e.g. a
+        future regression that breaks the KIND_SLASH whitelist),
+        process_one MUST log loudly and defer — NOT die silently in
+        asyncio.gather. This pins the second half of the Vuln 1 fix.
+        """
+        client = _make_substrate_client_stub()
+        observer = _make_observer_stub(
+            _make_observation(matched_lovelace=9_000_000)
+        )
+
+        async def explode(session, *, kind, key, digest, my_pubkey,
+                          my_sig):
+            raise ValueError(
+                f"kind must be 'settle' or 'expire', got {kind!r}"
+            )
+
+        aggregator = SimpleNamespace(assemble_envelope=explode)
+        watcher = _make_watcher(
+            substrate_client=client, observer=observer,
+            aggregator=aggregator, min_signer_threshold=2,
+        )
+        req = _default_pending_request(amount_lovelace=5_000_000)
+        verdict = _run(watcher.process_one(req, CHAIN_ID))
+        # Slash NOT submitted because the aggregator raised — we
+        # surface a deferral instead of a silent failure.
+        client.submit_slash_bad_settlement_evidence.assert_not_called()
+        # Verdict still classifies the fraud (we got past the
+        # classifier) but no extrinsic hash and the detail surfaces
+        # the aggregator failure class.
+        assert verdict.outcome == ClassifierOutcome.SLASH_WRONG_AMOUNT
+        assert verdict.extrinsic_hash is None
+        assert "aggregator_raised" in (verdict.detail or "")
+
+    def test_tick_surfaces_per_row_exceptions(self):
+        """If `process_one` raises (e.g. a bug we didn't anticipate),
+        `_tick`'s gather() iteration must surface the exception per
+        claim_id. Pre-fix the swallowed-by-gather behaviour silently
+        dropped the row and the operator never saw it.
+        """
+        import logging
+        client = _make_substrate_client_stub()
+        observer = _make_observer_stub(_make_observation())
+        watcher = _make_watcher(
+            substrate_client=client, observer=observer,
+        )
+        # Patch process_one to raise; verify _tick logs it.
+        watcher.process_one = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("boom"),
+        )
+        # Provide a bonded row so _tick reaches the gather.
+        client.list_pending_settlement_requests = MagicMock(
+            return_value=[dict(
+                claim_id=CLAIM_ID,
+                requester="5Test",
+                submitted_block=100,
+                settled_direct=True,
+                cardano_tx_hash=CARDANO_TX_HASH,
+                observed_at_depth=OBSERVED_DEPTH,
+                observed_slot=OBSERVED_SLOT,
+                beneficiary_addr_hash=BENE_HASH_28,
+                amount_lovelace=AMOUNT_LOVELACE,
+                mainchain_genesis_hash=PREPROD_GENESIS,
+                voucher_digest=VOUCHER_DIGEST,
+                bond_amount=BOND_AMOUNT,
+            )]
+        )
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = _Capture(level=logging.ERROR)
+        slash_logger = logging.getLogger("daemon.slash_watcher")
+        slash_logger.addHandler(handler)
+        try:
+            _run(watcher._tick(CHAIN_ID))
+        finally:
+            slash_logger.removeHandler(handler)
+        error_records = [r for r in records if r.levelno >= logging.ERROR]
+        msgs = " | ".join(r.getMessage() for r in error_records)
+        assert "process_one raised" in msgs, (
+            f"_tick must log an ERROR when a per-row coroutine raises; "
+            f"captured records={msgs!r}"
+        )
+        assert CLAIM_ID.hex()[:16] in msgs, (
+            f"error log must include the originating claim_id; "
+            f"captured records={msgs!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# sec-review round-1 Vuln 2 — Kupo response-shape errors + first-
+# payment-hash beneficiary skip.
+#
+# Round-1 finding: the parent observer treats `value.coins` as 0 when
+# it's not an int (stringly-typed from some Kupo forks). That silently
+# understates `matched_address_lovelace`. Combined with
+# `_first_payment_hash` returning the FIRST decodable hash (which may
+# be a keeper change-output hash, NOT a non-beneficiary payee), an
+# honest tx can be slashed as WrongBeneficiary(change_hash).
+#
+# The fix:
+#   (a) `_first_payment_hash` FILTERS OUT any output whose payment
+#       hash equals the expected beneficiary; sorts by output_index
+#       for cross-watcher determinism.
+#   (b) The slash observer detects stringly-typed `value.coins` and
+#       appends the `kupo_response_shape_error` mismatch tag so the
+#       dispatcher defers (NOT slashes).
+# ---------------------------------------------------------------------------
+
+
+def _make_kupo_match(
+    *,
+    output_index: int = 0,
+    address: str,
+    coins,
+    transaction_id: str | None = None,
+) -> dict:
+    """Build one Kupo /matches entry mirroring the live shape."""
+    return {
+        "transaction_id": transaction_id or CARDANO_TX_HASH.hex(),
+        "output_index": output_index,
+        "address": address,
+        "value": {"coins": coins, "assets": {}},
+        "created_at": {
+            "slot_no": OBSERVED_SLOT,
+            "header_hash": "ab" * 32,
+        },
+        "spent_at": None,
+    }
+
+
+def _make_testnet_addr_with_payment_hash(payment_hash: bytes) -> str:
+    """CIP-0019 type-0 testnet base address whose payment hash is the
+    supplied 28-byte value. Reuses the encoder pattern from the settle
+    attestor tests so this module stays self-contained."""
+    assert len(payment_hash) == 28
+    from tests.test_cardano_address import _bech32_encode_addr_test
+    header = bytes([0x00])
+    stake_hash = b"\x99" * 28
+    return _bech32_encode_addr_test(header + payment_hash + stake_hash)
+
+
+class TestKupoResponseShapeError:
+    """Vuln 2 — stringly-typed `value.coins` must NOT silently let the
+    slash path mis-trigger WrongBeneficiary against an honest
+    requester. The observer surfaces a new mismatch tag and the
+    dispatcher defers.
+    """
+
+    def test_kupo_string_coins_defers_not_slashes(self):
+        """Kupo returns a beneficiary-paying output with
+        `value.coins = "5000000"` (string, NOT int). The parent
+        observer silently treats it as 0 lovelace; pre-fix, the slash
+        path would surface the keeper's change-hash and slash for
+        WrongBeneficiary. Post-fix, the observer's shape-error
+        detection appends `kupo_response_shape_error` and the
+        dispatcher defers via OBSERVER_UNAVAILABLE.
+        """
+        # Build a real CardanoSlashObserver and patch _kupo_get +
+        # _ogmios_rpc.
+        observer = CardanoSlashObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        observer._ogmios_rpc = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"slot": OBSERVED_SLOT + 1000, "id": "ff" * 32},
+                1_000_000,
+                {"era": "shelley", "networkMagic": 1, "network": "testnet"},
+            ]
+        )
+        bene_addr = _make_testnet_addr_with_payment_hash(BENE_HASH_28)
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _make_kupo_match(
+                    output_index=0,
+                    address=bene_addr,
+                    coins="5000000",  # STRING — the headline bug
+                ),
+            ]
+        )
+
+        async def driver():
+            return await observer.observe(
+                CARDANO_TX_HASH.hex(), BENE_HASH_28,
+            )
+
+        obs = _run(driver())
+        # Observer must have surfaced the new shape-error tag.
+        assert "kupo_response_shape_error" in obs.mismatches, (
+            f"observer must surface kupo_response_shape_error for "
+            f"stringly-typed value.coins; got mismatches="
+            f"{obs.mismatches!r}"
+        )
+        # The classifier defers on this mismatch (it's neither
+        # `kupo_no_matches_for_tx` nor a clean observation).
+        proof = classify_fraud(_default_pending_request(), obs)
+        assert proof is None, (
+            f"classifier must defer on kupo_response_shape_error, "
+            f"not slash; got {proof!r}"
+        )
+
+        # End-to-end: the dispatcher routes this to
+        # OBSERVER_UNAVAILABLE, NOT to a slash dispatch.
+        client = _make_substrate_client_stub()
+        observer_stub = SimpleNamespace(
+            observe=AsyncMock(return_value=obs),
+            ogmios_url=observer.ogmios_url,
+            kupo_url=observer.kupo_url,
+        )
+        watcher = _make_watcher(
+            substrate_client=client, observer=observer_stub,
+        )
+        verdict = _run(
+            watcher.process_one(_default_pending_request(), CHAIN_ID)
+        )
+        assert verdict.outcome == ClassifierOutcome.OBSERVER_UNAVAILABLE
+        assert "kupo_response_shape_error" in (verdict.detail or "")
+        client.submit_slash_bad_settlement_evidence.assert_not_called()
+
+
+class TestFirstPaymentHashSkipsBeneficiary:
+    """Vuln 2 — `_first_payment_hash` must FILTER OUT the expected
+    beneficiary so a keeper's change-output hash can't be surfaced
+    as the "actual" payee. Also pins cross-watcher determinism via
+    output_index ordering.
+    """
+
+    def test_first_payment_hash_skips_beneficiary_in_output_set(self):
+        """Two outputs: the FIRST is the beneficiary, the SECOND is
+        a change hash. Pre-fix, _first_payment_hash returned the
+        beneficiary's hash (the first one it decoded). Post-fix it
+        skips the beneficiary and returns the change hash.
+        """
+        observer = CardanoSlashObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        bene_addr = _make_testnet_addr_with_payment_hash(BENE_HASH_28)
+        change_addr = _make_testnet_addr_with_payment_hash(OTHER_HASH_28)
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _make_kupo_match(
+                    output_index=0, address=bene_addr, coins=5_000_000,
+                ),
+                _make_kupo_match(
+                    output_index=1, address=change_addr, coins=2_000_000,
+                ),
+            ]
+        )
+
+        async def driver():
+            return await observer._first_payment_hash(
+                CARDANO_TX_HASH.hex(), BENE_HASH_28,
+            )
+
+        actual = _run(driver())
+        assert actual == OTHER_HASH_28, (
+            f"_first_payment_hash must SKIP the expected beneficiary "
+            f"and return the change-output hash; got {actual!r}"
+        )
+
+    def test_first_payment_hash_returns_none_when_only_beneficiary_present(
+        self,
+    ):
+        """If the only decodable output is the beneficiary itself,
+        return None (NOT the beneficiary's hash). The dispatcher
+        treats None as defer, not slash.
+        """
+        observer = CardanoSlashObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        bene_addr = _make_testnet_addr_with_payment_hash(BENE_HASH_28)
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _make_kupo_match(
+                    output_index=0, address=bene_addr, coins=5_000_000,
+                ),
+            ]
+        )
+
+        async def driver():
+            return await observer._first_payment_hash(
+                CARDANO_TX_HASH.hex(), BENE_HASH_28,
+            )
+
+        actual = _run(driver())
+        assert actual is None, (
+            f"only-beneficiary input must yield None (defer), not the "
+            f"beneficiary's hash; got {actual!r}"
+        )
+
+    def test_first_payment_hash_sorts_by_output_index_ascending(self):
+        """Kupo's match order isn't stable across queries. Pin the
+        cross-watcher determinism by sorting by output_index
+        ascending before iterating — every watcher then picks the
+        same actual-hash given the same chain state.
+        """
+        observer = CardanoSlashObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        bene_addr = _make_testnet_addr_with_payment_hash(BENE_HASH_28)
+        change_hash_a = bytes.fromhex("aa" * 28)
+        change_hash_b = bytes.fromhex("bb" * 28)
+        change_addr_a = _make_testnet_addr_with_payment_hash(
+            change_hash_a,
+        )
+        change_addr_b = _make_testnet_addr_with_payment_hash(
+            change_hash_b,
+        )
+        # Mock Kupo returning the outputs in DESCENDING output_index
+        # order — the impl must sort ASCENDING before iterating.
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _make_kupo_match(
+                    output_index=2, address=change_addr_b, coins=1,
+                ),
+                _make_kupo_match(
+                    output_index=1, address=change_addr_a, coins=2,
+                ),
+                _make_kupo_match(
+                    output_index=0, address=bene_addr, coins=3,
+                ),
+            ]
+        )
+
+        async def driver():
+            return await observer._first_payment_hash(
+                CARDANO_TX_HASH.hex(), BENE_HASH_28,
+            )
+
+        actual = _run(driver())
+        # Ascending sort → output_index 0 (beneficiary, skipped) →
+        # output_index 1 (change_hash_a) → return.
+        assert actual == change_hash_a, (
+            f"sort-by-output_index_asc must select change_hash_a "
+            f"(output_index=1) after skipping the beneficiary at "
+            f"output_index=0; got {actual!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# sec-review round-1 Vuln 3 — Kupo sync gate before promoting empty
+# matches to FraudProof::TxNotFound.
+#
+# Round-1 finding: Kupo empty matches conflate (a) tx absent from
+# chain (truthful TxNotFound), (b) follower hasn't caught up yet
+# (10-20 min after restart), (c) Kupo --match pattern too narrow.
+# The watcher never checked `most_recent_checkpoint.slot_no`. After
+# any Kupo restart, a window of false-positive slashes opened.
+#
+# The fix gates TxNotFound promotion on the local Kupo's
+# checkpoint_slot ≥ request.observed_slot + KUPO_SYNC_SAFETY_MARGIN_SLOTS.
+# A behind follower yields KUPO_BEHIND_REQUEST_DEPTH (defer, NOT slash).
+# ---------------------------------------------------------------------------
+
+
+class TestKupoSyncGate:
+    """Vuln 3 — gate empty-Kupo TxNotFound promotion on the local
+    follower being demonstrably caught up.
+    """
+
+    def test_kupo_behind_request_depth_defers(self):
+        """Kupo returns empty matches AND the /health checkpoint is
+        below request.observed_slot. Classifier MUST defer (return
+        None), NOT promote to TxNotFound.
+        """
+        req = _default_pending_request()
+        obs = _make_observation(
+            mismatches=["kupo_no_matches_for_tx"],
+            matched_lovelace=None,
+            actual_beneficiary_hash=None,
+        )
+        # Checkpoint well below request.observed_slot — follower mid-
+        # resync.
+        proof = classify_fraud(
+            req, obs,
+            kupo_checkpoint_slot=req.observed_slot - 100,
+        )
+        assert proof is None, (
+            f"classifier must defer when Kupo checkpoint is behind "
+            f"request.observed_slot; got {proof!r}"
+        )
+        assert "kupo_behind_request_depth" in obs.mismatches
+
+    def test_kupo_checkpoint_exactly_at_threshold_still_defers(self):
+        """Boundary check: checkpoint == request.observed_slot +
+        margin - 1 is STILL behind. The gate uses `<` not `<=` →
+        any value strictly below the threshold defers.
+        """
+        req = _default_pending_request()
+        obs = _make_observation(
+            mismatches=["kupo_no_matches_for_tx"],
+            matched_lovelace=None,
+            actual_beneficiary_hash=None,
+        )
+        proof = classify_fraud(
+            req, obs,
+            kupo_checkpoint_slot=(
+                req.observed_slot + KUPO_SYNC_SAFETY_MARGIN_SLOTS - 1
+            ),
+        )
+        assert proof is None
+        assert "kupo_behind_request_depth" in obs.mismatches
+
+    def test_kupo_caught_up_classifies_tx_not_found(self):
+        """Kupo returns empty matches AND the /health checkpoint is
+        at or above request.observed_slot + margin. Classifier
+        promotes to TxNotFound (the truthful proof-of-absence).
+        """
+        req = _default_pending_request()
+        obs = _make_observation(
+            mismatches=["kupo_no_matches_for_tx"],
+            matched_lovelace=None,
+            actual_beneficiary_hash=None,
+        )
+        proof = classify_fraud(
+            req, obs,
+            kupo_checkpoint_slot=(
+                req.observed_slot + KUPO_SYNC_SAFETY_MARGIN_SLOTS
+            ),
+        )
+        assert isinstance(proof, TxNotFound), (
+            f"classifier must promote to TxNotFound when checkpoint "
+            f">= observed_slot + margin; got {proof!r}"
+        )
+        # No defer marker should have been appended.
+        assert "kupo_behind_request_depth" not in obs.mismatches
+
+    def test_classifier_defers_when_checkpoint_is_none(self):
+        """If the /health probe fails entirely (None), the
+        classifier defers — same fail-safe-on-tooling-error contract
+        as the rest of the slash path.
+        """
+        req = _default_pending_request()
+        obs = _make_observation(
+            mismatches=["kupo_no_matches_for_tx"],
+            matched_lovelace=None,
+            actual_beneficiary_hash=None,
+        )
+        proof = classify_fraud(req, obs, kupo_checkpoint_slot=None)
+        assert proof is None
+        assert "kupo_behind_request_depth" in obs.mismatches
+
+    def test_dispatcher_routes_kupo_behind_to_dedicated_outcome(self):
+        """End-to-end: the dispatcher emits the new
+        KUPO_BEHIND_REQUEST_DEPTH outcome (NOT generic
+        OBSERVER_UNAVAILABLE) when the sync gate fires. Operators
+        grep journalctl for this specific tag.
+        """
+        client = _make_substrate_client_stub()
+        obs = _make_observation(
+            mismatches=["kupo_no_matches_for_tx"],
+            matched_lovelace=None,
+            actual_beneficiary_hash=None,
+        )
+        # Build an observer stub that exposes the kupo_checkpoint_slot
+        # helper returning a behind-follower value.
+        observer = SimpleNamespace(
+            observe=AsyncMock(return_value=obs),
+            kupo_checkpoint_slot=AsyncMock(
+                return_value=OBSERVED_SLOT - 100,
+            ),
+            ogmios_url="http://ogmios.test",
+            kupo_url="http://kupo.test",
+        )
+        watcher = _make_watcher(
+            substrate_client=client, observer=observer,
+        )
+        req = _default_pending_request()
+        verdict = _run(watcher.process_one(req, CHAIN_ID))
+        assert verdict.outcome == ClassifierOutcome.KUPO_BEHIND_REQUEST_DEPTH
+        assert verdict.fraud_proof is None
+        assert verdict.extrinsic_hash is None
+        client.submit_slash_bad_settlement_evidence.assert_not_called()
+
+    def test_dispatcher_promotes_to_slash_when_observer_caught_up(self):
+        """Complement: when the observer's checkpoint is caught up,
+        the dispatcher promotes to SLASH_TX_NOT_FOUND and submits.
+        """
+        client = _make_substrate_client_stub(
+            submit_ext_hash="0x" + ("ff" * 32),
+        )
+        obs = _make_observation(
+            mismatches=["kupo_no_matches_for_tx"],
+            matched_lovelace=None,
+            actual_beneficiary_hash=None,
+        )
+        observer = SimpleNamespace(
+            observe=AsyncMock(return_value=obs),
+            kupo_checkpoint_slot=AsyncMock(
+                return_value=OBSERVED_SLOT + KUPO_SYNC_SAFETY_MARGIN_SLOTS + 50,
+            ),
+            ogmios_url="http://ogmios.test",
+            kupo_url="http://kupo.test",
+        )
+        watcher = _make_watcher(
+            substrate_client=client, observer=observer,
+            min_signer_threshold=1,
+        )
+        req = _default_pending_request()
+        verdict = _run(watcher.process_one(req, CHAIN_ID))
+        assert verdict.outcome == ClassifierOutcome.SLASH_TX_NOT_FOUND
+        assert isinstance(verdict.fraud_proof, TxNotFound)
+        client.submit_slash_bad_settlement_evidence.assert_called_once()
+
+    def test_kupo_checkpoint_slot_parses_scalar_form(self):
+        """Vuln 3 helper: /health may return
+        most_recent_checkpoint as a bare slot number. Parse it.
+        """
+        from daemon.slash_watcher import _extract_kupo_checkpoint_slot
+        assert _extract_kupo_checkpoint_slot(
+            {"most_recent_checkpoint": 12345678}
+        ) == 12345678
+
+    def test_kupo_checkpoint_slot_parses_subdict_form(self):
+        """Vuln 3 helper: /health may return
+        most_recent_checkpoint.slot_no as a sub-dict shape. Parse it.
+        """
+        from daemon.slash_watcher import _extract_kupo_checkpoint_slot
+        assert _extract_kupo_checkpoint_slot(
+            {"most_recent_checkpoint": {"slot_no": 12345678}}
+        ) == 12345678
+
+    def test_kupo_checkpoint_slot_returns_none_on_unexpected_shape(self):
+        from daemon.slash_watcher import _extract_kupo_checkpoint_slot
+        assert _extract_kupo_checkpoint_slot(None) is None
+        assert _extract_kupo_checkpoint_slot({}) is None
+        assert _extract_kupo_checkpoint_slot(
+            {"most_recent_checkpoint": "not-a-number"}
+        ) is None
+        assert _extract_kupo_checkpoint_slot(
+            {"most_recent_checkpoint": {"wrong_key": 1}}
+        ) is None

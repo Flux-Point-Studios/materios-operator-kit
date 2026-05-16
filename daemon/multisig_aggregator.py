@@ -38,6 +38,19 @@ logger = logging.getLogger(__name__)
 # `services/blob-gateway/src/multisig_sigs_store.ts::MULTISIG_KINDS`.
 KIND_SETTLE = "settle"
 KIND_EXPIRE = "expire"
+# KIND_SLASH added 2026-05-15 for spec-225 slash_bad_settlement_evidence
+# watcher (task #84-watcher, sec-review round-1 Vuln 1). The gateway-
+# side MULTISIG_KINDS whitelist in the blob-gateway repo MUST also be
+# extended to accept "slash" before this channel can round-trip in
+# production; until then `share_sig`/`fetch_envelope` will log a 4xx
+# transport warning and the slash watcher will defer to the next tick.
+KIND_SLASH = "slash"
+
+# Allowed kinds for the URL builder. Keep in sync with the gateway's
+# `MULTISIG_KINDS` whitelist exactly — drift here is a silent-defer
+# class bug (the daemon will raise + die in `asyncio.gather` without
+# explicit error logging at the caller).
+_ALLOWED_KINDS = (KIND_SETTLE, KIND_EXPIRE, KIND_SLASH)
 
 
 class MultisigAggregator:
@@ -64,8 +77,11 @@ class MultisigAggregator:
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
 
     def _url(self, kind: str, key: bytes) -> str:
-        if kind not in (KIND_SETTLE, KIND_EXPIRE):
-            raise ValueError(f"kind must be {KIND_SETTLE!r} or {KIND_EXPIRE!r}, got {kind!r}")
+        if kind not in _ALLOWED_KINDS:
+            allowed_repr = ", ".join(repr(k) for k in _ALLOWED_KINDS)
+            raise ValueError(
+                f"kind must be one of {allowed_repr}, got {kind!r}"
+            )
         if len(key) != 32:
             raise ValueError(f"key must be 32 bytes, got {len(key)}")
         return f"{self.base_url}/v2/multisig_sigs/{kind}/{key.hex()}"
