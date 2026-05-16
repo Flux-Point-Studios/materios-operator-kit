@@ -1,7 +1,7 @@
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.exceptions import SubstrateRequestException
 
@@ -283,7 +283,15 @@ class SubstrateClient:
               "amount_lovelace": int,
               "mainchain_genesis_hash": bytes32,
               "voucher_digest": bytes32,           # from on-chain Vouchers[claim_id]
+              "bond_amount": int,                  # task #84 slash trigger (u128, 0 on pre-#84 rows)
             }
+
+        ``bond_amount`` is sourced from the ``SettlementRequestRecord``
+        struct directly — post-spec-225 the record carries this
+        u128 field (LAST in the struct, so old 4-field records decode
+        as ``bond_amount=0`` via the additive SCALE migration). The
+        slash watcher dispatcher gates on ``bond_amount > 0``;
+        unbonded rows are skipped before the L1 observation pass.
         """
         out: list[dict] = []
         try:
@@ -347,6 +355,11 @@ class SubstrateClient:
                         evidence.get("mainchain_genesis_hash")
                     ),
                     "voucher_digest": voucher_digest,
+                    # Task #84-watcher: surface the bond amount so the
+                    # slash watcher can gate on `bond_amount > 0`.
+                    # Pre-spec-225 rows decode as 0 via the additive
+                    # SCALE migration baked into spec-225.
+                    "bond_amount": int(record.get("bond_amount", 0) or 0),
                 })
             except (ValueError, TypeError, KeyError) as e:
                 logger.warning(
@@ -885,6 +898,158 @@ class SubstrateClient:
             f"attest_expire_policy_envelope gave up after "
             f"{self.config.tx_max_retries} attempts for "
             f"{intent_id.hex()[:16]}...: {last_error}"
+        )
+        return None
+
+    # --- Slash helpers (task #84-watcher) -----------------------------------
+    # spec-225 ships `slash_bad_settlement_evidence(claim_id, fraud_proof,
+    # signatures)` (call_index 20 in pallet-intent-settlement::lib.rs). The
+    # daemon-side slash_watcher module assembles the M-of-N FRAU envelope
+    # via the gateway aggregator and calls this helper to dispatch the
+    # extrinsic. Encoding maps the daemon's typed FraudProof variant
+    # (WrongAmount / TxNotFound / WrongBeneficiary) into the SCALE-encoded
+    # enum shape substrate-interface expects.
+
+    def submit_slash_bad_settlement_evidence(
+        self,
+        claim_id: bytes,
+        fraud_proof: Any,
+        sigs: list,  # list[tuple[bytes, bytes]]: (pubkey, sig)
+    ) -> Optional[str]:
+        """Submit ``IntentSettlement::slash_bad_settlement_evidence(
+        claim_id, fraud_proof, signatures)``.
+
+        ``fraud_proof`` is the daemon's typed FraudProof dataclass from
+        :mod:`daemon.slash_watcher` (one of ``WrongAmount(actual_lovelace)``,
+        ``TxNotFound()``, or ``WrongBeneficiary(actual_payment_hash)``).
+        It's converted here to the substrate-interface variant-dict shape
+        (``{"WrongAmount": {"actual_lovelace": int}}`` etc) — the encoder
+        on the wire matches the byte-exact form
+        :func:`daemon.slash_watcher.encode_fraud_proof` produces (the FRAU
+        digest builder uses the latter, so the signatures bind to the
+        same bytes the runtime decodes).
+
+        ``sigs`` is ``[(pubkey, sig), ...]``; the caller (the slash
+        watcher) is responsible for assembling, deduping, and sorting
+        the entries. The caller's own pubkey MUST appear in the
+        envelope or the pallet's caller-binding check rejects with
+        ``InsufficientSignatures``.
+
+        Returns the extrinsic hash on inclusion, None on any
+        non-success (including ``FraudThresholdNotMet`` /
+        ``InsufficientSignatures`` if too few sigs, or
+        ``FraudProofInvalid`` if the daemon's classifier got
+        out-of-step with chain state — the latter is a daemon bug
+        worth investigating in logs, but it's not retryable so we
+        return None for either).
+        """
+        # Lazy import keeps the slash_watcher module optional at
+        # daemon import-time. Older deploys without spec-225 wired
+        # can still load substrate_client without forcing the slash
+        # module into the import graph.
+        from daemon.slash_watcher import (
+            TxNotFound,
+            WrongAmount,
+            WrongBeneficiary,
+        )
+        if len(claim_id) != 32:
+            raise ValueError(f"claim_id must be 32 bytes, got {len(claim_id)}")
+        if not sigs:
+            raise ValueError("sigs must be non-empty")
+        for i, (pub, sig) in enumerate(sigs):
+            if len(pub) != 32:
+                raise ValueError(
+                    f"sigs[{i}].pubkey must be 32 bytes, got {len(pub)}"
+                )
+            if len(sig) != 64:
+                raise ValueError(
+                    f"sigs[{i}].sig must be 64 bytes, got {len(sig)}"
+                )
+        # Map the typed FraudProof to substrate-interface's enum-dict
+        # form. Variant names match the Rust enum (types.rs lines
+        # 448-464) — substrate-interface re-encodes them from the
+        # runtime metadata so the on-the-wire bytes match exactly
+        # what the pallet's FraudProof::decode expects.
+        if isinstance(fraud_proof, WrongAmount):
+            fraud_proof_param = {
+                "WrongAmount": {"actual_lovelace": int(fraud_proof.actual_lovelace)},
+            }
+        elif isinstance(fraud_proof, TxNotFound):
+            fraud_proof_param = "TxNotFound"
+        elif isinstance(fraud_proof, WrongBeneficiary):
+            if len(fraud_proof.actual_payment_hash) != 28:
+                raise ValueError(
+                    f"WrongBeneficiary.actual_payment_hash must be 28 "
+                    f"bytes, got {len(fraud_proof.actual_payment_hash)}"
+                )
+            fraud_proof_param = {
+                "WrongBeneficiary": {
+                    "actual_payment_hash": "0x"
+                    + bytes(fraud_proof.actual_payment_hash).hex(),
+                },
+            }
+        else:
+            raise TypeError(
+                f"submit_slash_bad_settlement_evidence: unknown "
+                f"FraudProof variant {type(fraud_proof).__name__}"
+            )
+        sigs_param = [
+            ("0x" + pub.hex(), "0x" + sig.hex()) for pub, sig in sigs
+        ]
+        last_error: Optional[str] = None
+        for attempt in range(self.config.tx_max_retries):
+            try:
+                call = self.substrate.compose_call(
+                    call_module="IntentSettlement",
+                    call_function="slash_bad_settlement_evidence",
+                    call_params={
+                        "claim_id": "0x" + claim_id.hex(),
+                        "fraud_proof": fraud_proof_param,
+                        "signatures": sigs_param,
+                    },
+                )
+                extrinsic = self.substrate.create_signed_extrinsic(
+                    call=call, keypair=self.keypair,
+                )
+                receipt = self.substrate.submit_extrinsic(
+                    extrinsic, wait_for_inclusion=True
+                )
+                if not receipt.is_success:
+                    last_error = str(receipt.error_message)
+                    logger.warning(
+                        f"slash_bad_settlement_evidence failed for "
+                        f"{claim_id.hex()[:16]}... (sigs={len(sigs)}): "
+                        f"{last_error}"
+                    )
+                    # Non-retryable: FraudProofInvalid / BondNotReserved
+                    # / FraudThresholdNotMet won't resolve on retry — the
+                    # caller treats None as terminal for this tick.
+                    return None
+                ext_hash = (
+                    getattr(receipt, "extrinsic_hash", None)
+                    or getattr(receipt, "block_hash", None)
+                    or ""
+                )
+                return str(ext_hash) if ext_hash else None
+            except SubstrateRequestException as e:
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"slash_bad_settlement_evidence attempt {attempt + 1} "
+                    f"raised: {e}"
+                )
+                if attempt < self.config.tx_max_retries - 1:
+                    time.sleep(2 ** attempt)
+            except Exception as e:  # noqa: BLE001
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(
+                    f"slash_bad_settlement_evidence unexpected error for "
+                    f"{claim_id.hex()[:16]}...: {e}"
+                )
+                return None
+        logger.error(
+            f"slash_bad_settlement_evidence gave up after "
+            f"{self.config.tx_max_retries} attempts for "
+            f"{claim_id.hex()[:16]}...: {last_error}"
         )
         return None
 

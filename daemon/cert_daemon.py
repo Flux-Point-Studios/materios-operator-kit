@@ -28,6 +28,10 @@ from daemon.expire_policy_attestor import (
     ExpirePolicyAttestor,
     maybe_create_expire_policy_attestor,
 )
+from daemon.slash_watcher import (
+    SlashWatcher,
+    maybe_create_slash_watcher,
+)
 from daemon import health_server
 from daemon.health_server import drain_notifications
 
@@ -182,6 +186,16 @@ class CertDaemon:
         # attest_expire_policy extrinsic submissions can't race the other
         # three submission paths on the signer's nonce.
         self.expire_policy_attestor: Optional[ExpirePolicyAttestor] = None
+        # Task #84-watcher — slash watcher for bonded
+        # ClaimSettlementRequests rows (fifth job type for the same
+        # sr25519 committee key, sister to settle_claim + expire_policy).
+        # Polls `ClaimSettlementRequests` for bonded rows, independently
+        # observes the Cardano tx, classifies fraud (TxNotFound /
+        # WrongAmount / WrongBeneficiary) and submits
+        # `slash_bad_settlement_evidence` via the M-sig aggregator.
+        # Reuses `_chain_write_lock` so the slash dispatch nonce stays
+        # monotonic against the other four submission paths.
+        self.slash_watcher: Optional[SlashWatcher] = None
 
     def _ensure_concurrency_primitives(self):
         """Lazy-init asyncio Lock / Semaphore inside the running event loop.
@@ -217,6 +231,11 @@ class CertDaemon:
         try:
             if self.expire_policy_attestor is not None:
                 self.expire_policy_attestor.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self.slash_watcher is not None:
+                self.slash_watcher.stop()
         except Exception:  # noqa: BLE001
             pass
 
@@ -928,6 +947,18 @@ class CertDaemon:
         )
         if self.expire_policy_attestor is not None:
             self.expire_policy_attestor.start()
+
+        # Task #84-watcher — slash watcher for bonded
+        # ClaimSettlementRequests. Soft-disabled when OGMIOS_URL or
+        # KUPO_URL is unset (same env-var gating). Shares the same
+        # chain_write_lock so the slash dispatch nonce stays
+        # monotonic across all five submission paths
+        # (receipt-cert, TEE-evidence, settle, expire, slash).
+        self.slash_watcher = maybe_create_slash_watcher(
+            self.config, self.client, self._chain_write_lock
+        )
+        if self.slash_watcher is not None:
+            self.slash_watcher.start()
 
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
 
