@@ -1509,6 +1509,103 @@ class TestKupoResponseShapeError:
         assert "kupo_response_shape_error" in (verdict.detail or "")
         client.submit_slash_bad_settlement_evidence.assert_not_called()
 
+    def test_kupo_mixed_int_and_string_coins_defers_not_wrong_amount_slash(self):
+        """Round-2 sec-review regression: a tx with MULTIPLE outputs
+        to the beneficiary where SOME have int-typed coins and OTHERS
+        have stringly-typed coins.
+
+        The parent observer's `isinstance(coins, int)` check at
+        `settle_claim_attestor.py:863-867` silently drops the stringly
+        outputs, producing a nonzero-but-undercounted
+        `matched_address_lovelace` (here: 3_000_000 from the int
+        output, vs 5_000_000 actually paid across both). Pre-round-2
+        the shape-check gate was conjoined with `matched == 0` and
+        bypassed this case, letting `classify_fraud` emit
+        `WrongAmount(actual_lovelace=3_000_000)` and slash an honest
+        requester. Post-fix the gate runs whenever the tx exists,
+        catches the stringly output, and defers.
+        """
+        observer = CardanoSlashObserver(
+            ogmios_url="http://ogmios.test:1337",
+            kupo_url="http://kupo.test",
+        )
+        observer._ogmios_rpc = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                {"slot": OBSERVED_SLOT + 1000, "id": "ff" * 32},
+                1_000_000,
+                {"era": "shelley", "networkMagic": 1, "network": "testnet"},
+            ]
+        )
+        bene_addr = _make_testnet_addr_with_payment_hash(BENE_HASH_28)
+        # TWO outputs to the SAME beneficiary — one with int coins
+        # (the parent observer counts this half = 3_000_000), the
+        # other stringly-typed (the parent observer silently drops
+        # this output). Honest requester paid 5_000_000 total.
+        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
+            return_value=[
+                _make_kupo_match(
+                    output_index=0, address=bene_addr, coins=3_000_000,
+                ),
+                _make_kupo_match(
+                    output_index=1, address=bene_addr, coins="2000000",
+                ),
+            ]
+        )
+
+        async def driver():
+            return await observer.observe(
+                CARDANO_TX_HASH.hex(), BENE_HASH_28,
+            )
+
+        obs = _run(driver())
+        # The parent observer counted only the int output.
+        assert obs.matched_address_lovelace == 3_000_000, (
+            f"parent observer should count only int-coins output; got "
+            f"matched_address_lovelace={obs.matched_address_lovelace}"
+        )
+        # The slash observer's shape-check MUST have fired despite
+        # `matched != 0`, surfacing the new mismatch tag.
+        assert "kupo_response_shape_error" in obs.mismatches, (
+            f"shape check must fire on mixed-coins beneficiary outputs "
+            f"regardless of matched_address_lovelace; got mismatches="
+            f"{obs.mismatches!r}"
+        )
+
+        # Honest requester's evidence claimed 5_000_000.
+        request = _default_pending_request()
+        # Sanity: pre-fix this would have emitted
+        # WrongAmount(actual_lovelace=3_000_000) because:
+        #   matched (3_000_000) != request.amount_lovelace (5_000_000)
+        # AND no `kupo_no_matches_for_tx` AND no shape-error tag.
+        # Post-fix the shape-error tag is present, so:
+        proof = classify_fraud(request, obs)
+        assert proof is None, (
+            f"classifier must defer when stringly-coins is detected "
+            f"on a beneficiary output, even when other outputs sum to "
+            f"nonzero; pre-fix would have emitted "
+            f"WrongAmount(actual_lovelace=3_000_000); got {proof!r}"
+        )
+
+        # End-to-end: dispatcher routes to OBSERVER_UNAVAILABLE, NOT
+        # to a slash dispatch.
+        client = _make_substrate_client_stub()
+        observer_stub = SimpleNamespace(
+            observe=AsyncMock(return_value=obs),
+            ogmios_url=observer.ogmios_url,
+            kupo_url=observer.kupo_url,
+        )
+        watcher = _make_watcher(
+            substrate_client=client, observer=observer_stub,
+        )
+        verdict = _run(
+            watcher.process_one(request, CHAIN_ID)
+        )
+        assert verdict.outcome == ClassifierOutcome.OBSERVER_UNAVAILABLE, (
+            f"dispatcher must DEFER (not slash) for mixed-coins "
+            f"beneficiary outputs; got {verdict.outcome!r}"
+        )
+        client.submit_slash_bad_settlement_evidence.assert_not_called()
+
 
 class TestFirstPaymentHashSkipsBeneficiary:
     """Vuln 2 — `_first_payment_hash` must FILTER OUT the expected

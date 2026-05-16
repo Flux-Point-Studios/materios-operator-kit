@@ -705,10 +705,20 @@ class CardanoSlashObserver(CardanoTxObserver):
         # output for the expected beneficiary has a non-int
         # `value.coins`, append the new mismatch tag and short-circuit
         # the actual-hash lookup.
-        if (
-            "kupo_no_matches_for_tx" not in slash_obs.mismatches
-            and slash_obs.matched_address_lovelace == 0
-        ):
+        #
+        # Round-2 sec-review fix: the gate runs whenever the tx
+        # exists (no `kupo_no_matches_for_tx`), NOT only when
+        # `matched_address_lovelace == 0`. Previously the `== 0`
+        # conjunct meant a tx with MULTIPLE beneficiary outputs —
+        # some int-typed and some stringly-typed — bypassed this
+        # check (matched != 0 from the int-typed half), letting the
+        # downstream classifier emit a false-positive
+        # `WrongAmount(actual=undercounted_sum)` slash against an
+        # honest requester. Running the shape check on every
+        # classify-bound observation closes that hole; the wrapper
+        # iterates only the beneficiary-matching outputs so the cost
+        # stays bounded.
+        if "kupo_no_matches_for_tx" not in slash_obs.mismatches:
             shape_error = await self._kupo_response_has_shape_error(
                 cardano_tx_hash_hex,
                 expected_beneficiary_blake2_224,
