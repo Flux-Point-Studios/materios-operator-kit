@@ -119,12 +119,66 @@ def _make_substrate_mock(
 
 
 def _make_client_mock(substrate=None) -> MagicMock:
+    """Mock of ``SubstrateClient``.
+
+    After task #288 the evidence_submitter calls the bounded-timeout
+    wrappers on ``client`` directly (``client.compose_call``,
+    ``client.submit_extrinsic``, etc.) instead of ``client.substrate.X``.
+    We wire those wrappers to delegate to the underlying ``substrate``
+    mock so existing assertions on ``substrate.compose_call.call_args``
+    still see the same calls.
+    """
     client = MagicMock()
-    client.substrate = substrate or _make_substrate_mock()
+    si = substrate or _make_substrate_mock()
+    client.substrate = si
     client.keypair = SimpleNamespace(
         ss58_address=ATTESTOR_SS58,
         public_key=b"\xaa" * 32,
     )
+
+    # Route the new bounded-timeout wrapper methods back to the underlying
+    # substrate mock so test assertions on `substrate.compose_call.call_args`
+    # / `substrate.submit_extrinsic.call_args` still match.
+    client.compose_call = MagicMock(side_effect=lambda **kw: si.compose_call(**kw))
+    client.create_signed_extrinsic = MagicMock(
+        side_effect=lambda **kw: si.create_signed_extrinsic(**kw)
+    )
+    client.submit_extrinsic = MagicMock(
+        side_effect=lambda extrinsic, wait_for_inclusion=True: si.submit_extrinsic(
+            extrinsic, wait_for_inclusion=wait_for_inclusion
+        )
+    )
+    client.encode_scale = MagicMock(
+        side_effect=lambda type_string, value: si.encode_scale(
+            type_string=type_string, value=value
+        )
+    )
+
+    # get_receipt_content_hash delegates to substrate.query of the
+    # Receipts storage map. Mirror the production helper's logic.
+    def _get_receipt_content_hash(receipt_id_hex):
+        rid = receipt_id_hex if receipt_id_hex.startswith("0x") else "0x" + receipt_id_hex
+        try:
+            result = si.query(
+                module="OrinqReceipts", storage_function="Receipts", params=[rid]
+            )
+        except Exception:
+            return None
+        if result is None or result.value is None:
+            return None
+        ch = result.value.get("content_hash")
+        if ch is None:
+            return None
+        if isinstance(ch, str):
+            s = ch[2:] if ch.startswith("0x") else ch
+            return bytes.fromhex(s)
+        if isinstance(ch, (list, tuple)):
+            return bytes(ch)
+        if isinstance(ch, (bytes, bytearray)):
+            return bytes(ch)
+        return None
+
+    client.get_receipt_content_hash = MagicMock(side_effect=_get_receipt_content_hash)
     return client
 
 

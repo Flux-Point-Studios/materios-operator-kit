@@ -44,6 +44,19 @@ _metrics = {
     "substrate_connected": False,
     "finalized_head": 0,
     "finality_gap": 0,
+    # Bounded-timeout + auto-reconnect wrapper metrics (tasks #288 + #156).
+    # ``ws_rpc_timeouts_total``       — total RPC calls that exceeded the
+    #                                   bounded timeout budget.
+    # ``ws_force_reconnects_total``   — successful force-replaces of the
+    #                                   SubstrateInterface after the
+    #                                   consecutive-timeout threshold tripped.
+    # ``ws_consecutive_reconnect_failures`` — current streak of failed
+    #                                   reconnect attempts. Gauge — 0 means
+    #                                   we're online or the last reconnect
+    #                                   succeeded.
+    "ws_rpc_timeouts_total": 0,
+    "ws_force_reconnects_total": 0,
+    "ws_consecutive_reconnect_failures": 0,
 }
 _metrics_lock = threading.Lock()
 
@@ -87,14 +100,33 @@ class HealthHandler(BaseHTTPRequestHandler):
         with _metrics_lock:
             connected = _metrics["substrate_connected"]
             last_poll = _metrics["last_poll_timestamp"]
+            ws_timeouts = _metrics.get("ws_rpc_timeouts_total", 0)
+            ws_reconnects = _metrics.get("ws_force_reconnects_total", 0)
+            ws_reconnect_failures = _metrics.get(
+                "ws_consecutive_reconnect_failures", 0
+            )
         # Ready if connected and polled within last 2 intervals (24s)
         recent = (time.time() - last_poll) < 24 if last_poll > 0 else False
+        # Surface the WS-wrapper metrics in /ready so operators can see at
+        # a glance how often the inner reconnect logic is doing the work
+        # the outer container-restart watchdog used to do. The values are
+        # included on BOTH success and failure paths.
+        ws_block = {
+            "ws_rpc_timeouts_total": ws_timeouts,
+            "ws_force_reconnects_total": ws_reconnects,
+            "ws_consecutive_reconnect_failures": ws_reconnect_failures,
+        }
         if connected and recent:
             self.send_response(200)
-            body = {"status": "ready"}
+            body = {"status": "ready", **ws_block}
         else:
             self.send_response(503)
-            body = {"status": "not_ready", "connected": connected, "last_poll_age": time.time() - last_poll}
+            body = {
+                "status": "not_ready",
+                "connected": connected,
+                "last_poll_age": time.time() - last_poll,
+                **ws_block,
+            }
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(body).encode())

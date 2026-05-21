@@ -800,7 +800,10 @@ class CertDaemon:
         """
         try:
             my_address = self.client.keypair.ss58_address
-            committee = self.client.substrate.query("OrinqReceipts", "CommitteeMembers")
+            # Route through the bounded-timeout wrapper (task #288) — a
+            # wedged WS during ``_ensure_committee_membership`` used to be
+            # one of the recurring crashloop modes.
+            committee = self.client.get_committee_members()
 
             # Check if we're already a member (handle different SS58 prefixes)
             my_pubkey = self.client.keypair.public_key.hex()
@@ -830,18 +833,7 @@ class CertDaemon:
 
             bond_retry_used = False
             for attempt in range(2):  # at most: original attempt + 1 bond-fallback
-                call = self.client.substrate.compose_call(
-                    call_module="OrinqReceipts",
-                    call_function="join_committee",
-                    call_params={},
-                )
-                extrinsic = self.client.substrate.create_signed_extrinsic(
-                    call=call,
-                    keypair=self.client.keypair,
-                )
-                receipt = self.client.substrate.submit_extrinsic(
-                    extrinsic, wait_for_inclusion=True
-                )
+                receipt = self.client.submit_join_committee()
 
                 if receipt.is_success:
                     logger.info(f"Successfully joined attestation committee!")
