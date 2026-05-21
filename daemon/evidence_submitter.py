@@ -590,7 +590,10 @@ class EvidenceSubmitter:
         receipt_id_param = (
             receipt_id_hex if receipt_id_hex.startswith("0x") else "0x" + receipt_id_hex
         )
-        call = self.client.substrate.compose_call(
+        # Route through the SubstrateClient's bounded-timeout wrapper —
+        # ``compose_call`` is a metadata-dependent path that can touch
+        # the WS for missing-runtime cache lookups (task #288 / #156).
+        call = self.client.compose_call(
             call_module="TeeAttestation",
             call_function="submit_evidence",
             call_params={
@@ -622,10 +625,10 @@ class EvidenceSubmitter:
         evidence_type = str(row["evidence_type"])
         payload = row.get("payload") or {}
 
-        # 1. Resolve content_hash from chain receipt.
-        content_hash = _content_hash_from_receipt_id_via_chain(
-            self.client.substrate, receipt_id_hex
-        )
+        # 1. Resolve content_hash from chain receipt. Routes through the
+        # SubstrateClient's bounded-timeout wrapper (task #288 + #156) so
+        # a wedged WS can't strand the evidence-submission path.
+        content_hash = self.client.get_receipt_content_hash(receipt_id_hex)
         if content_hash is None:
             logger.info(
                 f"evidence_submitter: row {row_id} receipt "
@@ -637,6 +640,13 @@ class EvidenceSubmitter:
         # NotImplementedError and shape-validation ValueError are TERMINAL —
         # the gateway row's bytes won't morph into something the pallet
         # accepts on retry, so record the local skip-bit.
+        # NOTE: passes the raw ``self.client.substrate`` because the
+        # payload assembly's ``encode_scale`` is a SCALE-encoding CPU
+        # path, not a network RPC. The SI's metadata cache lookup that
+        # backs it never blocks on the WS. If a chain reset wipes the
+        # metadata mid-call, the resulting exception is caught by the
+        # ``except Exception`` block below and the row is correctly
+        # marked terminal.
         try:
             payload_bytes = _build_evidence_payload_bytes(
                 self.client.substrate, evidence_type, payload
@@ -684,24 +694,29 @@ class EvidenceSubmitter:
 
         # 3. Compose + sign + submit. Hold the chain-write lock for the full
         # nonce + sign + submit triplet (per
-        # feedback_polkadot_nonce_race_on_burst.md).
+        # feedback_polkadot_nonce_race_on_burst.md). Compose / sign / submit
+        # each go through the SubstrateClient wrapper so a wedged WS can't
+        # silently stall an evidence row past the outer-watchdog threshold
+        # (task #156).
         async with self._chain_write_lock:
             try:
                 call = self._compose_submit_evidence_call(
                     receipt_id_hex, content_hash, evidence_type, payload_bytes
                 )
-                extrinsic = self.client.substrate.create_signed_extrinsic(
+                extrinsic = self.client.create_signed_extrinsic(
                     call=call, keypair=self.client.keypair
                 )
                 receipt = await asyncio.to_thread(
-                    self.client.substrate.submit_extrinsic,
+                    self.client.submit_extrinsic,
                     extrinsic,
                     True,  # wait_for_inclusion
                 )
             except Exception as e:  # noqa: BLE001
                 # Compose/submit raise on transport / nonce / encoding
                 # failures. These are usually transient (RPC hiccup, txpool
-                # full, etc.) — keep them retryable.
+                # full, etc.) — keep them retryable. RPCTimeoutError lands
+                # here too — the wrapper has already triggered a force-
+                # reconnect by then.
                 logger.warning(
                     f"evidence_submitter: row {row_id} compose/submit raised: "
                     f"{type(e).__name__}: {e}"

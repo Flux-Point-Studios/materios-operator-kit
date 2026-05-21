@@ -56,6 +56,16 @@ services:
       FINALITY_CONFIRMATIONS: "4"
       MAX_LEAF_WAIT_SECONDS: "90"
 
+      ## ─── Substrate RPC bounded-timeout knobs (tasks #288 + #156) ────
+      ## Hard cap on any single substrate-interface RPC call. If a call
+      ## exceeds this budget the daemon-side wrapper raises a timeout
+      ## error rather than letting the wedged WS hang forever. Defaults
+      ## are conservative and rarely need tuning — only bump if your
+      ## upstream node is consistently slow.
+      MATERIOS_RPC_TIMEOUT_SECS: "30"
+      MATERIOS_RPC_RECONNECT_AFTER_TIMEOUTS: "2"
+      MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS: "8"
+
     volumes:
       - cert-daemon-data:/data
     ports:

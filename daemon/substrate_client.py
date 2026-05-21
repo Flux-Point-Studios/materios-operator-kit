@@ -1,10 +1,13 @@
 import logging
+import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.exceptions import SubstrateRequestException
 
+from daemon import health_server
 from daemon.config import DaemonConfig
 from daemon.models import ReceiptRecord
 from daemon.voucher_canonicalize import (
@@ -14,6 +17,73 @@ from daemon.voucher_canonicalize import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Bounded-timeout + auto-reconnect wrapper for substrate-interface
+# (tasks #288 + #156).
+#
+# Why this exists: substrate-interface 1.x is built on the blocking
+# ``websocket-client`` library. After multi-hour uptime (correlates with
+# multi-minute extrinsic phases where the WS sits idle), the underlying
+# socket enters a state where ``recv()`` blocks past any timeout passed to
+# it. No exception fires. The Python call sits indefinitely. Watchdog
+# evidence from 2026-05-21 shows ~5 outer-container restarts in 9 hours
+# triggered by this wedge.
+#
+# The wrapper enforces three contracts:
+#   1. Every RPC method call runs inside a ``ThreadPoolExecutor`` worker
+#      thread; the calling thread sees ``RPCTimeoutError`` if the call
+#      exceeds ``MATERIOS_RPC_TIMEOUT_SECS`` (default 30s). The worker
+#      thread is daemonised — if the socket recv never returns, the
+#      thread leaks at most one Python thread per timeout, which is
+#      cheap (the OS reaps the underlying fd when the new SI replaces it).
+#   2. After ``MATERIOS_RPC_RECONNECT_AFTER_TIMEOUTS`` consecutive
+#      timeouts (default 2) the wrapper closes the current SI's websocket
+#      and constructs a new SI. A successful call resets the streak.
+#   3. Reconnect failures retry with exponential backoff: 1s, 2s, 4s, 8s,
+#      16s, then capped at 30s. The streak gauge surfaces to /metrics.
+#
+# Metrics surfaced on success/failure:
+#   - cert_daemon_ws_rpc_timeouts_total (counter)
+#   - cert_daemon_ws_force_reconnects_total (counter)
+#   - cert_daemon_ws_consecutive_reconnect_failures (gauge)
+#   - last_poll_timestamp bumped on every success
+# ---------------------------------------------------------------------------
+
+
+class RPCTimeoutError(Exception):
+    """Raised when an RPC method call exceeds the bounded-timeout budget.
+
+    A daemon-side wrapper type so callers can catch this specifically and
+    react (retry, log, drop pending row, etc.) without coupling to the
+    threading impl detail.
+    """
+
+
+def _read_float_env(name: str, default: float) -> float:
+    """Parse a float env var, falling back to ``default`` on missing or
+    malformed input. Used for tunable budgets like ``MATERIOS_RPC_TIMEOUT_SECS``.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = int(raw)
+        return v if v > 0 else default
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -146,35 +216,301 @@ class SubstrateClient:
         self.config = config
         self.substrate: Optional[SubstrateInterface] = None
         self.keypair = Keypair.create_from_uri(config.signer_uri)
+        # Bounded-timeout + reconnect knobs (tasks #288 + #156). Each is
+        # overridable via env so operators can tune in prod without a
+        # re-deploy; the defaults are conservative.
+        #
+        # The default 30s timeout is set well above ``wait_for_inclusion``
+        # block time (~6s per block, occasional 12s tip lag) so legitimate
+        # extrinsic submits don't false-alarm — but well below the
+        # outer-watchdog's 180s STALE_THRESHOLD so the wedge is broken
+        # before the container restarts.
+        self._rpc_timeout_secs: float = _read_float_env(
+            "MATERIOS_RPC_TIMEOUT_SECS", 30.0
+        )
+        self._reconnect_after_timeouts: int = _read_int_env(
+            "MATERIOS_RPC_RECONNECT_AFTER_TIMEOUTS", 2
+        )
+        # Hard cap on reconnect attempts in a single force-replace cycle.
+        # Without this, a persistent network outage could spin the
+        # backoff loop forever. After the cap is hit the wrapper bails
+        # with the latest constructor error; the next user-call kicks
+        # off a fresh cycle.
+        self._reconnect_max_attempts: int = _read_int_env(
+            "MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS", 8
+        )
+        self._consecutive_timeouts: int = 0
+        self._consecutive_reconnect_failures: int = 0
+        # Each ``_call`` dispatches its work on a fresh daemon thread.
+        # We can't reuse a single-worker pool — a wedged thread would
+        # block all subsequent calls (the very problem we're fixing).
+        # We can't bound a multi-worker pool either — wedged threads
+        # leak, and a bounded pool would eventually starve. A fresh
+        # ``threading.Thread`` per call is the cheapest correct option:
+        # Python threads cost ~8KB each, and the wedged-thread count
+        # is bounded by the timeout frequency × the OS's open-fd cap
+        # (i.e. it's self-limiting in practice — the OS reaps the
+        # underlying socket when ``close()`` is called on the SI).
+        #
+        # Guards ``self.substrate`` replacement during reconnect. RPC
+        # calls take this in shared mode (the bookkeeping is read-then-
+        # write of a few ints) so the force-replace path can swap the
+        # SI without racing.
+        self._reconnect_lock: threading.RLock = threading.RLock()
+        # Injectable so backoff tests can run instantaneously.
+        self._backoff_sleep = time.sleep
 
     def connect(self) -> bool:
+        """Open the initial SubstrateInterface connection.
+
+        Subsequent forced reconnects go through ``_force_replace_substrate_interface``
+        which shares the same constructor helper.
+        """
         try:
-            self.substrate = SubstrateInterface(url=self.config.rpc_url, config={'strict_scale_decode': False})
-            logger.info(f"Connected to {self.config.rpc_url}, chain: {self.substrate.chain}")
+            self.substrate = self._create_substrate_interface()
+            logger.info(
+                f"Connected to {self.config.rpc_url}, chain: {self.substrate.chain}"
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to connect to substrate: {e}")
             self.substrate = None
             return False
 
+    def _create_substrate_interface(self) -> SubstrateInterface:
+        """Single chokepoint for SubstrateInterface construction.
+
+        Tests patch this method to inject fakes / failure modes without
+        dialling a real websocket. Production behavior matches the prior
+        inlined construction (``strict_scale_decode=False`` is required so
+        the daemon stays forgiving of optional / additive SCALE schema
+        fields across chain spec versions).
+        """
+        return SubstrateInterface(
+            url=self.config.rpc_url, config={"strict_scale_decode": False}
+        )
+
     @property
     def connected(self) -> bool:
         return self.substrate is not None
 
+    # --- Bounded-timeout RPC wrapper (tasks #288 + #156) ---------------------
+
+    def _ensure_wrapper_state(self) -> None:
+        """Lazy-init the WSGuard fields if they're missing.
+
+        Some test fixtures construct ``SubstrateClient`` via ``__new__`` to
+        bypass ``__init__`` (so they don't need a Keypair / real config);
+        such fixtures rely on the wrapper to set up its own state on first
+        call. Production startup goes through ``__init__`` and these
+        fields are already set — the check is cheap.
+        """
+        if not hasattr(self, "_reconnect_lock"):
+            self._reconnect_lock = threading.RLock()
+        if not hasattr(self, "_rpc_timeout_secs"):
+            self._rpc_timeout_secs = _read_float_env(
+                "MATERIOS_RPC_TIMEOUT_SECS", 30.0
+            )
+        if not hasattr(self, "_reconnect_after_timeouts"):
+            self._reconnect_after_timeouts = _read_int_env(
+                "MATERIOS_RPC_RECONNECT_AFTER_TIMEOUTS", 2
+            )
+        if not hasattr(self, "_reconnect_max_attempts"):
+            self._reconnect_max_attempts = _read_int_env(
+                "MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS", 8
+            )
+        if not hasattr(self, "_consecutive_timeouts"):
+            self._consecutive_timeouts = 0
+        if not hasattr(self, "_consecutive_reconnect_failures"):
+            self._consecutive_reconnect_failures = 0
+        if not hasattr(self, "_backoff_sleep"):
+            self._backoff_sleep = time.sleep
+
+    def _call(self, method_name: str, *args, **kwargs) -> Any:
+        """Invoke ``self.substrate.<method_name>(*args, **kwargs)`` under a
+        bounded timeout. If the call exceeds the budget we raise
+        :class:`RPCTimeoutError`; consecutive timeouts trigger a force-
+        replace of the underlying ``SubstrateInterface``.
+
+        On every success we bump ``health_server.update_metrics(
+        last_poll_timestamp=time.time())`` so the outer watchdog's
+        ``/ready last_poll_age`` reflects the freshest chain interaction
+        (it used to only reflect the poll-loop outer tick, which meant
+        a wedged single RPC could fail to update health for 180s+).
+
+        Threading model: each call runs on a fresh daemonised thread.
+        When the call wedges, the daemon-side wrapper raises
+        ``RPCTimeoutError`` and abandons the worker. The wedged thread
+        eventually exits when the OS reaps the underlying socket (which
+        happens when ``self.substrate.close()`` runs in the force-replace
+        path). At process exit, all daemonised threads die regardless.
+        """
+        self._ensure_wrapper_state()
+        with self._reconnect_lock:
+            si = self.substrate
+        if si is None:
+            # Defensive: the daemon's `_running` loop calls `connect()`
+            # before any RPC; if we land here the wrapper still must
+            # not block — bail loudly.
+            raise RPCTimeoutError(
+                f"_call({method_name!r}) invoked with no live SubstrateInterface"
+            )
+
+        result_holder: dict[str, Any] = {}
+
+        def _invoke():
+            try:
+                method = getattr(si, method_name)
+                result_holder["ok"] = method(*args, **kwargs)
+            except BaseException as e:  # noqa: BLE001
+                result_holder["err"] = e
+
+        worker = threading.Thread(
+            target=_invoke,
+            name=f"substrate-rpc-{method_name}",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=self._rpc_timeout_secs)
+        if worker.is_alive():
+            # Thread still running past the budget — abandon it and report
+            # timeout. The thread will die when the OS reaps the socket fd
+            # (close() in force-replace) or at process exit.
+            self._on_rpc_timeout(method_name)
+            raise RPCTimeoutError(
+                f"RPC {method_name!r} exceeded {self._rpc_timeout_secs:.1f}s budget"
+            )
+        if "err" in result_holder:
+            # Any other exception (SubstrateRequestException, ValueError,
+            # etc.) is the underlying call's verdict — surface as-is so
+            # existing `except` clauses still match. Real exceptions do
+            # NOT count toward the consecutive-timeout streak.
+            raise result_holder["err"]
+        self._on_rpc_success()
+        return result_holder.get("ok")
+
+    def _on_rpc_success(self) -> None:
+        """Reset the consecutive-timeout streak and bump health_last_poll."""
+        self._consecutive_timeouts = 0
+        try:
+            health_server.update_metrics(last_poll_timestamp=time.time())
+        except Exception:
+            # Never let a metrics bump kill a successful RPC.
+            pass
+
+    def _on_rpc_timeout(self, method_name: str) -> None:
+        """Bookkeeping for a timed-out call: bump counters, possibly trigger
+        a force-replace of the SI."""
+        self._consecutive_timeouts += 1
+        try:
+            health_server.increment_metric("ws_rpc_timeouts_total")
+        except Exception:
+            pass
+        logger.warning(
+            f"substrate RPC {method_name!r} timed out after "
+            f"{self._rpc_timeout_secs:.1f}s (consecutive={self._consecutive_timeouts})"
+        )
+        if self._consecutive_timeouts >= self._reconnect_after_timeouts:
+            self._force_replace_substrate_interface()
+
+    def _force_replace_substrate_interface(self) -> None:
+        """Close the current SI's websocket and construct a new one.
+
+        Exponential backoff between failed reconnects: 1, 2, 4, 8, 16, 30
+        (capped). After ``self._reconnect_max_attempts`` failures we
+        return without a working SI — the next user-call kicks off a
+        fresh cycle. The consecutive-timeout streak is reset on the way
+        out so the next RPC starts clean (success OR another reconnect
+        cycle from scratch).
+        """
+        old_si = self.substrate
+        # Best-effort close on the dead WS. Failures here are ignored —
+        # the underlying socket is already in an unknown state.
+        if old_si is not None:
+            try:
+                old_si.close()
+            except Exception as e:  # noqa: BLE001
+                logger.info(
+                    f"force-replace: old SI close() raised "
+                    f"{type(e).__name__}: {e}; continuing"
+                )
+        self.substrate = None
+        # Reset the timeout streak whether or not the reconnect succeeds —
+        # we don't want a still-wedged WS to keep stacking force-replace
+        # attempts in a single call.
+        self._consecutive_timeouts = 0
+        attempt = 0
+        while attempt < self._reconnect_max_attempts:
+            try:
+                new_si = self._create_substrate_interface()
+            except Exception as e:  # noqa: BLE001
+                self._consecutive_reconnect_failures += 1
+                try:
+                    health_server.update_metrics(
+                        ws_consecutive_reconnect_failures=self._consecutive_reconnect_failures
+                    )
+                except Exception:
+                    pass
+                # Backoff: 1, 2, 4, 8, 16, then 30s cap.
+                # ``2 ** (n-1)`` for n=1..5 = 1, 2, 4, 8, 16; clamped at 30.
+                delay = min(30, 1 << (self._consecutive_reconnect_failures - 1))
+                logger.warning(
+                    f"force-replace: SubstrateInterface ctor failed "
+                    f"(attempt {attempt + 1}/{self._reconnect_max_attempts}, "
+                    f"streak={self._consecutive_reconnect_failures}): "
+                    f"{type(e).__name__}: {e}; sleeping {delay}s"
+                )
+                self._backoff_sleep(delay)
+                attempt += 1
+                continue
+            # Success.
+            self.substrate = new_si
+            try:
+                health_server.increment_metric("ws_force_reconnects_total")
+                health_server.update_metrics(
+                    ws_consecutive_reconnect_failures=0,
+                    substrate_connected=True,
+                )
+            except Exception:
+                pass
+            self._consecutive_reconnect_failures = 0
+            logger.warning(
+                f"force-replace: new SubstrateInterface online "
+                f"(chain={getattr(new_si, 'chain', '?')})"
+            )
+            return
+        # Bailed without a working SI. The next user-call enters _call,
+        # finds substrate is None, and raises RPCTimeoutError — the
+        # caller will retry on its own schedule (cert_daemon poll loop,
+        # evidence_submitter tick, etc.).
+        try:
+            health_server.update_metrics(
+                ws_consecutive_reconnect_failures=self._consecutive_reconnect_failures,
+                substrate_connected=False,
+            )
+        except Exception:
+            pass
+        logger.error(
+            f"force-replace: gave up after {self._reconnect_max_attempts} "
+            f"attempts; substrate remains disconnected (streak="
+            f"{self._consecutive_reconnect_failures}). Next user-call "
+            f"will retry."
+        )
+
     def get_finalized_head_number(self) -> int:
-        head_hash = self.substrate.get_chain_finalised_head()
-        header = self.substrate.get_block_header(head_hash)
+        head_hash = self._call("get_chain_finalised_head")
+        header = self._call("get_block_header", head_hash)
         return header["header"]["number"]
 
     def get_best_block_number(self) -> int:
-        header = self.substrate.get_block_header()
+        header = self._call("get_block_header")
         return header["header"]["number"]
 
     def get_genesis_hash(self) -> str:
         """Return the chain's genesis hash (0x-prefixed lowercase hex). Used to
         detect that we're pointed at a different chain than we were last run
         (e.g. a chain reset) and self-heal stale daemon state."""
-        return self.substrate.get_block_hash(0)
+        return self._call("get_block_hash", 0)
 
     # --- Bond helpers (OrinqReceipts pallet) --------------------------------
     # These are used by CertDaemon._ensure_bond() to keep the attestor's
@@ -187,7 +523,7 @@ class SubstrateClient:
         Returns 0 when the storage item is absent (pre-runtime-upgrade chains)
         so `_ensure_bond()` falls through to its "nothing to do" branch.
         """
-        result = self.substrate.query("OrinqReceipts", "BondRequirement")
+        result = self._call("query", "OrinqReceipts", "BondRequirement")
         val = result.value
         if val is None:
             return 0
@@ -200,7 +536,7 @@ class SubstrateClient:
         `ValueQuery` so the runtime returns 0 in that case; we defensively
         handle a missing value anyway).
         """
-        result = self.substrate.query("OrinqReceipts", "AttestorBonds", [address])
+        result = self._call("query", "OrinqReceipts", "AttestorBonds", [address])
         val = result.value
         if val is None:
             return 0
@@ -211,7 +547,7 @@ class SubstrateClient:
 
         Returns 0 if the account row does not exist (never received MATRA).
         """
-        result = self.substrate.query("System", "Account", [address])
+        result = self._call("query", "System", "Account", [address])
         val = result.value
         if val is None:
             return 0
@@ -221,6 +557,118 @@ class SubstrateClient:
         except (KeyError, TypeError):
             return 0
 
+    def get_receipt_content_hash(self, receipt_id_hex: str) -> Optional[bytes]:
+        """Return ``OrinqReceipts.Receipts(receipt_id).content_hash`` as raw
+        bytes, or None if the receipt isn't on chain yet.
+
+        Used by ``daemon.evidence_submitter`` (task #156) to recover the
+        32-byte content_hash for ``TeeAttestation.submit_evidence`` —
+        ``receipt_id == sha256(content_hash)`` is one-way so we have to
+        read it back from chain.
+
+        Routes through the bounded-timeout wrapper so a wedged WS can't
+        strand the evidence-submission path (task #288 / #156). Returns
+        None on any error including RPCTimeoutError — the caller's
+        next-tick retry path covers transient misses.
+        """
+        try:
+            rid = (
+                receipt_id_hex
+                if receipt_id_hex.startswith("0x")
+                else "0x" + receipt_id_hex
+            )
+            result = self._call(
+                "query",
+                module="OrinqReceipts",
+                storage_function="Receipts",
+                params=[rid],
+            )
+            if result is None or result.value is None:
+                return None
+            ch = result.value.get("content_hash")
+            if ch is None:
+                return None
+            if isinstance(ch, str):
+                s = ch[2:] if ch.startswith("0x") else ch
+                return bytes.fromhex(s)
+            if isinstance(ch, (list, tuple)):
+                return bytes(ch)
+            if isinstance(ch, (bytes, bytearray)):
+                return bytes(ch)
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"get_receipt_content_hash: failed to resolve "
+                f"receipt_id={receipt_id_hex[:16]}...: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
+
+    def compose_call(self, **kwargs):
+        """Thin bounded-timeout wrapper over ``self.substrate.compose_call``.
+
+        Exposed for callers in :mod:`daemon.evidence_submitter` that build
+        their own extrinsics outside this module's typed helpers (task #156).
+        Returns the SCALE-encoded call object as-is.
+        """
+        return self._call("compose_call", **kwargs)
+
+    def create_signed_extrinsic(self, **kwargs):
+        """Sister wrapper to :meth:`compose_call`; bounded-timeout-wrap."""
+        return self._call("create_signed_extrinsic", **kwargs)
+
+    def submit_extrinsic(self, extrinsic, wait_for_inclusion: bool = True):
+        """Sister wrapper to :meth:`compose_call`; bounded-timeout-wrap."""
+        return self._call(
+            "submit_extrinsic", extrinsic, wait_for_inclusion=wait_for_inclusion
+        )
+
+    def encode_scale(self, *, type_string: str, value: Any) -> Any:
+        """Wrap ``self.substrate.encode_scale`` so external SCALE-encoding
+        callers (e.g. evidence_submitter's payload builder) inherit the
+        bounded-timeout safety.
+
+        ``encode_scale`` is a CPU-only operation in normal flows, but it
+        does dispatch through the same SI which holds the metadata cache
+        — if the SI itself is in a partially-collapsed state any call
+        through it can hang. Cheap to wrap; large upside.
+        """
+        return self._call("encode_scale", type_string=type_string, value=value)
+
+    def get_committee_members(self):
+        """Return ``OrinqReceipts.CommitteeMembers`` storage as-is.
+
+        Cert-daemon's ``_ensure_committee_membership`` uses the result for
+        membership-check iteration. Routes through the bounded-timeout
+        wrapper so a wedged WS can't strand the join-committee path
+        forever — same wedge class as the poll loop (task #288).
+        """
+        return self._call("query", "OrinqReceipts", "CommitteeMembers")
+
+    def submit_join_committee(self):
+        """Submit ``OrinqReceipts.join_committee()`` and return the included
+        extrinsic receipt. Returns the receipt unchanged so the caller can
+        inspect ``is_success`` + ``error_message`` (the join path needs
+        per-error branching that's specific to cert_daemon).
+
+        Routes through the wrapper for the same reason as
+        :meth:`get_committee_members` — task #288.
+        """
+        call = self._call(
+            "compose_call",
+            call_module="OrinqReceipts",
+            call_function="join_committee",
+            call_params={},
+        )
+        extrinsic = self._call(
+            "create_signed_extrinsic",
+            call=call,
+            keypair=self.keypair,
+        )
+        return self._call(
+            "submit_extrinsic", extrinsic, wait_for_inclusion=True
+        )
+
     def submit_bond(self, amount: int) -> tuple[bool, Optional[str]]:
         """Submit `OrinqReceipts.bond(amount)` as a signed extrinsic.
 
@@ -228,16 +676,18 @@ class SubstrateClient:
         otherwise. Raises on unrecoverable exceptions — callers should wrap in
         try/except to avoid killing daemon startup on transient RPC errors.
         """
-        call = self.substrate.compose_call(
+        call = self._call(
+            "compose_call",
             call_module="OrinqReceipts",
             call_function="bond",
             call_params={"amount": amount},
         )
-        extrinsic = self.substrate.create_signed_extrinsic(
+        extrinsic = self._call(
+            "create_signed_extrinsic",
             call=call,
             keypair=self.keypair,
         )
-        receipt = self.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
+        receipt = self._call("submit_extrinsic", extrinsic, wait_for_inclusion=True)
         if receipt.is_success:
             logger.info(
                 f"Bond of {amount} base units posted successfully, "
@@ -295,7 +745,8 @@ class SubstrateClient:
         """
         out: list[dict] = []
         try:
-            rows = self.substrate.query_map(
+            rows = self._call(
+                "query_map",
                 module="IntentSettlement",
                 storage_function="ClaimSettlementRequests",
             )
@@ -391,17 +842,17 @@ class SubstrateClient:
         ``query``.
         """
         try:
-            chain_id_const = self.substrate.get_constant(
-                "IntentSettlement", "MateriosChainId"
+            chain_id_const = self._call(
+                "get_constant", "IntentSettlement", "MateriosChainId"
             )
-            network_magic_const = self.substrate.get_constant(
-                "IntentSettlement", "NetworkMagic"
+            network_magic_const = self._call(
+                "get_constant", "IntentSettlement", "NetworkMagic"
             )
-            script_hash_const = self.substrate.get_constant(
-                "IntentSettlement", "AegisPolicyV1ScriptHash"
+            script_hash_const = self._call(
+                "get_constant", "IntentSettlement", "AegisPolicyV1ScriptHash"
             )
-            settlement_version_const = self.substrate.get_constant(
-                "IntentSettlement", "SettlementVersion"
+            settlement_version_const = self._call(
+                "get_constant", "IntentSettlement", "SettlementVersion"
             )
         except Exception as e:  # noqa: BLE001
             logger.info(
@@ -490,7 +941,8 @@ class SubstrateClient:
         claim_param = "0x" + claim_id.hex()
         # Path 1: dedicated VoucherDigests map (forward-compat).
         try:
-            result = self.substrate.query(
+            result = self._call(
+                "query",
                 module="IntentSettlement",
                 storage_function="VoucherDigests",
                 params=[claim_param],
@@ -514,7 +966,8 @@ class SubstrateClient:
         # Read Voucher row once; both path-2 (voucher_digest field) and
         # path-3 (derive-from-state) consume it.
         try:
-            result = self.substrate.query(
+            result = self._call(
+                "query",
                 module="IntentSettlement",
                 storage_function="Vouchers",
                 params=[claim_param],
@@ -609,7 +1062,8 @@ class SubstrateClient:
         """
         claim_param = "0x" + claim_id.hex()
         try:
-            result = self.substrate.query(
+            result = self._call(
+                "query",
                 module="IntentSettlement",
                 storage_function="Vouchers",
                 params=[claim_param],
@@ -649,8 +1103,8 @@ class SubstrateClient:
         default.
         """
         try:
-            consts = self.substrate.get_constant(
-                "IntentSettlement", "MinFinalityDepth"
+            consts = self._call(
+                "get_constant", "IntentSettlement", "MinFinalityDepth"
             )
             if consts is None:
                 return None
@@ -689,7 +1143,8 @@ class SubstrateClient:
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
             try:
-                call = self.substrate.compose_call(
+                call = self._call(
+                    "compose_call",
                     call_module="IntentSettlement",
                     call_function="attest_settle",
                     call_params={
@@ -702,11 +1157,13 @@ class SubstrateClient:
                         ],
                     },
                 )
-                extrinsic = self.substrate.create_signed_extrinsic(
+                extrinsic = self._call(
+                    "create_signed_extrinsic",
                     call=call, keypair=self.keypair,
                 )
-                receipt = self.substrate.submit_extrinsic(
-                    extrinsic, wait_for_inclusion=True
+                receipt = self._call(
+                    "submit_extrinsic",
+                    extrinsic, wait_for_inclusion=True,
                 )
                 if not receipt.is_success:
                     last_error = str(receipt.error_message)
@@ -785,7 +1242,8 @@ class SubstrateClient:
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
             try:
-                call = self.substrate.compose_call(
+                call = self._call(
+                    "compose_call",
                     call_module="IntentSettlement",
                     call_function="attest_settle",
                     call_params={
@@ -793,11 +1251,13 @@ class SubstrateClient:
                         "signatures": sigs_param,
                     },
                 )
-                extrinsic = self.substrate.create_signed_extrinsic(
+                extrinsic = self._call(
+                    "create_signed_extrinsic",
                     call=call, keypair=self.keypair,
                 )
-                receipt = self.substrate.submit_extrinsic(
-                    extrinsic, wait_for_inclusion=True
+                receipt = self._call(
+                    "submit_extrinsic",
+                    extrinsic, wait_for_inclusion=True,
                 )
                 if not receipt.is_success:
                     last_error = str(receipt.error_message)
@@ -852,7 +1312,8 @@ class SubstrateClient:
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
             try:
-                call = self.substrate.compose_call(
+                call = self._call(
+                    "compose_call",
                     call_module="IntentSettlement",
                     call_function="attest_expire_policy",
                     call_params={
@@ -860,11 +1321,13 @@ class SubstrateClient:
                         "signatures": sigs_param,
                     },
                 )
-                extrinsic = self.substrate.create_signed_extrinsic(
+                extrinsic = self._call(
+                    "create_signed_extrinsic",
                     call=call, keypair=self.keypair,
                 )
-                receipt = self.substrate.submit_extrinsic(
-                    extrinsic, wait_for_inclusion=True
+                receipt = self._call(
+                    "submit_extrinsic",
+                    extrinsic, wait_for_inclusion=True,
                 )
                 if not receipt.is_success:
                     last_error = str(receipt.error_message)
@@ -999,7 +1462,8 @@ class SubstrateClient:
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
             try:
-                call = self.substrate.compose_call(
+                call = self._call(
+                    "compose_call",
                     call_module="IntentSettlement",
                     call_function="slash_bad_settlement_evidence",
                     call_params={
@@ -1008,11 +1472,13 @@ class SubstrateClient:
                         "signatures": sigs_param,
                     },
                 )
-                extrinsic = self.substrate.create_signed_extrinsic(
+                extrinsic = self._call(
+                    "create_signed_extrinsic",
                     call=call, keypair=self.keypair,
                 )
-                receipt = self.substrate.submit_extrinsic(
-                    extrinsic, wait_for_inclusion=True
+                receipt = self._call(
+                    "submit_extrinsic",
+                    extrinsic, wait_for_inclusion=True,
                 )
                 if not receipt.is_success:
                     last_error = str(receipt.error_message)
@@ -1060,8 +1526,8 @@ class SubstrateClient:
         Used by daemon attestors to know how many envelope sigs to assemble
         before submitting via the multi-sig envelope methods."""
         try:
-            stored = self.substrate.query(
-                "IntentSettlement", "MinSignerThreshold"
+            stored = self._call(
+                "query", "IntentSettlement", "MinSignerThreshold"
             ).value
             stored_int = int(stored or 0)
             return stored_int if stored_int > 0 else 2
@@ -1103,7 +1569,8 @@ class SubstrateClient:
         """
         out: list[dict] = []
         try:
-            rows = self.substrate.query_map(
+            rows = self._call(
+                "query_map",
                 module="IntentSettlement",
                 storage_function="PolicyExpireRequests",
             )
@@ -1176,7 +1643,8 @@ class SubstrateClient:
         """
         intent_param = "0x" + intent_id.hex()
         try:
-            result = self.substrate.query(
+            result = self._call(
+                "query",
                 module="IntentSettlement",
                 storage_function="Intents",
                 params=[intent_param],
@@ -1239,7 +1707,8 @@ class SubstrateClient:
         """
         intent_param = "0x" + intent_id.hex()
         try:
-            result = self.substrate.query(
+            result = self._call(
+                "query",
                 module="IntentSettlement",
                 storage_function="Intents",
                 params=[intent_param],
@@ -1317,7 +1786,8 @@ class SubstrateClient:
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
             try:
-                call = self.substrate.compose_call(
+                call = self._call(
+                    "compose_call",
                     call_module="IntentSettlement",
                     call_function="attest_expire_policy",
                     call_params={
@@ -1330,11 +1800,13 @@ class SubstrateClient:
                         ],
                     },
                 )
-                extrinsic = self.substrate.create_signed_extrinsic(
+                extrinsic = self._call(
+                    "create_signed_extrinsic",
                     call=call, keypair=self.keypair,
                 )
-                receipt = self.substrate.submit_extrinsic(
-                    extrinsic, wait_for_inclusion=True
+                receipt = self._call(
+                    "submit_extrinsic",
+                    extrinsic, wait_for_inclusion=True,
                 )
                 if not receipt.is_success:
                     last_error = str(receipt.error_message)
@@ -1375,8 +1847,8 @@ class SubstrateClient:
         return None
 
     def get_block_events(self, block_number: int) -> list:
-        block_hash = self.substrate.get_block_hash(block_number)
-        events = self.substrate.get_events(block_hash=block_hash)
+        block_hash = self._call("get_block_hash", block_number)
+        events = self._call("get_events", block_hash=block_hash)
         receipt_events = []
         for event in events:
             if (event.value["module_id"] == "OrinqReceipts" and
@@ -1391,8 +1863,8 @@ class SubstrateClient:
 
     def get_block_certified_events(self, block_number: int) -> list:
         """Scan a block for AvailabilityCertified events."""
-        block_hash = self.substrate.get_block_hash(block_number)
-        events = self.substrate.get_events(block_hash=block_hash)
+        block_hash = self._call("get_block_hash", block_number)
+        events = self._call("get_events", block_hash=block_hash)
         certified = []
         for event in events:
             if (event.value["module_id"] == "OrinqReceipts" and
@@ -1405,7 +1877,8 @@ class SubstrateClient:
         return certified
 
     def get_receipt(self, receipt_id: str) -> Optional[ReceiptRecord]:
-        result = self.substrate.query(
+        result = self._call(
+            "query",
             module="OrinqReceipts",
             storage_function="Receipts",
             params=[receipt_id],
@@ -1445,7 +1918,8 @@ class SubstrateClient:
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
             try:
-                call = self.substrate.compose_call(
+                call = self._call(
+                    "compose_call",
                     call_module="OrinqReceipts",
                     call_function="attest_availability_cert",
                     call_params={
@@ -1453,11 +1927,14 @@ class SubstrateClient:
                         "claimed_hash": list(cert_hash),
                     },
                 )
-                extrinsic = self.substrate.create_signed_extrinsic(
+                extrinsic = self._call(
+                    "create_signed_extrinsic",
                     call=call,
                     keypair=self.keypair,
                 )
-                receipt = self.substrate.submit_extrinsic(extrinsic, wait_for_inclusion=True)
+                receipt = self._call(
+                    "submit_extrinsic", extrinsic, wait_for_inclusion=True
+                )
                 if not receipt.is_success:
                     last_error = str(receipt.error_message)
                     logger.error(f"Cert tx failed for {receipt_id}: {last_error}")

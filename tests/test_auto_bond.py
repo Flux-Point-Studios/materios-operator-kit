@@ -271,6 +271,27 @@ def test_ensure_committee_membership_retries_bond_on_insufficient_bond_error():
     ok_receipt = MagicMock(is_success=True, error_message=None)
     substrate.submit_extrinsic.side_effect = [fail_receipt, ok_receipt]
     daemon.client.substrate = substrate
+    # After task #288, cert_daemon calls the SubstrateClient's typed
+    # wrappers (`get_committee_members`, `submit_join_committee`) instead
+    # of `self.client.substrate.X` directly. Wire those wrappers to the
+    # underlying substrate mock so existing assertions still see the
+    # same call counts.
+    daemon.client.get_committee_members = MagicMock(
+        side_effect=lambda: substrate.query("OrinqReceipts", "CommitteeMembers")
+    )
+    daemon.client.submit_join_committee = MagicMock(
+        side_effect=lambda: substrate.submit_extrinsic(
+            substrate.create_signed_extrinsic(
+                call=substrate.compose_call(
+                    call_module="OrinqReceipts",
+                    call_function="join_committee",
+                    call_params={},
+                ),
+                keypair=daemon.client.keypair,
+            ),
+            wait_for_inclusion=True,
+        )
+    )
 
     _run(daemon._ensure_committee_membership())
 
@@ -298,6 +319,23 @@ def test_ensure_committee_membership_bounded_on_persistent_insufficient_bond():
     # Always returns InsufficientBond.
     substrate.submit_extrinsic.return_value = fail_receipt
     daemon.client.substrate = substrate
+    # See sibling test for the rationale on these mock seams.
+    daemon.client.get_committee_members = MagicMock(
+        side_effect=lambda: substrate.query("OrinqReceipts", "CommitteeMembers")
+    )
+    daemon.client.submit_join_committee = MagicMock(
+        side_effect=lambda: substrate.submit_extrinsic(
+            substrate.create_signed_extrinsic(
+                call=substrate.compose_call(
+                    call_module="OrinqReceipts",
+                    call_function="join_committee",
+                    call_params={},
+                ),
+                keypair=daemon.client.keypair,
+            ),
+            wait_for_inclusion=True,
+        )
+    )
 
     _run(daemon._ensure_committee_membership())
 
