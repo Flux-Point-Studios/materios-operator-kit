@@ -30,7 +30,7 @@ DAEMON_IMAGE="ghcr.io/flux-point-studios/materios-operator-kit:latest"
 GATEWAY_URL="https://materios.fluxpointstudios.com/preprod-blobs"
 CHAIN_SPEC_URL="https://materios.fluxpointstudios.com/chain-spec-v5-raw.json"
 EXPLORER_URL="https://fluxpointstudios.com/materios/explorer#committee"
-BOOTNODE="/ip4/166.70.250.197/tcp/30333/p2p/12D3KooWPueKoxRAirTTKH4Y2qQAsJDegWMjS4k89Z7izCbZKgkM"
+BOOTNODE="/dns4/bootnode.materios.fluxpointstudios.com/tcp/30333/p2p/12D3KooWPueKoxRAirTTKH4Y2qQAsJDegWMjS4k89Z7izCbZKgkM"
 MIN_DISK_MB=51200   # 50 GB
 MIN_RAM_MB=1800     # ~2 GB
 
@@ -261,7 +261,7 @@ if [ -n "$CHAIN_INFO" ] && echo "$CHAIN_INFO" | python3 -c "import sys,json; jso
   ok "Chain info: genesis=${CHAIN_GENESIS_CLEAN:0:16}... spec_version=${CHAIN_SPEC_VERSION}"
 else
   warn "Could not fetch chain info from gateway. Using default genesis."
-  CHAIN_GENESIS_CLEAN="37a6bbe4be1a81995d9edb706cea9a7daa16f4777c85aa2fc7db107cc486dcde"
+  CHAIN_GENESIS_CLEAN="0e46e33f639a56cc8780fd871d9a15e16d99af248526f907cb560cb40849f7bf"
 fi
 
 # Port 30333 — warn if something is already bound (validators only)
