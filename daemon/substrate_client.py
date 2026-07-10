@@ -211,10 +211,42 @@ def _extract_voucher_fields_for_digest(row: dict) -> dict:
     }
 
 
+class _WsConn:
+    """One ``SubstrateInterface`` plus its independent bounded-timeout and
+    reconnect state.
+
+    Two run concurrently: a ``write`` conn for extrinsic submits and a
+    ``read`` conn for poll-loop reads (``get_events`` / ``get_block_hash``).
+    A ``submit_extrinsic(wait_for_inclusion=True)`` holds the write socket
+    for seconds; keeping reads on a separate socket means that hold cannot
+    block the poll loop — the get_events-behind-submit wedge (tasks #288/#500)
+    that silently stalled attestation across the committee. Each conn
+    force-replaces itself in isolation: a wedged write socket never trips a
+    read reconnect, and vice versa.
+    """
+
+    __slots__ = (
+        "name",
+        "si",
+        "consecutive_timeouts",
+        "consecutive_reconnect_failures",
+    )
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.si: Optional[SubstrateInterface] = None
+        self.consecutive_timeouts = 0
+        self.consecutive_reconnect_failures = 0
+
+
 class SubstrateClient:
     def __init__(self, config: DaemonConfig):
         self.config = config
-        self.substrate: Optional[SubstrateInterface] = None
+        # Two independent websocket connections (task #500): `write` carries
+        # extrinsic submits, `read` carries poll-loop reads. `self.substrate`
+        # is a property aliasing the write conn for backward compatibility.
+        self._write = _WsConn("write")
+        self._read = _WsConn("read")
         self.keypair = Keypair.create_from_uri(config.signer_uri)
         # Bounded-timeout + reconnect knobs (tasks #288 + #156). Each is
         # overridable via env so operators can tune in prod without a
@@ -239,8 +271,6 @@ class SubstrateClient:
         self._reconnect_max_attempts: int = _read_int_env(
             "MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS", 8
         )
-        self._consecutive_timeouts: int = 0
-        self._consecutive_reconnect_failures: int = 0
         # Each ``_call`` dispatches its work on a fresh daemon thread.
         # We can't reuse a single-worker pool — a wedged thread would
         # block all subsequent calls (the very problem we're fixing).
@@ -261,21 +291,29 @@ class SubstrateClient:
         self._backoff_sleep = time.sleep
 
     def connect(self) -> bool:
-        """Open the initial SubstrateInterface connection.
+        """Open the write + read SubstrateInterface connections.
 
-        Subsequent forced reconnects go through ``_force_replace_substrate_interface``
-        which shares the same constructor helper.
+        Both target the same RPC URL but are distinct sockets so a
+        submit-held write socket can't block poll-loop reads. Subsequent
+        forced reconnects go through ``_force_replace`` per conn, sharing
+        the same constructor helper. Returns True once the write conn (the
+        one that must never be down) is live; a failed read conn is logged
+        and reads fall back to the write conn until its next reconnect.
         """
-        try:
-            self.substrate = self._create_substrate_interface()
-            logger.info(
-                f"Connected to {self.config.rpc_url}, chain: {self.substrate.chain}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to substrate: {e}")
-            self.substrate = None
-            return False
+        self._ensure_wrapper_state()
+        for conn in (self._write, self._read):
+            try:
+                conn.si = self._create_substrate_interface()
+                logger.info(
+                    f"Connected {conn.name} conn to {self.config.rpc_url}, "
+                    f"chain: {conn.si.chain}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to connect {conn.name} conn to substrate: {e}"
+                )
+                conn.si = None
+        return self._write.si is not None
 
     def _create_substrate_interface(self) -> SubstrateInterface:
         """Single chokepoint for SubstrateInterface construction.
@@ -292,7 +330,23 @@ class SubstrateClient:
 
     @property
     def connected(self) -> bool:
-        return self.substrate is not None
+        return self._write.si is not None
+
+    @property
+    def substrate(self) -> Optional[SubstrateInterface]:
+        """Backward-compat alias for the *write* connection's interface.
+
+        Pre-split code and every existing test fixture reference
+        ``client.substrate`` directly (get and set); mapping it to the write
+        conn keeps the extrinsic-submit path and those call sites unchanged.
+        """
+        self._ensure_wrapper_state()
+        return self._write.si
+
+    @substrate.setter
+    def substrate(self, value: Optional[SubstrateInterface]) -> None:
+        self._ensure_wrapper_state()
+        self._write.si = value
 
     # --- Bounded-timeout RPC wrapper (tasks #288 + #156) ---------------------
 
@@ -319,41 +373,53 @@ class SubstrateClient:
             self._reconnect_max_attempts = _read_int_env(
                 "MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS", 8
             )
-        if not hasattr(self, "_consecutive_timeouts"):
-            self._consecutive_timeouts = 0
-        if not hasattr(self, "_consecutive_reconnect_failures"):
-            self._consecutive_reconnect_failures = 0
+        if not hasattr(self, "_write"):
+            self._write = _WsConn("write")
+        if not hasattr(self, "_read"):
+            self._read = _WsConn("read")
         if not hasattr(self, "_backoff_sleep"):
             self._backoff_sleep = time.sleep
 
-    def _call(self, method_name: str, *args, **kwargs) -> Any:
-        """Invoke ``self.substrate.<method_name>(*args, **kwargs)`` under a
-        bounded timeout. If the call exceeds the budget we raise
-        :class:`RPCTimeoutError`; consecutive timeouts trigger a force-
-        replace of the underlying ``SubstrateInterface``.
+    def _call(
+        self, method_name: str, *args, conn: "Optional[_WsConn]" = None, **kwargs
+    ) -> Any:
+        """Invoke ``<conn>.si.<method_name>(*args, **kwargs)`` under a bounded
+        timeout, defaulting to the write connection.
 
-        On every success we bump ``health_server.update_metrics(
-        last_poll_timestamp=time.time())`` so the outer watchdog's
-        ``/ready last_poll_age`` reflects the freshest chain interaction
-        (it used to only reflect the poll-loop outer tick, which meant
-        a wedged single RPC could fail to update health for 180s+).
+        Read wrappers pass ``conn=self._read`` so poll-loop reads
+        (``get_events`` / ``get_block_hash``) run on a socket that a
+        submit-held write socket can never block. If the read conn was
+        never opened (pre-split fixtures) or is mid-reconnect, the call
+        degrades to the write conn rather than failing.
 
-        Threading model: each call runs on a fresh daemonised thread.
-        When the call wedges, the daemon-side wrapper raises
-        ``RPCTimeoutError`` and abandons the worker. The wedged thread
-        eventually exits when the OS reaps the underlying socket (which
-        happens when ``self.substrate.close()`` runs in the force-replace
-        path). At process exit, all daemonised threads die regardless.
+        If the call exceeds the budget we raise :class:`RPCTimeoutError`;
+        consecutive timeouts on that conn trigger a force-replace of *its*
+        ``SubstrateInterface`` (the other conn is untouched). On success we
+        bump ``health_server.update_metrics(last_poll_timestamp=...)`` so the
+        outer watchdog's ``/ready last_poll_age`` reflects the freshest chain
+        interaction.
+
+        Threading model: each call runs on a fresh daemonised thread. When
+        the call wedges, the wrapper raises ``RPCTimeoutError`` and abandons
+        the worker; the wedged thread exits when the OS reaps the socket
+        (``close()`` in force-replace) or at process exit.
         """
         self._ensure_wrapper_state()
+        if conn is None:
+            conn = self._write
         with self._reconnect_lock:
-            si = self.substrate
+            # A read-conn request degrades to the write conn when the read
+            # conn was never opened (pre-split fixtures) or is mid-recovery.
+            if conn is self._read and conn.si is None:
+                conn = self._write
+            si = conn.si
         if si is None:
             # Defensive: the daemon's `_running` loop calls `connect()`
             # before any RPC; if we land here the wrapper still must
             # not block — bail loudly.
             raise RPCTimeoutError(
-                f"_call({method_name!r}) invoked with no live SubstrateInterface"
+                f"_call({method_name!r}) invoked with no live "
+                f"SubstrateInterface on the {conn.name} conn"
             )
 
         result_holder: dict[str, Any] = {}
@@ -367,7 +433,7 @@ class SubstrateClient:
 
         worker = threading.Thread(
             target=_invoke,
-            name=f"substrate-rpc-{method_name}",
+            name=f"substrate-rpc-{conn.name}-{method_name}",
             daemon=True,
         )
         worker.start()
@@ -376,9 +442,10 @@ class SubstrateClient:
             # Thread still running past the budget — abandon it and report
             # timeout. The thread will die when the OS reaps the socket fd
             # (close() in force-replace) or at process exit.
-            self._on_rpc_timeout(method_name)
+            self._on_rpc_timeout(conn, method_name)
             raise RPCTimeoutError(
-                f"RPC {method_name!r} exceeded {self._rpc_timeout_secs:.1f}s budget"
+                f"RPC {method_name!r} exceeded {self._rpc_timeout_secs:.1f}s "
+                f"budget on the {conn.name} conn"
             )
         if "err" in result_holder:
             # Any other exception (SubstrateRequestException, ValueError,
@@ -386,44 +453,44 @@ class SubstrateClient:
             # existing `except` clauses still match. Real exceptions do
             # NOT count toward the consecutive-timeout streak.
             raise result_holder["err"]
-        self._on_rpc_success()
+        self._on_rpc_success(conn)
         return result_holder.get("ok")
 
-    def _on_rpc_success(self) -> None:
-        """Reset the consecutive-timeout streak and bump health_last_poll."""
-        self._consecutive_timeouts = 0
+    def _on_rpc_success(self, conn: "_WsConn") -> None:
+        """Reset the conn's consecutive-timeout streak and bump health_last_poll."""
+        conn.consecutive_timeouts = 0
         try:
             health_server.update_metrics(last_poll_timestamp=time.time())
         except Exception:
             # Never let a metrics bump kill a successful RPC.
             pass
 
-    def _on_rpc_timeout(self, method_name: str) -> None:
-        """Bookkeeping for a timed-out call: bump counters, possibly trigger
-        a force-replace of the SI."""
-        self._consecutive_timeouts += 1
+    def _on_rpc_timeout(self, conn: "_WsConn", method_name: str) -> None:
+        """Bookkeeping for a timed-out call: bump the conn's counters, possibly
+        trigger a force-replace of that conn's SI."""
+        conn.consecutive_timeouts += 1
         try:
             health_server.increment_metric("ws_rpc_timeouts_total")
         except Exception:
             pass
         logger.warning(
             f"substrate RPC {method_name!r} timed out after "
-            f"{self._rpc_timeout_secs:.1f}s (consecutive={self._consecutive_timeouts})"
+            f"{self._rpc_timeout_secs:.1f}s on the {conn.name} conn "
+            f"(consecutive={conn.consecutive_timeouts})"
         )
-        if self._consecutive_timeouts >= self._reconnect_after_timeouts:
-            self._force_replace_substrate_interface()
+        if conn.consecutive_timeouts >= self._reconnect_after_timeouts:
+            self._force_replace(conn)
 
-    def _force_replace_substrate_interface(self) -> None:
-        """Close the current SI's websocket and construct a new one.
+    def _force_replace(self, conn: "_WsConn") -> None:
+        """Close a conn's websocket and construct a new one, in isolation.
 
         Exponential backoff between failed reconnects: 1, 2, 4, 8, 16, 30
-        (capped). After ``self._reconnect_max_attempts`` failures we
-        return without a working SI — the next user-call kicks off a
-        fresh cycle. The consecutive-timeout streak is reset on the way
-        out so the next RPC starts clean (success OR another reconnect
-        cycle from scratch).
+        (capped). After ``self._reconnect_max_attempts`` failures we return
+        without a working SI on that conn — the next user-call kicks off a
+        fresh cycle. The conn's timeout streak is reset on the way out so the
+        next RPC starts clean. The *other* conn is never touched.
         """
-        old_si = self.substrate
+        old_si = conn.si
         # Best-effort close on the dead WS. Failures here are ignored —
         # the underlying socket is already in an unknown state.
         if old_si is not None:
@@ -431,40 +498,40 @@ class SubstrateClient:
                 old_si.close()
             except Exception as e:  # noqa: BLE001
                 logger.info(
-                    f"force-replace: old SI close() raised "
+                    f"force-replace[{conn.name}]: old SI close() raised "
                     f"{type(e).__name__}: {e}; continuing"
                 )
-        self.substrate = None
+        conn.si = None
         # Reset the timeout streak whether or not the reconnect succeeds —
         # we don't want a still-wedged WS to keep stacking force-replace
         # attempts in a single call.
-        self._consecutive_timeouts = 0
+        conn.consecutive_timeouts = 0
         attempt = 0
         while attempt < self._reconnect_max_attempts:
             try:
                 new_si = self._create_substrate_interface()
             except Exception as e:  # noqa: BLE001
-                self._consecutive_reconnect_failures += 1
+                conn.consecutive_reconnect_failures += 1
                 try:
                     health_server.update_metrics(
-                        ws_consecutive_reconnect_failures=self._consecutive_reconnect_failures
+                        ws_consecutive_reconnect_failures=conn.consecutive_reconnect_failures
                     )
                 except Exception:
                     pass
                 # Backoff: 1, 2, 4, 8, 16, then 30s cap.
                 # ``2 ** (n-1)`` for n=1..5 = 1, 2, 4, 8, 16; clamped at 30.
-                delay = min(30, 1 << (self._consecutive_reconnect_failures - 1))
+                delay = min(30, 1 << (conn.consecutive_reconnect_failures - 1))
                 logger.warning(
-                    f"force-replace: SubstrateInterface ctor failed "
+                    f"force-replace[{conn.name}]: SubstrateInterface ctor failed "
                     f"(attempt {attempt + 1}/{self._reconnect_max_attempts}, "
-                    f"streak={self._consecutive_reconnect_failures}): "
+                    f"streak={conn.consecutive_reconnect_failures}): "
                     f"{type(e).__name__}: {e}; sleeping {delay}s"
                 )
                 self._backoff_sleep(delay)
                 attempt += 1
                 continue
             # Success.
-            self.substrate = new_si
+            conn.si = new_si
             try:
                 health_server.increment_metric("ws_force_reconnects_total")
                 health_server.update_metrics(
@@ -473,44 +540,44 @@ class SubstrateClient:
                 )
             except Exception:
                 pass
-            self._consecutive_reconnect_failures = 0
+            conn.consecutive_reconnect_failures = 0
             logger.warning(
-                f"force-replace: new SubstrateInterface online "
+                f"force-replace[{conn.name}]: new SubstrateInterface online "
                 f"(chain={getattr(new_si, 'chain', '?')})"
             )
             return
         # Bailed without a working SI. The next user-call enters _call,
-        # finds substrate is None, and raises RPCTimeoutError — the
-        # caller will retry on its own schedule (cert_daemon poll loop,
-        # evidence_submitter tick, etc.).
+        # finds this conn's si is None, and (for reads) degrades to the
+        # write conn or (for writes) raises RPCTimeoutError — the caller
+        # retries on its own schedule (poll loop, evidence_submitter tick).
         try:
             health_server.update_metrics(
-                ws_consecutive_reconnect_failures=self._consecutive_reconnect_failures,
+                ws_consecutive_reconnect_failures=conn.consecutive_reconnect_failures,
                 substrate_connected=False,
             )
         except Exception:
             pass
         logger.error(
-            f"force-replace: gave up after {self._reconnect_max_attempts} "
-            f"attempts; substrate remains disconnected (streak="
-            f"{self._consecutive_reconnect_failures}). Next user-call "
-            f"will retry."
+            f"force-replace[{conn.name}]: gave up after "
+            f"{self._reconnect_max_attempts} attempts; {conn.name} conn "
+            f"remains disconnected (streak={conn.consecutive_reconnect_failures}). "
+            f"Next user-call will retry."
         )
 
     def get_finalized_head_number(self) -> int:
-        head_hash = self._call("get_chain_finalised_head")
-        header = self._call("get_block_header", head_hash)
+        head_hash = self._call("get_chain_finalised_head", conn=self._read)
+        header = self._call("get_block_header", head_hash, conn=self._read)
         return header["header"]["number"]
 
     def get_best_block_number(self) -> int:
-        header = self._call("get_block_header")
+        header = self._call("get_block_header", conn=self._read)
         return header["header"]["number"]
 
     def get_genesis_hash(self) -> str:
         """Return the chain's genesis hash (0x-prefixed lowercase hex). Used to
         detect that we're pointed at a different chain than we were last run
         (e.g. a chain reset) and self-heal stale daemon state."""
-        return self._call("get_block_hash", 0)
+        return self._call("get_block_hash", 0, conn=self._read)
 
     # --- Bond helpers (OrinqReceipts pallet) --------------------------------
     # These are used by CertDaemon._ensure_bond() to keep the attestor's
@@ -523,7 +590,7 @@ class SubstrateClient:
         Returns 0 when the storage item is absent (pre-runtime-upgrade chains)
         so `_ensure_bond()` falls through to its "nothing to do" branch.
         """
-        result = self._call("query", "OrinqReceipts", "BondRequirement")
+        result = self._call("query", "OrinqReceipts", "BondRequirement", conn=self._read)
         val = result.value
         if val is None:
             return 0
@@ -536,7 +603,7 @@ class SubstrateClient:
         `ValueQuery` so the runtime returns 0 in that case; we defensively
         handle a missing value anyway).
         """
-        result = self._call("query", "OrinqReceipts", "AttestorBonds", [address])
+        result = self._call("query", "OrinqReceipts", "AttestorBonds", [address], conn=self._read)
         val = result.value
         if val is None:
             return 0
@@ -547,7 +614,7 @@ class SubstrateClient:
 
         Returns 0 if the account row does not exist (never received MATRA).
         """
-        result = self._call("query", "System", "Account", [address])
+        result = self._call("query", "System", "Account", [address], conn=self._read)
         val = result.value
         if val is None:
             return 0
@@ -643,7 +710,7 @@ class SubstrateClient:
         wrapper so a wedged WS can't strand the join-committee path
         forever — same wedge class as the poll loop (task #288).
         """
-        return self._call("query", "OrinqReceipts", "CommitteeMembers")
+        return self._call("query", "OrinqReceipts", "CommitteeMembers", conn=self._read)
 
     def submit_join_committee(self):
         """Submit ``OrinqReceipts.join_committee()`` and return the included
@@ -1847,8 +1914,8 @@ class SubstrateClient:
         return None
 
     def get_block_events(self, block_number: int) -> list:
-        block_hash = self._call("get_block_hash", block_number)
-        events = self._call("get_events", block_hash=block_hash)
+        block_hash = self._call("get_block_hash", block_number, conn=self._read)
+        events = self._call("get_events", block_hash=block_hash, conn=self._read)
         receipt_events = []
         for event in events:
             if (event.value["module_id"] == "OrinqReceipts" and
@@ -1863,8 +1930,8 @@ class SubstrateClient:
 
     def get_block_certified_events(self, block_number: int) -> list:
         """Scan a block for AvailabilityCertified events."""
-        block_hash = self._call("get_block_hash", block_number)
-        events = self._call("get_events", block_hash=block_hash)
+        block_hash = self._call("get_block_hash", block_number, conn=self._read)
+        events = self._call("get_events", block_hash=block_hash, conn=self._read)
         certified = []
         for event in events:
             if (event.value["module_id"] == "OrinqReceipts" and
