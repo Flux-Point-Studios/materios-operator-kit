@@ -57,12 +57,20 @@ LABEL=""
 MODE="validator"  # "validator" (full node + daemon) or "attestor" (daemon only)
 INSTALL_DIR=""     # if unset, defaults to mode-specific ~/materios-operator or ~/materios-attestor
 INSTALL_DIR_EXPLICIT=false
+# Optional self-declared operator identity, sent on the faucet drip. Env-var
+# defaults so an automated install can declare without a terminal.
+OPERATOR_LABEL="${MATERIOS_OPERATOR_LABEL:-}"
+OPERATOR_CONTACT="${MATERIOS_OPERATOR_CONTACT:-}"
+CARDANO_POOL_ID="${MATERIOS_CARDANO_POOL_ID:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --token)        INVITE_TOKEN="$2"; shift 2 ;;
-    --label)        LABEL="$2"; shift 2 ;;
-    --mode)         MODE="$2"; shift 2 ;;
-    --install-dir)  INSTALL_DIR="$2"; INSTALL_DIR_EXPLICIT=true; shift 2 ;;
+    --token)          INVITE_TOKEN="$2"; shift 2 ;;
+    --label)          LABEL="$2"; shift 2 ;;
+    --mode)           MODE="$2"; shift 2 ;;
+    --install-dir)    INSTALL_DIR="$2"; INSTALL_DIR_EXPLICIT=true; shift 2 ;;
+    --operator-label) OPERATOR_LABEL="$2"; shift 2 ;;
+    --contact)        OPERATOR_CONTACT="$2"; shift 2 ;;
+    --pool-id)        CARDANO_POOL_ID="$2"; shift 2 ;;
     --help|-h)
       cat <<'HELP'
 Usage: install.sh [--mode validator|attestor] [--token <INVITE_TOKEN>] [--label <NAME>] [--install-dir <PATH>]
@@ -78,6 +86,19 @@ Usage: install.sh [--mode validator|attestor] [--token <INVITE_TOKEN>] [--label 
                    bash install.sh --mode attestor --label first
                    bash install.sh --mode attestor --label second \
                                    --install-dir ~/materios-attestor-2
+
+Optional — who is running this node. All three are optional and self-declared;
+supplying none of them installs exactly as before. They are recorded once, on
+the registration this install creates, and used only so Flux Point Studios can
+contact you about becoming a Materios validator.
+
+  --operator-label  Your name or your organisation's (env MATERIOS_OPERATOR_LABEL)
+  --contact         Email or Discord handle (env MATERIOS_OPERATOR_CONTACT)
+  --pool-id         Cardano pool id, pool1... or hex (env MATERIOS_CARDANO_POOL_ID)
+
+When none of these are supplied and a terminal is available, the installer asks
+for them once before registering. Piped installs with no terminal (CI, cron,
+`docker run -d`) skip the questions and register anonymously.
 
 Validator mode: Full node + cert daemon. Requires invite token.
   Requirements: 2+ vCPU, 2+ GB RAM, 50+ GB SSD, port 30333 open.
@@ -269,6 +290,42 @@ if [ "$MODE" = "validator" ]; then
   if ss -tlnp 2>/dev/null | grep -q ':30333 '; then
     warn "Port 30333 is already in use. The node needs this port for P2P networking."
   fi
+fi
+
+# ── Step 1b: Optional operator identity ─────────────────────────────────────
+#
+# The faucet drip in step 6 is what creates this operator's registration, and
+# the gateway records identity only on that first INSERT — there is no update
+# path, deliberately, because the drip is unauthenticated and proves nothing
+# about who controls the address. An installer that drips anonymously therefore
+# locks its operator out of ever declaring, which is precisely the SPO
+# population we are recruiting. So the offer has to happen here, before it.
+#
+# Asked only on the permissionless path, since that is the one that drips.
+#
+# stdin is the `curl … | bash` pipe, so `read` cannot use it. /dev/tty is the
+# operator's terminal; it is opened in a subshell first because cron, CI and
+# `docker run -d` have no controlling terminal, and those must fall through to
+# an anonymous install rather than block forever on a read that can never
+# return.
+if [ -z "$INVITE_TOKEN" ] &&
+   [ -z "${OPERATOR_LABEL}${OPERATOR_CONTACT}${CARDANO_POOL_ID}" ] &&
+   (: </dev/tty) 2>/dev/null; then
+  echo ""
+  echo "  ${BOLD}Optional — who is running this node?${RESET}"
+  echo "  Answer or press Enter to skip each one. These are used only so Flux"
+  echo "  Point Studios can contact you about becoming a Materios validator;"
+  echo "  leaving them all blank changes nothing about this install."
+  echo ""
+  read -r -p "    Your name or organisation: " OPERATOR_LABEL < /dev/tty || OPERATOR_LABEL=""
+  read -r -p "    Email or Discord handle:   " OPERATOR_CONTACT < /dev/tty || OPERATOR_CONTACT=""
+  read -r -p "    Cardano pool id (pool1…):  " CARDANO_POOL_ID < /dev/tty || CARDANO_POOL_ID=""
+  echo ""
+fi
+
+IDENTITY_DECLARED=false
+if [ -n "${OPERATOR_LABEL}${OPERATOR_CONTACT}${CARDANO_POOL_ID}" ]; then
+  IDENTITY_DECLARED=true
 fi
 
 # ── Step 2: Create operator directory ────────────────────────────────────────
@@ -476,18 +533,71 @@ if [ -n "$INVITE_TOKEN" ]; then
   fi
 fi
 
+# Backslash and double-quote are the only characters that can break out of a
+# JSON string here; the gateway rejects the rest (angle brackets, control
+# characters) itself and names the offending field when it does.
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
+}
+
+# Identity fields are appended only when non-empty, so an operator who declared
+# nothing produces a request byte-identical to the pre-identity installer's.
+faucet_drip_body() {
+  local body="{\"address\": \"${SS58}\""
+  if [ -n "$OPERATOR_LABEL" ]; then
+    body="${body}, \"operator_label\": \"$(json_escape "$OPERATOR_LABEL")\""
+  fi
+  if [ -n "$OPERATOR_CONTACT" ]; then
+    body="${body}, \"contact\": \"$(json_escape "$OPERATOR_CONTACT")\""
+  fi
+  if [ -n "$CARDANO_POOL_ID" ]; then
+    body="${body}, \"cardano_pool_id\": \"$(json_escape "$CARDANO_POOL_ID")\""
+  fi
+  printf '%s}' "$body"
+}
+
+faucet_field() {
+  echo "$1" | FIELD="$2" python3 -c \
+    "import os,sys,json; print(json.load(sys.stdin).get(os.environ['FIELD'],''))" 2>/dev/null || echo ""
+}
+
 # Request faucet drip (auto-registers in gateway + provides tMATRA for fees)
 if [ -z "$API_KEY" ]; then
   info "Requesting faucet drip (auto-registers with gateway)..."
   FAUCET_RESP=$(curl -sS --max-time 15 -X POST "${GATEWAY_URL}/faucet/drip" \
     -H "Content-Type: application/json" \
-    -d "{\"address\": \"${SS58}\"}" 2>/dev/null || echo "")
-  FAUCET_OK=$(echo "$FAUCET_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('success',''))" 2>/dev/null || echo "")
+    -d "$(faucet_drip_body)" 2>/dev/null || echo "")
+  FAUCET_OK=$(faucet_field "$FAUCET_RESP" success)
+
+  # A malformed optional field makes the gateway reject the whole drip, and the
+  # drip is what funds the operator's fees. Never let a declaration be the
+  # reason a node ends up unfunded: say what was refused, then re-request
+  # without it.
+  if [ "$FAUCET_OK" != "True" ] && [ "$IDENTITY_DECLARED" = true ]; then
+    warn "Faucet refused the optional operator details: $(faucet_field "$FAUCET_RESP" error)"
+    warn "Re-requesting without them so your node is still funded."
+    OPERATOR_LABEL="" OPERATOR_CONTACT="" CARDANO_POOL_ID=""
+    IDENTITY_DECLARED=false
+    FAUCET_RESP=$(curl -sS --max-time 15 -X POST "${GATEWAY_URL}/faucet/drip" \
+      -H "Content-Type: application/json" \
+      -d "$(faucet_drip_body)" 2>/dev/null || echo "")
+    FAUCET_OK=$(faucet_field "$FAUCET_RESP" success)
+  fi
+
   if [ "$FAUCET_OK" = "True" ]; then
     ok "Registered via faucet. tMATRA received — MOTRA will auto-generate."
+    # Identity is recorded only on the registration this drip creates. If the
+    # address already had one, the gateway keeps what it holds and says so.
+    case "$(faucet_field "$FAUCET_RESP" identity_status)" in
+      recorded)  ok "Operator details recorded. We will be in touch." ;;
+      discarded) warn "This address was already registered, so the operator details were NOT recorded. Contact Flux Point Studios to update them." ;;
+    esac
   else
-    FAUCET_ERR=$(echo "$FAUCET_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error',''))" 2>/dev/null || echo "request failed")
-    warn "Faucet: $FAUCET_ERR (daemon will retry on startup)"
+    FAUCET_ERR=$(faucet_field "$FAUCET_RESP" error)
+    warn "Faucet: ${FAUCET_ERR:-request failed} (daemon will retry on startup)"
   fi
 fi
 
