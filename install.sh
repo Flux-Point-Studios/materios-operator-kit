@@ -343,7 +343,7 @@ if [ -z "$INVITE_TOKEN" ] &&
    [ -z "${CONTACT_NAME}${CONTACT_HANDLE}${CARDANO_POOL_ID}" ] &&
    tty_is_ours; then
   echo ""
-  echo "  ${BOLD}Optional — who is running this node?${RESET}"
+  echo -e "  ${BOLD}Optional — who is running this node?${RESET}"
   echo "  Answer or press Enter to skip each one. These are used only so Flux"
   echo "  Point Studios can contact you about becoming a Materios validator;"
   echo "  leaving them all blank changes nothing about this install."
@@ -354,7 +354,7 @@ if [ -z "$INVITE_TOKEN" ] &&
   echo ""
 fi
 
-IDENTITY_DECLARED=false
+DROPPED_ANY=false
 if [ -n "${CONTACT_NAME}${CONTACT_HANDLE}${CARDANO_POOL_ID}" ]; then
   IDENTITY_DECLARED=true
 fi
@@ -378,7 +378,7 @@ if [ -f "$OPERATOR_DIR/docker-compose.yml" ]; then
     warn "reused from the existing files so the operator identity is preserved."
     warn "If you meant to create a second independent attestor, pick a different"
     warn "--install-dir (see docs/RUNNING_MULTIPLE_ATTESTORS.md)."
-    if [ -t 0 ]; then
+    if [ -t 0 ] && tty_is_ours; then
       read -r -p "  Proceed with reinstall into $OPERATOR_DIR? [y/N] " REPLY
       case "$REPLY" in
         y|Y|yes|YES) : ;;
@@ -639,6 +639,7 @@ if isinstance(err, str) and err.split(' ', 1)[0] in (
 
 # Request faucet drip (auto-registers in gateway + provides tMATRA for fees)
 if [ -z "$API_KEY" ]; then
+  DROPPED_ANY=false
   info "Requesting faucet drip (auto-registers with gateway)..."
   faucet_drip_attempt
 
@@ -649,11 +650,21 @@ if [ -z "$API_KEY" ]; then
   # unhealthy chain, a failed transfer or a dead network the drip is still
   # available and the declaration has to survive for a later attempt.
   #
-  # Terminates in at most three passes: the gateway only names a field the
-  # request actually carried, and each pass drops the one it named.
-  while [ "$FAUCET_OK" != "True" ] && [ "$IDENTITY_DECLARED" = true ]; do
+  # Termination is ENFORCED here, not assumed. Progress requires that each pass
+  # actually empties a field the request was still carrying, so the loop is
+  # bounded by the three fields; a responder that names a field we are no longer
+  # sending would otherwise re-send an identical request forever. The counter is
+  # a second, independent bound in case a future field is added without
+  # revisiting this.
+  DROPS=0
+  while [ "$FAUCET_OK" != "True" ] && [ "$IDENTITY_DECLARED" = true ] && [ "$DROPS" -lt 3 ]; do
     REFUSED=$(faucet_refused_field "$FAUCET_CODE" "$FAUCET_RESP")
     [ -n "$REFUSED" ] || break
+    case "$REFUSED" in
+      operator_label)  [ -n "$CONTACT_NAME" ]    || break ;;
+      contact)         [ -n "$CONTACT_HANDLE" ]  || break ;;
+      cardano_pool_id) [ -n "$CARDANO_POOL_ID" ] || break ;;
+    esac
     warn "The gateway refused ${REFUSED}: $(faucet_field "$FAUCET_RESP" error)"
     warn "Dropping ${REFUSED} and asking again; your other details are kept."
     case "$REFUSED" in
@@ -661,6 +672,8 @@ if [ -z "$API_KEY" ]; then
       contact)         CONTACT_HANDLE="" ;;
       cardano_pool_id) CARDANO_POOL_ID="" ;;
     esac
+    DROPS=$((DROPS + 1))
+    DROPPED_ANY=true
     IDENTITY_DECLARED=false
     if [ -n "${CONTACT_NAME}${CONTACT_HANDLE}${CARDANO_POOL_ID}" ]; then
       IDENTITY_DECLARED=true
@@ -680,9 +693,14 @@ if [ -z "$API_KEY" ]; then
     FAUCET_ERR=$(faucet_field "$FAUCET_RESP" error)
     warn "Faucet: ${FAUCET_ERR:-request failed} (HTTP ${FAUCET_CODE}) (daemon will retry on startup)"
     if [ "$IDENTITY_DECLARED" = true ]; then
-      warn "Your details were NOT sent again without them — the failure was not about the details,"
-      warn "and they can only ever be stored on the registration a successful drip creates."
-      warn "Re-run this installer with the same options once the faucet is healthy."
+      if [ "$DROPPED_ANY" = true ]; then
+        warn "The details the gateway accepted were re-sent; the ones it named were dropped."
+        warn "Re-run WITHOUT the rejected field once the faucet is healthy."
+      else
+        warn "Your details were NOT re-sent without them — the failure was not about the details,"
+        warn "and they can only ever be stored on the registration a successful drip creates."
+        warn "Re-run this installer with the same options once the faucet is healthy."
+      fi
     fi
   fi
 fi

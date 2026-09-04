@@ -405,6 +405,27 @@ drip_output | grep -q "cardano_pool_id" \
   || fail "operator was not told which field was refused: $(drip_output)"
 pass "a refused field is named, dropped, and the rest of the declaration survives"
 
+# ── 12. The retry loop terminates against a responder that never relents ───
+# Nothing obliges the far end to stop naming a field once we stop sending it —
+# a stale cache, a WAF or a rolled-back gateway can repeat the same 400
+# forever. The loop only makes progress when a pass empties a field the request
+# was actually carrying, so this must stop at 2 requests: the declaration, then
+# one retry without the pool id, whose refusal names a field no longer present.
+run_drip '[{"status":400,"body":"{\"error\":\"cardano_pool_id must be at most 64 characters\"}"}]' \
+  "OnlyBlocks" "ops@example.org" "pool1abc"
+[ "$(drip_requests)" = "2" ] \
+  || fail "unrelenting refusal: expected 2 requests, got $(drip_requests) — the loop does not terminate"
+python3 - "$(drip_request 2)" <<'PY' || fail "the one retry did not keep the accepted fields"
+import json, sys
+b = json.loads(sys.argv[1])
+assert "cardano_pool_id" not in b, b
+assert b["operator_label"] == "OnlyBlocks", b
+assert b["contact"] == "ops@example.org", b
+PY
+drip_output | grep -qi "re-run" \
+  || fail "operator was not told what to do after the loop gave up: $(drip_output)"
+pass "a responder that keeps naming a dropped field stops the loop instead of spinning"
+
 # Everything that is not the gateway refusing a field must leave the one
 # identity-bearing INSERT unspent.
 for scenario in \
