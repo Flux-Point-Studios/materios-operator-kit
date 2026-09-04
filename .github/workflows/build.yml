@@ -1,7 +1,14 @@
 name: Build and push Docker image
 
+# `build` is a REQUIRED status check on main, but this workflow used to trigger
+# on push-to-main only — so the check could not run until after the merge that
+# required it. Every PR sat BLOCKED on a check that was structurally incapable
+# of reporting. Adding the pull_request trigger is what makes the gate real
+# rather than decorative.
 on:
   push:
+    branches: [main]
+  pull_request:
     branches: [main]
 
 permissions:
@@ -20,17 +27,22 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Only authenticate when we are actually going to publish. A PR build
+      # needs no registry credentials, and fork PRs cannot be granted them.
       - uses: docker/login-action@v3
+        if: github.event_name == 'push'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # PRs BUILD but never PUBLISH. This image is what operators run, so a PR
+      # must not be able to move `:latest` to unmerged code.
       - uses: docker/build-push-action@v5
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name == 'push' }}
           tags: |
             ghcr.io/flux-point-studios/materios-operator-kit:latest
             ghcr.io/flux-point-studios/materios-operator-kit:${{ github.sha }}
