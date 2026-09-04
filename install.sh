@@ -59,8 +59,8 @@ INSTALL_DIR=""     # if unset, defaults to mode-specific ~/materios-operator or 
 INSTALL_DIR_EXPLICIT=false
 # Optional self-declared operator identity, sent on the faucet drip. Env-var
 # defaults so an automated install can declare without a terminal.
-OPERATOR_LABEL="${MATERIOS_OPERATOR_LABEL:-}"
-OPERATOR_CONTACT="${MATERIOS_OPERATOR_CONTACT:-}"
+CONTACT_NAME="${MATERIOS_CONTACT_NAME:-}"
+CONTACT_HANDLE="${MATERIOS_CONTACT:-}"
 CARDANO_POOL_ID="${MATERIOS_CARDANO_POOL_ID:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,9 +68,18 @@ while [[ $# -gt 0 ]]; do
     --label)          LABEL="$2"; shift 2 ;;
     --mode)           MODE="$2"; shift 2 ;;
     --install-dir)    INSTALL_DIR="$2"; INSTALL_DIR_EXPLICIT=true; shift 2 ;;
-    --operator-label) OPERATOR_LABEL="$2"; shift 2 ;;
-    --contact)        OPERATOR_CONTACT="$2"; shift 2 ;;
+    --contact-name)   CONTACT_NAME="$2"; shift 2 ;;
+    --contact)        CONTACT_HANDLE="$2"; shift 2 ;;
     --pool-id)        CARDANO_POOL_ID="$2"; shift 2 ;;
+    # bootstrap-validator.sh has taken --operator-label since long before this
+    # installer had any identity flags, and the published SPO docs tell
+    # operators to pass it there — it names the node (systemd Description,
+    # --name). Reusing the spelling here would give one flag two meanings, so
+    # refuse rather than guess which one was meant.
+    --operator-label)
+      fail "--operator-label belongs to bootstrap-validator.sh, where it names your node.
+       To say who you are so we can contact you, use: --contact-name \"${2-YOUR NAME}\""
+      ;;
     --help|-h)
       cat <<'HELP'
 Usage: install.sh [--mode validator|attestor] [--token <INVITE_TOKEN>] [--label <NAME>] [--install-dir <PATH>]
@@ -92,9 +101,13 @@ supplying none of them installs exactly as before. They are recorded once, on
 the registration this install creates, and used only so Flux Point Studios can
 contact you about becoming a Materios validator.
 
-  --operator-label  Your name or your organisation's (env MATERIOS_OPERATOR_LABEL)
-  --contact         Email or Discord handle (env MATERIOS_OPERATOR_CONTACT)
+  --contact-name    Your name or your organisation's (env MATERIOS_CONTACT_NAME)
+  --contact         Email or Discord handle (env MATERIOS_CONTACT)
   --pool-id         Cardano pool id, pool1... or hex (env MATERIOS_CARDANO_POOL_ID)
+
+--contact-name is deliberately not spelled --operator-label: bootstrap-validator.sh
+already uses that flag for something else (the name your node runs under), and
+this installer refuses it rather than give one spelling two meanings.
 
 When none of these are supplied and a terminal is available, the installer asks
 for them once before registering. Piped installs with no terminal (CI, cron,
@@ -303,28 +316,46 @@ fi
 #
 # Asked only on the permissionless path, since that is the one that drips.
 #
-# stdin is the `curl … | bash` pipe, so `read` cannot use it. /dev/tty is the
-# operator's terminal; it is opened in a subshell first because cron, CI and
-# `docker run -d` have no controlling terminal, and those must fall through to
-# an anonymous install rather than block forever on a read that can never
-# return.
+# stdin is the `curl … | bash` pipe, so `read` cannot use it — the questions go
+# to /dev/tty. Two conditions have to hold for that to work, and only asking
+# about the first is a hang:
+#
+#   - a controlling terminal must exist at all (cron, CI and `docker run -d`
+#     have none, and must fall through to an anonymous install);
+#   - this process group must be the terminal's FOREGROUND one. Opening
+#     /dev/tty succeeds from the background; it is read(2) that raises SIGTTIN,
+#     whose default disposition stops the process. A backgrounded piped install
+#     would suspend on the first question with nobody to answer it.
+#
+# `ps` reports both: tpgid is the foreground process group of our controlling
+# terminal, or -1 when there is none. Comparing it to our own pgid decides
+# before anything is printed, so the background case is silent rather than
+# half-asked. Where ps is unavailable the comparison fails closed and the
+# install registers anonymously.
+tty_is_ours() {
+  local pgid tpgid
+  pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d '[:space:]') || return 1
+  tpgid=$(ps -o tpgid= -p $$ 2>/dev/null | tr -d '[:space:]') || return 1
+  [ -n "$pgid" ] && [ "$pgid" = "$tpgid" ] && (: </dev/tty) 2>/dev/null
+}
+
 if [ -z "$INVITE_TOKEN" ] &&
-   [ -z "${OPERATOR_LABEL}${OPERATOR_CONTACT}${CARDANO_POOL_ID}" ] &&
-   (: </dev/tty) 2>/dev/null; then
+   [ -z "${CONTACT_NAME}${CONTACT_HANDLE}${CARDANO_POOL_ID}" ] &&
+   tty_is_ours; then
   echo ""
   echo "  ${BOLD}Optional — who is running this node?${RESET}"
   echo "  Answer or press Enter to skip each one. These are used only so Flux"
   echo "  Point Studios can contact you about becoming a Materios validator;"
   echo "  leaving them all blank changes nothing about this install."
   echo ""
-  read -r -p "    Your name or organisation: " OPERATOR_LABEL < /dev/tty || OPERATOR_LABEL=""
-  read -r -p "    Email or Discord handle:   " OPERATOR_CONTACT < /dev/tty || OPERATOR_CONTACT=""
+  read -r -p "    Your name or organisation: " CONTACT_NAME < /dev/tty || CONTACT_NAME=""
+  read -r -p "    Email or Discord handle:   " CONTACT_HANDLE < /dev/tty || CONTACT_HANDLE=""
   read -r -p "    Cardano pool id (pool1…):  " CARDANO_POOL_ID < /dev/tty || CARDANO_POOL_ID=""
   echo ""
 fi
 
 IDENTITY_DECLARED=false
-if [ -n "${OPERATOR_LABEL}${OPERATOR_CONTACT}${CARDANO_POOL_ID}" ]; then
+if [ -n "${CONTACT_NAME}${CONTACT_HANDLE}${CARDANO_POOL_ID}" ]; then
   IDENTITY_DECLARED=true
 fi
 
@@ -545,13 +576,15 @@ json_escape() {
 
 # Identity fields are appended only when non-empty, so an operator who declared
 # nothing produces a request byte-identical to the pre-identity installer's.
+# The key names are the gateway's wire contract and do not follow the local
+# variable names.
 faucet_drip_body() {
   local body="{\"address\": \"${SS58}\""
-  if [ -n "$OPERATOR_LABEL" ]; then
-    body="${body}, \"operator_label\": \"$(json_escape "$OPERATOR_LABEL")\""
+  if [ -n "$CONTACT_NAME" ]; then
+    body="${body}, \"operator_label\": \"$(json_escape "$CONTACT_NAME")\""
   fi
-  if [ -n "$OPERATOR_CONTACT" ]; then
-    body="${body}, \"contact\": \"$(json_escape "$OPERATOR_CONTACT")\""
+  if [ -n "$CONTACT_HANDLE" ]; then
+    body="${body}, \"contact\": \"$(json_escape "$CONTACT_HANDLE")\""
   fi
   if [ -n "$CARDANO_POOL_ID" ]; then
     body="${body}, \"cardano_pool_id\": \"$(json_escape "$CARDANO_POOL_ID")\""
@@ -564,28 +597,76 @@ faucet_field() {
     "import os,sys,json; print(json.load(sys.stdin).get(os.environ['FIELD'],''))" 2>/dev/null || echo ""
 }
 
+# The reply as "<body>\n<http-status>", status "000" when curl never got one.
+# The status is the whole point: a refused field and a cooldown are both
+# "success is absent", and only one of them may be retried.
+faucet_drip_request() {
+  curl -sS --max-time 15 -X POST "${GATEWAY_URL}/faucet/drip" \
+    -H "Content-Type: application/json" \
+    -d "$(faucet_drip_body)" \
+    -w '\n%{http_code}' 2>/dev/null
+}
+
+# One drip attempt, split into FAUCET_CODE / FAUCET_RESP / FAUCET_OK. Bash has
+# no do-while, so the retry loop needs this both before and inside itself.
+faucet_drip_attempt() {
+  local raw
+  raw=$(faucet_drip_request) || true
+  FAUCET_CODE="${raw##*$'\n'}"
+  FAUCET_RESP="${raw%$'\n'*}"
+  [ -n "$FAUCET_CODE" ] || FAUCET_CODE="000"
+  FAUCET_OK=$(faucet_field "$FAUCET_RESP" success)
+}
+
+# Which declared field the gateway refused, empty for every other outcome.
+# operator_identity.ts phrases each rejection as "<field> must …" and the
+# route's only other 400 is "Invalid SS58 address", so the leading word of the
+# error names the field exactly.
+faucet_refused_field() {
+  [ "$1" = "400" ] || return 0
+  printf '%s' "$2" | python3 -c "
+import json, sys
+try:
+    err = json.load(sys.stdin).get('error', '')
+except Exception:
+    raise SystemExit(0)
+if isinstance(err, str) and err.split(' ', 1)[0] in (
+    'operator_label', 'contact', 'cardano_pool_id'
+):
+    print(err.split(' ', 1)[0])
+" 2>/dev/null || true
+}
+
 # Request faucet drip (auto-registers in gateway + provides tMATRA for fees)
 if [ -z "$API_KEY" ]; then
   info "Requesting faucet drip (auto-registers with gateway)..."
-  FAUCET_RESP=$(curl -sS --max-time 15 -X POST "${GATEWAY_URL}/faucet/drip" \
-    -H "Content-Type: application/json" \
-    -d "$(faucet_drip_body)" 2>/dev/null || echo "")
-  FAUCET_OK=$(faucet_field "$FAUCET_RESP" success)
+  faucet_drip_attempt
 
-  # A malformed optional field makes the gateway reject the whole drip, and the
-  # drip is what funds the operator's fees. Never let a declaration be the
-  # reason a node ends up unfunded: say what was refused, then re-request
-  # without it.
-  if [ "$FAUCET_OK" != "True" ] && [ "$IDENTITY_DECLARED" = true ]; then
-    warn "Faucet refused the optional operator details: $(faucet_field "$FAUCET_RESP" error)"
-    warn "Re-requesting without them so your node is still funded."
-    OPERATOR_LABEL="" OPERATOR_CONTACT="" CARDANO_POOL_ID=""
+  # The gateway records these details on the INSERT that creates the
+  # registration and offers no way to add them afterwards, so this address gets
+  # exactly one identity-bearing drip. Re-sending it stripped is only right
+  # when the gateway said the field itself was the problem; on a cooldown, an
+  # unhealthy chain, a failed transfer or a dead network the drip is still
+  # available and the declaration has to survive for a later attempt.
+  #
+  # Terminates in at most three passes: the gateway only names a field the
+  # request actually carried, and each pass drops the one it named.
+  while [ "$FAUCET_OK" != "True" ] && [ "$IDENTITY_DECLARED" = true ]; do
+    REFUSED=$(faucet_refused_field "$FAUCET_CODE" "$FAUCET_RESP")
+    [ -n "$REFUSED" ] || break
+    warn "The gateway refused ${REFUSED}: $(faucet_field "$FAUCET_RESP" error)"
+    warn "Dropping ${REFUSED} and asking again; your other details are kept."
+    case "$REFUSED" in
+      operator_label)  CONTACT_NAME="" ;;
+      contact)         CONTACT_HANDLE="" ;;
+      cardano_pool_id) CARDANO_POOL_ID="" ;;
+    esac
     IDENTITY_DECLARED=false
-    FAUCET_RESP=$(curl -sS --max-time 15 -X POST "${GATEWAY_URL}/faucet/drip" \
-      -H "Content-Type: application/json" \
-      -d "$(faucet_drip_body)" 2>/dev/null || echo "")
-    FAUCET_OK=$(faucet_field "$FAUCET_RESP" success)
-  fi
+    if [ -n "${CONTACT_NAME}${CONTACT_HANDLE}${CARDANO_POOL_ID}" ]; then
+      IDENTITY_DECLARED=true
+    fi
+    faucet_drip_attempt
+  done
 
   if [ "$FAUCET_OK" = "True" ]; then
     ok "Registered via faucet. tMATRA received — MOTRA will auto-generate."
@@ -597,7 +678,12 @@ if [ -z "$API_KEY" ]; then
     esac
   else
     FAUCET_ERR=$(faucet_field "$FAUCET_RESP" error)
-    warn "Faucet: ${FAUCET_ERR:-request failed} (daemon will retry on startup)"
+    warn "Faucet: ${FAUCET_ERR:-request failed} (HTTP ${FAUCET_CODE}) (daemon will retry on startup)"
+    if [ "$IDENTITY_DECLARED" = true ]; then
+      warn "Your details were NOT sent again without them — the failure was not about the details,"
+      warn "and they can only ever be stored on the registration a successful drip creates."
+      warn "Re-run this installer with the same options once the faucet is healthy."
+    fi
   fi
 fi
 
