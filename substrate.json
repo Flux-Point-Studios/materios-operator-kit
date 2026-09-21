@@ -1,0 +1,128 @@
+{
+  "repo": "materios-operator-kit",
+  "primitives": [
+    {
+      "id": "daemon-core",
+      "name": "Daemon core",
+      "desc": "Shared runtime plumbing for every operator-kit daemon module: configuration, the Substrate chain client, data models, the health server and heartbeat reporting.",
+      "kind": "toolkit",
+      "paths": [
+        "daemon/config.py",
+        "daemon/substrate_client.py",
+        "daemon/models.py",
+        "daemon/health_server.py",
+        "daemon/heartbeat.py"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "cert-daemon",
+      "name": "Cert daemon",
+      "desc": "Committee attestor: watches receipts, resolves blob locators through the gateway, verifies content (including the self-rooted short-circuit), attests availability certificates on chain and heartbeats.",
+      "kind": "agent",
+      "paths": [
+        "daemon/cert_daemon.py",
+        "daemon/blob_verifier.py",
+        "daemon/locator_registry.py",
+        "daemon/cert_builder.py",
+        "daemon/cert_store.py"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet",
+        "blob-gateway-api",
+        "evidence-submitter",
+        "settlement-attestors",
+        "slash-watcher",
+        "checkpoint-anchoring",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "checkpoint-anchoring",
+      "name": "Checkpoint anchoring",
+      "desc": "Batches certified receipts into a Merkle root on a size, age or interval trigger and posts it to the anchor worker; keyed only on the AvailabilityCertified event, so it is source-agnostic.",
+      "kind": "pipeline",
+      "paths": [
+        "daemon/checkpoint.py",
+        "daemon/merkle.py"
+      ],
+      "consumes": [
+        "materios-anchor-worker",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "evidence-submitter",
+      "name": "Evidence submitter",
+      "desc": "Lifts pending attestation evidence from the gateway to the tee-attestation pallet.",
+      "kind": "pipeline",
+      "paths": [
+        "daemon/evidence_submitter.py"
+      ],
+      "consumes": [
+        "gateway-attestation-evidence",
+        "tee-attestation-pallet",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "slash-watcher",
+      "name": "Slash watcher",
+      "desc": "Bad-attestation detection with multisig-aggregated slash and settlement evidence.",
+      "kind": "agent",
+      "paths": [
+        "daemon/slash_watcher.py",
+        "daemon/multisig_aggregator.py",
+        "daemon/watchtower.py"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet",
+        "blob-gateway-api",
+        "settlement-attestors",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "settlement-attestors",
+      "name": "Settlement attestors",
+      "desc": "Settle-claim and expire-policy attestors that read Cardano state and attest outcomes on chain.",
+      "kind": "agent",
+      "paths": [
+        "daemon/settle_claim_attestor.py",
+        "daemon/expire_policy_attestor.py"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "operator-install",
+      "name": "Operator install",
+      "desc": "One-command onboarding for validators and attestors: key generation, faucet bootstrap with optional identity capture, daemon install, update and watchdog.",
+      "kind": "toolkit",
+      "paths": [
+        "install.sh",
+        "install-linux.sh",
+        "install-macos.command",
+        "install-windows.bat",
+        "update.sh",
+        "watchdog.sh",
+        "generate_key.py"
+      ],
+      "consumes": [
+        "gateway-faucet",
+        "cert-daemon"
+      ],
+      "status": "live"
+    }
+  ]
+}
