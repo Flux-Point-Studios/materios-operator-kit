@@ -1,0 +1,44 @@
+when:
+  - event: [push, pull_request]
+    branch: main
+
+# Operators pull :latest on amd64 and arm64 hosts, so it must stay a two-arch
+# index: a single-arch push leaves every arm64 attestor unable to pull.
+# Kaniko builds each arch in userspace (no privileged container, no docker.sock
+# on the shared CI host) into an OCI layout. The arm64 build runs the
+# Dockerfile's RUN steps through the host's qemu-aarch64 binfmt handler.
+steps:
+  - name: build-amd64
+    image: woodpeckerci/plugin-kaniko:2.3.2
+    settings:
+      dry_run: true
+      extra_opts: --custom-platform=linux/amd64 --oci-layout-path=/woodpecker/oci/amd64 --digest-file=/woodpecker/oci/amd64.digest
+
+  - name: build-arm64
+    image: woodpeckerci/plugin-kaniko:2.3.2
+    settings:
+      dry_run: true
+      extra_opts: --custom-platform=linux/arm64 --oci-layout-path=/woodpecker/oci/arm64 --digest-file=/woodpecker/oci/arm64.digest
+
+  # PRs build but never publish: :latest must not move to unmerged code.
+  # Tags are written only after both arches built, so a failed leg can never
+  # leave a single-arch :latest behind.
+  - name: publish
+    image: gcr.io/go-containerregistry/crane/debug:v0.22.1
+    # The debug image ships busybox under /busybox and has no /bin/sh.
+    entrypoint: ["/busybox/sh", "-c", "echo $$CI_SCRIPT | base64 -d | /busybox/sh -e"]
+    environment:
+      IMAGE: ghcr.io/flux-point-studios/materios-operator-kit
+      GHCR_TOKEN:
+        from_secret: gchr_token
+    commands:
+      - echo "$${GHCR_TOKEN}" | crane auth login ghcr.io -u realdecimalist --password-stdin
+      - AMD64="$${IMAGE}@$$(cat /woodpecker/oci/amd64.digest)"
+      - ARM64="$${IMAGE}@$$(cat /woodpecker/oci/arm64.digest)"
+      - crane push /woodpecker/oci/amd64 "$${AMD64}"
+      - crane push /woodpecker/oci/arm64 "$${ARM64}"
+      - crane index append -m "$${AMD64}" -m "$${ARM64}" -t "$${IMAGE}:${CI_COMMIT_SHA}"
+      - crane tag "$${IMAGE}:${CI_COMMIT_SHA}" latest
+    when:
+      - event: push
+        branch: main
