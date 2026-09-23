@@ -177,9 +177,9 @@ class TestFlushPostsAnchorIdEverywhere:
                 }
                 return resp
 
-            def fake_put(url, json=None, headers=None, timeout=None):
+            def fake_put(url, data=None, headers=None, timeout=None):
                 captured.setdefault("gateway_calls", []).append(
-                    {"url": url, "payload": json, "headers": headers}
+                    {"url": url, "payload": json.loads(data), "headers": headers}
                 )
                 resp = MagicMock()
                 resp.status_code = 200
@@ -227,9 +227,9 @@ class TestFlushPostsAnchorIdEverywhere:
                 }
                 return resp
 
-            def fake_put(url, json=None, headers=None, timeout=None):
+            def fake_put(url, data=None, headers=None, timeout=None):
                 seen["gateway_url"] = url
-                seen["gateway_payload"] = json
+                seen["gateway_payload"] = json.loads(data)
                 seen["gateway_headers"] = headers
                 resp = MagicMock()
                 resp.status_code = 200
@@ -285,7 +285,7 @@ class TestFlushPostsAnchorIdEverywhere:
 
             seen_gateway_url = []
 
-            def fake_put(url, json=None, headers=None, timeout=None):
+            def fake_put(url, data=None, headers=None, timeout=None):
                 seen_gateway_url.append(url)
                 resp = MagicMock()
                 resp.status_code = 200
@@ -319,7 +319,7 @@ class TestFlushPostsAnchorIdEverywhere:
                 }
                 return resp
 
-            def fake_put(url, json=None, headers=None, timeout=None):
+            def fake_put(url, data=None, headers=None, timeout=None):
                 resp = MagicMock()
                 resp.status_code = 200
                 return resp
@@ -370,7 +370,7 @@ class TestFlushPostsAnchorIdEverywhere:
                 }
                 return resp
 
-            def fake_put(url, json=None, headers=None, timeout=None):
+            def fake_put(url, data=None, headers=None, timeout=None):
                 resp = MagicMock()
                 resp.status_code = 503
                 resp.text = "gateway down"
@@ -399,7 +399,7 @@ class TestPostBatchMetadata:
         with tempfile.TemporaryDirectory() as tmp:
             cp = _make_checkpointer(tmp)
 
-            def fake_put(url, json=None, headers=None, timeout=None):
+            def fake_put(url, data=None, headers=None, timeout=None):
                 resp = MagicMock()
                 resp.status_code = 200
                 return resp
@@ -417,7 +417,7 @@ class TestPostBatchMetadata:
         with tempfile.TemporaryDirectory() as tmp:
             cp = _make_checkpointer(tmp)
 
-            def fake_put(url, json=None, headers=None, timeout=None):
+            def fake_put(url, data=None, headers=None, timeout=None):
                 resp = MagicMock()
                 resp.status_code = 401
                 resp.text = "no auth"
@@ -453,7 +453,7 @@ class TestPostBatchMetadata:
 
             seen = {}
 
-            def fake_put(url, json=None, headers=None, timeout=None):
+            def fake_put(url, data=None, headers=None, timeout=None):
                 seen["url"] = url
                 resp = MagicMock()
                 resp.status_code = 200
