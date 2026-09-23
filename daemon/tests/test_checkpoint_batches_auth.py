@@ -24,7 +24,14 @@ Tests:
      (the actual fix: previously this path had no auth headers at all)
   7. _save_batch_history → _post_batch_metadata sequence still wraps
      correctly when called from flush()
+
+The PUT also carries a materios-upload-v2 signature, which binds method,
+path and the exact body bytes so a captured PUT cannot be resent with a
+different body. fixtures/upload-sig-v2-golden.json is the vector shared
+verbatim with materios-gateway and orynq-sdk.
 """
+import hashlib
+import json
 import os
 import tempfile
 import time
@@ -33,8 +40,11 @@ from unittest.mock import patch, MagicMock
 import pytest
 from substrateinterface import Keypair
 
-from daemon.checkpoint import CardanoCheckpointer
+from daemon.checkpoint import CardanoCheckpointer, upload_sig_v2_message
 from daemon.config import DaemonConfig
+
+with open(os.path.join(os.path.dirname(__file__), "fixtures", "upload-sig-v2-golden.json"), encoding="utf-8") as f:
+    GOLDEN = json.load(f)
 
 
 @pytest.fixture
@@ -205,3 +215,83 @@ def test_keypair_attribute_retained(tmp_state_file):
     assert hasattr(cp, "keypair")
     assert isinstance(cp.keypair, Keypair)
     assert cp.keypair.ss58_address == cp.submitter_address
+
+
+# ---------------------------------------------------------------------------
+# materios-upload-v2
+# ---------------------------------------------------------------------------
+def test_v2_signing_string_matches_the_shared_golden_vector():
+    assert hashlib.sha256(GOLDEN["body"].encode("utf-8")).hexdigest() == GOLDEN["body_sha256"]
+    assert upload_sig_v2_message(
+        GOLDEN["method"], GOLDEN["path"], GOLDEN["body_sha256"], GOLDEN["id"], GOLDEN["address"], GOLDEN["ts"],
+    ) == GOLDEN["signing_string"]
+
+
+@pytest.mark.parametrize("signer", ["substrate-interface", "polkadot-js"])
+def test_golden_signatures_verify_here(signer):
+    alice = Keypair(ss58_address=GOLDEN["address"])
+    sig = bytes.fromhex(GOLDEN["signatures"][signer][2:])
+    assert alice.verify(GOLDEN["signing_string"].encode("utf-8"), sig)
+
+
+def test_batch_put_carries_a_v2_signature_over_the_exact_bytes_sent(tmp_state_file):
+    cp = _make_checkpointer(tmp_state_file)
+    anchor_id = "0x" + "ab" * 32
+    anchor_id_no_0x = "ab" * 32
+    eligible = [{"receipt_id": "0x" + "11" * 32, "block_num": 100, "cert_hash": "22" * 32}]
+
+    with patch("daemon.checkpoint.requests.put") as mock_put:
+        mock_put.return_value = MagicMock(status_code=200, text="ok")
+        assert cp._post_batch_metadata(anchor_id, "44" * 32, eligible, ["33" * 32]) is True
+
+    call = mock_put.call_args
+    path = f"/batches/{anchor_id_no_0x}"
+    assert call[0][0] == f"http://gw.test:3000{path}"
+    body = call[1]["data"]
+    assert isinstance(body, bytes)
+    assert json.loads(body)["anchorId"] == anchor_id
+    headers = call[1]["headers"]
+    assert headers["Content-Type"] == "application/json"
+    ts = int(headers["x-upload-ts"])
+
+    message = (
+        f"materios-upload-v2|PUT|{path}|{hashlib.sha256(body).hexdigest()}"
+        f"|{anchor_id_no_0x}|{_alice_address()}|{ts}"
+    )
+    sig = bytes.fromhex(headers["x-upload-sig-v2"][2:])
+    assert Keypair.create_from_uri("//Alice").verify(message.encode("utf-8"), sig)
+
+
+def test_v2_signature_does_not_cover_a_different_body(tmp_state_file):
+    cp = _make_checkpointer(tmp_state_file)
+    eligible = [{"receipt_id": "0x" + "11" * 32, "block_num": 1, "cert_hash": "22" * 32}]
+    with patch("daemon.checkpoint.requests.put") as mock_put:
+        mock_put.return_value = MagicMock(status_code=200, text="ok")
+        cp._post_batch_metadata("0x" + "ab" * 32, "44" * 32, eligible, ["33" * 32])
+
+    headers = mock_put.call_args[1]["headers"]
+    forged = json.loads(mock_put.call_args[1]["data"])
+    forged["cardanoTxHash"] = "66" * 32
+    forged_bytes = json.dumps(forged).encode("utf-8")
+    message = (
+        f"materios-upload-v2|PUT|/batches/{'ab' * 32}|{hashlib.sha256(forged_bytes).hexdigest()}"
+        f"|{'ab' * 32}|{_alice_address()}|{headers['x-upload-ts']}"
+    )
+    sig = bytes.fromhex(headers["x-upload-sig-v2"][2:])
+    assert not Keypair.create_from_uri("//Alice").verify(message.encode("utf-8"), sig)
+
+
+def test_v1_and_v2_are_both_sent_with_an_address_as_api_key(tmp_state_file):
+    """An operator who configured their own address as BLOB_GATEWAY_API_KEY:
+    the gateway ignores that header and authenticates the signatures."""
+    cp = _make_checkpointer(tmp_state_file, blob_gateway_api_key=_alice_address())
+    eligible = [{"receipt_id": "0x" + "11" * 32, "block_num": 1, "cert_hash": "22" * 32}]
+    with patch("daemon.checkpoint.requests.put") as mock_put:
+        mock_put.return_value = MagicMock(status_code=200, text="ok")
+        cp._post_batch_metadata("0x" + "ab" * 32, "44" * 32, eligible, ["33" * 32])
+
+    headers = mock_put.call_args[1]["headers"]
+    assert headers["x-api-key"] == _alice_address()
+    assert headers["x-upload-sig"].startswith("0x")
+    assert headers["x-upload-sig-v2"].startswith("0x")
+    assert headers["x-upload-sig"] != headers["x-upload-sig-v2"]

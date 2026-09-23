@@ -50,6 +50,15 @@ def merkle_root(leaves: list[bytes]) -> bytes:
     return layer[0]
 
 
+def upload_sig_v2_message(
+    method: str, path: str, body_sha256: str, content_id: str, address: str, ts: int
+) -> str:
+    """The materios-upload-v2 signing string. The gateway rebuilds it from the
+    request it receives: `path` is the path appended to the gateway base URL,
+    without a query, and `body_sha256` hashes the exact body bytes sent."""
+    return f"materios-upload-v2|{method}|{path}|{body_sha256}|{content_id}|{address}|{ts}"
+
+
 def compute_anchor_id(root_hash_hex: str, manifest_hash_hex: str) -> str:
     """Deterministically synthesize the anchorId from (rootHash, manifestHash).
 
@@ -447,39 +456,40 @@ class CardanoCheckpointer:
             if anchor_id_clean.startswith("0x"):
                 anchor_id_clean = anchor_id_clean[2:]
 
-            # Auth: sr25519 sig over `materios-upload-v1|{anchorId}|{address}|{ts}`
-            # (task #122). Pre-image format pinned by gateway's upload-auth.ts.
-            # `contentHash` slot is `anchorId` per the route's resolveAuth call.
-            # IMPORTANT: gateway uses the URL-path anchorId (no 0x), so the
-            # signing string MUST use the same form — sign with anchor_id_clean,
-            # not the 0x-prefixed form.
+            # Auth: two sr25519 signatures over the same timestamp. v2 binds
+            # method, path and the exact body bytes, and is what the gateway
+            # requires for batch writes; v1 binds only the id and keeps a
+            # gateway that predates v2 working. Both use the URL-path anchorId
+            # (no 0x), which is the id the gateway verifies against.
+            path = f"/batches/{anchor_id_clean}"
+            body = json.dumps(batch_metadata).encode("utf-8")
             ts = int(time.time())
-            signing_string = (
-                f"materios-upload-v1|{anchor_id_clean}|{self.submitter_address}|{ts}"
+            v1_message = f"materios-upload-v1|{anchor_id_clean}|{self.submitter_address}|{ts}"
+            v2_message = upload_sig_v2_message(
+                "PUT", path, hashlib.sha256(body).hexdigest(), anchor_id_clean, self.submitter_address, ts
             )
-            sig_bytes = self.keypair.sign(signing_string.encode("utf-8"))
-            sig_hex = "0x" + sig_bytes.hex()
 
             headers = {
                 "Content-Type": "application/json",
-                "x-upload-sig": sig_hex,
+                "x-upload-sig": "0x" + self.keypair.sign(v1_message.encode("utf-8")).hex(),
+                "x-upload-sig-v2": "0x" + self.keypair.sign(v2_message.encode("utf-8")).hex(),
                 "x-uploader-address": self.submitter_address,
                 "x-upload-ts": str(ts),
             }
             # Belt-and-suspenders: if an API key is also configured, attach it.
-            # Gateway resolveAuth checks api-key BEFORE upload-sig, so when both
-            # are present it'll authenticate via api-key. Either path produces a
-            # 200; we prefer sig because it doesn't require provisioning a
-            # static secret in compose env.
+            # Gateway resolveAuth checks api-key BEFORE upload-sig, so a real
+            # key authenticates via api-key; an address configured as the key
+            # is ignored and the signatures decide.
             if blob_gateway_api_key:
                 headers["x-api-key"] = blob_gateway_api_key
 
             # PUT is idempotent and matches the gateway's documented upsert
             # contract (routes/batches.ts wires both POST and PUT to the same
-            # handler; PUT is preferred for re-tries).
+            # handler; PUT is preferred for re-tries). The body is sent as the
+            # bytes that were signed.
             resp = requests.put(
-                f"{blob_gateway_url}/batches/{anchor_id_clean}",
-                json=batch_metadata,
+                f"{blob_gateway_url}{path}",
+                data=body,
                 headers=headers,
                 timeout=10,
             )
