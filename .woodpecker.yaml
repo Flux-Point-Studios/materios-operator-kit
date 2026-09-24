@@ -74,7 +74,8 @@ steps:
     entrypoint: *busybox_entrypoint
     commands:
       - D=$$(cat /woodpecker/oci-index.digest)
-      - 'grep -Eq "^ *image: ghcr\.io/flux-point-studios/materios-operator-kit@$${D} *$$" .woodpecker.yaml || { echo "ci/oci-index now builds to $${D}; pin publish-index and the gchr_token image filter to it"; exit 1; }'
+      - 'P=$$(sed -n "/^  - name: publish-index$$/,/^  - name: /s/^    image: //p" .woodpecker.yaml)'
+      - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index and the gchr_token image filter to the new digest"; exit 1; }'
 
   - name: build-amd64
     image: *kaniko
