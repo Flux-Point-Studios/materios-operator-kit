@@ -10,40 +10,120 @@ labels:
 # Operators pull :latest on amd64 and arm64 hosts, so it must stay a two-arch
 # index: a single-arch push leaves every arm64 attestor unable to pull.
 # Kaniko builds each arch in userspace (no privileged container, no docker.sock
-# on the shared CI host) into an OCI layout. The arm64 build runs the
-# Dockerfile's RUN steps through the host's qemu-aarch64 binfmt handler.
+# on the shared CI host) into an OCI layout. The arm64 build runs the Dockerfile's
+# RUN steps through the host's qemu-aarch64 binfmt handler.
+#
+# The arch builds hold no registry credential: kaniko runs the Dockerfile's RUN steps
+# (apt, pip and their build backends) in its own container, where any credential it
+# was given is readable. The GHCR token is a secret restricted to plugin images, and
+# the only arch-image step that receives it is publish-index: the ci/oci-index plugin,
+# pinned by digest, which pushes the two layouts, joins them into the index at :<sha>,
+# and moves :latest.
+variables:
+  # plugin-kaniko 2.3.2, by digest alone: a secret image filter can only bind an exact
+  # digest in that form (its tag syntax rejects dots).
+  - &kaniko woodpeckerci/plugin-kaniko@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
+  - &crane gcr.io/go-containerregistry/crane/debug:v0.22.1@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
+  # The crane debug image ships busybox under /busybox and has no /bin/sh.
+  - &busybox_entrypoint ["/busybox/sh", "-c", "echo $$CI_SCRIPT | base64 -d | /busybox/sh -e"]
+  # --reproducible makes the plugin's digest a function of its sources alone, which is
+  # what lets check-oci-index-pin compare a rebuild against the pinned digest.
+  - &oci_index_build
+    dockerfile: ci/oci-index/Dockerfile
+    context: ci/oci-index
+    extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/oci-index.digest
+  - &on_pr
+    - event: pull_request
+  - &on_main
+    - event: push
+      branch: main
+
 steps:
+  - name: test-oci-index
+    image: *crane
+    entrypoint: *busybox_entrypoint
+    commands:
+      - /busybox/sh ci/oci-index/test.sh
+
+  - name: build-oci-index
+    image: *kaniko
+    settings:
+      <<: *oci_index_build
+      dry_run: true
+    when: *on_pr
+
+  # Builds the plugin image itself: its Dockerfile has no RUN step and a digest-pinned
+  # base, so the credential here is never exposed to third-party build code.
+  - name: push-oci-index
+    image: *kaniko
+    settings:
+      <<: *oci_index_build
+      registry: ghcr.io
+      # plugin-kaniko prefixes `registry` to `repo`, so `repo` must not repeat ghcr.io.
+      repo: flux-point-studios/materios-operator-kit
+      tags: ci-oci-index
+      username: realdecimalist
+      password:
+        from_secret: gchr_token
+    when: *on_main
+
+  # publish-index runs the plugin by digest, and the gchr_token secret's image filter
+  # names that same digest. A plugin change fails here until both are updated.
+  - name: check-oci-index-pin
+    image: *crane
+    entrypoint: *busybox_entrypoint
+    commands:
+      - D=$$(cat /woodpecker/oci-index.digest)
+      - 'P=$$(sed -n "/^  - name: publish-index$$/,/^  - name: /s/^    image: //p" .woodpecker.yaml)'
+      - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index and the gchr_token image filter to the new digest"; exit 1; }'
+
   - name: build-amd64
-    image: woodpeckerci/plugin-kaniko:2.3.2
+    image: *kaniko
     settings:
       dry_run: true
-      extra_opts: --custom-platform=linux/amd64 --oci-layout-path=/woodpecker/oci/amd64 --digest-file=/woodpecker/oci/amd64.digest
+      extra_opts: --custom-platform=linux/amd64 --oci-layout-path=/woodpecker/oci/amd64
 
   - name: build-arm64
-    image: woodpeckerci/plugin-kaniko:2.3.2
+    image: *kaniko
     settings:
       dry_run: true
-      extra_opts: --custom-platform=linux/arm64 --oci-layout-path=/woodpecker/oci/arm64 --digest-file=/woodpecker/oci/arm64.digest
+      extra_opts: --custom-platform=linux/arm64 --oci-layout-path=/woodpecker/oci/arm64
 
-  # PRs build but never publish: :latest must not move to unmerged code.
-  # Tags are written only after both arches built, so a failed leg can never
-  # leave a single-arch :latest behind.
-  - name: publish
-    image: gcr.io/go-containerregistry/crane/debug:v0.22.1
-    # The debug image ships busybox under /busybox and has no /bin/sh.
-    entrypoint: ["/busybox/sh", "-c", "echo $$CI_SCRIPT | base64 -d | /busybox/sh -e"]
+  # Runs publish-index's exact logic against the real layouts and a throwaway registry,
+  # so a wrong-arch or unpushable build fails the pull request instead of main.
+  - name: rehearse-publish
+    image: *crane
+    entrypoint: *busybox_entrypoint
     environment:
-      IMAGE: ghcr.io/flux-point-studios/materios-operator-kit
-      GHCR_TOKEN:
-        from_secret: gchr_token
+      PLUGIN_SOURCES: /woodpecker/oci/amd64=localhost:5000/opkit:pr-amd64,/woodpecker/oci/arm64=localhost:5000/opkit:pr-arm64
+      PLUGIN_PLATFORMS: linux/amd64,linux/arm64
+      PLUGIN_TARGET: localhost:5000/opkit:pr
+      PLUGIN_TAGS: latest
     commands:
-      - echo "$${GHCR_TOKEN}" | crane auth login ghcr.io -u realdecimalist --password-stdin
-      - AMD64="$${IMAGE}@$$(cat /woodpecker/oci/amd64.digest)"
-      - ARM64="$${IMAGE}@$$(cat /woodpecker/oci/arm64.digest)"
-      - crane push /woodpecker/oci/amd64 "$${AMD64}"
-      - crane push /woodpecker/oci/arm64 "$${ARM64}"
-      - crane index append -m "$${AMD64}" -m "$${ARM64}" -t "$${IMAGE}:${CI_COMMIT_SHA}"
-      - crane tag "$${IMAGE}:${CI_COMMIT_SHA}" latest
-    when:
-      - event: push
-        branch: main
+      # --disk keeps the two images out of memory; it 500s on every upload unless the
+      # directory already exists.
+      - mkdir -p /tmp/registry
+      - crane registry serve --address localhost:5000 --disk /tmp/registry >/tmp/registry.log 2>&1 &
+      - until crane catalog localhost:5000 >/dev/null 2>&1; do sleep 0.2; done
+      - /busybox/sh ci/oci-index/oci-index.sh
+    when: *on_pr
+
+  # Moves :latest only once the index is verified to carry both platforms, so a failed
+  # leg never leaves :latest single-arch.
+  - name: publish-index
+    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:fa9b1a3baeb2bc943b07cd71cd0511681904801369f24f39882be71346c7db6a
+    settings:
+      registry: ghcr.io
+      username: realdecimalist
+      password:
+        from_secret: gchr_token
+      sources:
+        - /woodpecker/oci/amd64=ghcr.io/flux-point-studios/materios-operator-kit:${CI_COMMIT_SHA}-amd64
+        - /woodpecker/oci/arm64=ghcr.io/flux-point-studios/materios-operator-kit:${CI_COMMIT_SHA}-arm64
+      platforms:
+        - linux/amd64
+        - linux/arm64
+      target: ghcr.io/flux-point-studios/materios-operator-kit:${CI_COMMIT_SHA}
+      tags:
+        - latest
+    when: *on_main
