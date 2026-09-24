@@ -2,6 +2,11 @@ when:
   - event: [push, pull_request]
     branch: main
 
+# Only agents with a qemu-aarch64 binfmt handler (Node-2) carry this label; the
+# arm64 leg's RUN steps cannot execute anywhere else.
+labels:
+  arm64-emu: "true"
+
 # Operators pull :latest on amd64 and arm64 hosts, so it must stay a two-arch
 # index: a single-arch push leaves every arm64 attestor unable to pull.
 # Kaniko builds each arch in userspace (no privileged container, no docker.sock
