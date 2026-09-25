@@ -13,17 +13,19 @@ labels:
 # on the shared CI host) into an OCI layout. The arm64 build runs the Dockerfile's
 # RUN steps through the host's qemu-aarch64 binfmt handler.
 #
-# The arch builds hold no registry credential: kaniko runs the Dockerfile's RUN steps
-# (apt, pip and their build backends) in its own container, where any credential it
-# was given is readable. The GHCR token is a secret restricted to plugin images, and
-# the only arch-image step that receives it is publish-index: the ci/oci-index plugin,
-# pinned by digest, which pushes the two layouts, joins them into the index at :<sha>,
-# and moves :latest.
+# No build holds a registry credential: kaniko runs the Dockerfile's RUN steps (apt,
+# pip and their build backends) in its own container, where any credential it was
+# given is readable. The GHCR token is a secret restricted to the ci/oci-index plugin
+# by digest, and only the plugin pushes: the arch layouts (publish-index, which joins
+# them into the index at :<sha> and moves :latest) and the plugin's own image.
 variables:
   # plugin-kaniko 2.3.2, by digest alone: a secret image filter can only bind an exact
   # digest in that form (its tag syntax rejects dots).
   - &kaniko woodpeckerci/plugin-kaniko@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
   - &crane gcr.io/go-containerregistry/crane/debug:v0.22.1@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
+  # The plugin already on GHCR, which pushes the plugin image built here. A plugin change
+  # moves publish-index to the new digest first; this pin follows once that is on GHCR.
+  - &oci_index_in_service ghcr.io/flux-point-studios/materios-operator-kit@sha256:fa9b1a3baeb2bc943b07cd71cd0511681904801369f24f39882be71346c7db6a
   # The crane debug image ships busybox under /busybox and has no /bin/sh.
   - &busybox_entrypoint ["/busybox/sh", "-c", "echo $$CI_SCRIPT | base64 -d | /busybox/sh -e"]
   # --reproducible makes the plugin's digest a function of its sources alone, which is
@@ -31,7 +33,7 @@ variables:
   - &oci_index_build
     dockerfile: ci/oci-index/Dockerfile
     context: ci/oci-index
-    extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/oci-index.digest
+    extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/oci-index.digest --oci-layout-path=/woodpecker/oci/oci-index
   - &on_pr
     - event: pull_request
   - &on_main
@@ -50,21 +52,19 @@ steps:
     settings:
       <<: *oci_index_build
       dry_run: true
-    when: *on_pr
 
-  # Builds the plugin image itself: its Dockerfile has no RUN step and a digest-pinned
-  # base, so the credential here is never exposed to third-party build code.
   - name: push-oci-index
-    image: *kaniko
+    image: *oci_index_in_service
     settings:
-      <<: *oci_index_build
       registry: ghcr.io
-      # plugin-kaniko prefixes `registry` to `repo`, so `repo` must not repeat ghcr.io.
-      repo: flux-point-studios/materios-operator-kit
-      tags: ci-oci-index
       username: realdecimalist
       password:
         from_secret: gchr_token
+      sources:
+        - /woodpecker/oci/oci-index=ghcr.io/flux-point-studios/materios-operator-kit:ci-oci-index
+      platforms:
+        - linux/amd64
+      target: ghcr.io/flux-point-studios/materios-operator-kit:ci-oci-index
     when: *on_main
 
   # publish-index runs the plugin by digest, and the gchr_token secret's image filter
@@ -113,7 +113,7 @@ steps:
   # Moves :latest only once the index is verified to carry both platforms, so a failed
   # leg never leaves :latest single-arch.
   - name: publish-index
-    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:62cdd8775b51a46474e242ac33cfbb9aea58856162bd1e126173e62bd9d791ec
+    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:d3178aaf4dc548dda5bd2d15a09f7c650ac1325fa7bc9215a861a3f34774c84b
     settings:
       registry: ghcr.io
       username: realdecimalist

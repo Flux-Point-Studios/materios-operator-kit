@@ -28,6 +28,7 @@ single_arch() {
 single_arch "$REG/src:amd64" linux/amd64
 single_arch "$REG/src:arm64" linux/arm64
 single_arch "$REG/src:also-amd64" linux/amd64
+single_arch "$REG/src:windows" windows/amd64
 crane pull --format oci "$REG/src:amd64" /tmp/layout-amd64
 crane pull --format oci "$REG/src:arm64" /tmp/layout-arm64
 
@@ -103,6 +104,10 @@ rejects "an index missing an expected platform fails" wrongarch "do not match th
   "$REG/src:amd64,$REG/src:also-amd64" linux/amd64,linux/arm64
 rejects "an index carrying an extra platform entry fails" extra "do not match the expected" \
   "$REG/src:amd64,$REG/src:arm64,$REG/src:also-amd64" linux/amd64,linux/arm64
+rejects "an image for another os fails on one platform" winone "do not match the expected" \
+  "$REG/src:windows" linux/amd64
+rejects "an image for another os fails in an index" winidx "do not match the expected" \
+  "$REG/src:windows,$REG/src:arm64" linux/amd64,linux/arm64
 rejects "a missing source fails" nosrc "cannot resolve source: $REG/src:missing" \
   "$REG/src:amd64,$REG/src:missing" linux/amd64,linux/arm64
 if exists "$REG/nosrc:abc"; then bad "a missing source still wrote the index"; fi
@@ -119,6 +124,28 @@ else
   ok "a missing target fails"
 fi
 
+# With the token present the plugin only runs where a pipeline cannot choose its own
+# environment: those limits come from OCI_INDEX_* and CI_* variables that a
+# secret-holding plugin step cannot set, and the tests set them here.
+authorized() {
+  CI_PIPELINE_EVENT=push CI_COMMIT_BRANCH=main CI_REPO_DEFAULT_BRANCH=main \
+  OCI_INDEX_REGISTRY=$REG OCI_INDEX_PREFIX=$REG/fps/ \
+  PLUGIN_REGISTRY=$REG PLUGIN_USERNAME=ci PLUGIN_PASSWORD=s3cret-token "$@"
+}
+env_run() { env "$@" /busybox/sh "$HERE/oci-index.sh" >/tmp/plugin.out 2>&1; }
+# token_rejects NAME PATTERN VAR=VALUE...: an authorized run with those overrides must
+# fail for PATTERN and write nothing.
+denied=0
+token_rejects() {
+  name=$1 pattern=$2; shift 2
+  denied=$((denied + 1)); target=$REG/fps/denied$denied:abc
+  if authorized env_run PLUGIN_SOURCES="$REG/src:amd64" PLUGIN_PLATFORMS=linux/amd64 \
+    PLUGIN_TARGET="$target" PLUGIN_TAGS=latest "$@"; then bad "$name: accepted"
+  elif exists "$target"; then bad "$name: wrote the target anyway"
+  elif ! says "$pattern"; then bad "$name: failed for another reason"
+  else ok "$name"; fi
+}
+
 # A crane on PATH that refuses to run if the password reaches its argv, which any
 # process on the host can read from /proc.
 mkdir -p /tmp/shim
@@ -128,22 +155,37 @@ case " \$* " in *s3cret-token*) echo "password on argv: \$*" >&2; exit 97 ;; esa
 exec $(command -v crane) "\$@"
 EOF
 chmod +x /tmp/shim/crane
-if PATH=/tmp/shim:$PATH PLUGIN_REGISTRY=$REG PLUGIN_USERNAME=ci PLUGIN_PASSWORD=s3cret-token \
-  plugin "$REG/src:amd64,$REG/src:arm64" linux/amd64,linux/arm64 "$REG/authed:abc" ""; then
+if authorized env_run PATH=/tmp/shim:$PATH PLUGIN_SOURCES="/tmp/layout-amd64=$REG/fps/authed:abc" \
+  PLUGIN_PLATFORMS=linux/amd64 PLUGIN_TARGET="$REG/fps/authed:abc" PLUGIN_TAGS=latest; then
   stored=$(echo "$REG" | crane auth get)
   if says "s3cret-token"; then bad "the password appeared in the plugin output"
   elif [ "$stored" != '{"Username":"ci","Secret":"s3cret-token"}' ]; then bad "login stored [$stored], not the configured credential"
-  else ok "logs in with the configured credential, never printing it or passing it on argv"; fi
+  elif ! same "$REG/fps/authed:latest" "$REG/src:amd64"; then bad "the authorized run did not publish"
+  else ok "with the token, publishes on the default branch without printing it or passing it on argv"; fi
 else
-  bad "the login path exited non-zero"
+  bad "the authorized login path exited non-zero"
 fi
 
-if PLUGIN_PASSWORD=s3cret-token plugin "$REG/src:amd64,$REG/src:arm64" linux/amd64,linux/arm64 "$REG/noreg:abc" ""; then
-  bad "a password without registry and username was accepted"
-elif ! says "password needs registry and username"; then
-  bad "the incomplete login settings were not the reported failure"
+token_rejects "the token is refused on a pull request" "push or manual pipeline of the default branch" CI_PIPELINE_EVENT=pull_request
+token_rejects "the token is refused off the default branch" "push or manual pipeline of the default branch" CI_COMMIT_BRANCH=feature
+token_rejects "the token is refused without branch metadata" "push or manual pipeline of the default branch" CI_COMMIT_BRANCH= CI_REPO_DEFAULT_BRANCH=
+token_rejects "the token is only sent to the allowed registry" "may only be sent to $REG" PLUGIN_REGISTRY=evil.example
+token_rejects "the target must be under the allowed prefix" "outside $REG/fps/" PLUGIN_TARGET="$REG/elsewhere:abc"
+token_rejects "a source must be under the allowed prefix" "outside $REG/fps/" PLUGIN_SOURCES="/tmp/layout-amd64=$REG/elsewhere:abc"
+token_rejects "a password without a username fails" "password needs registry and username" PLUGIN_USERNAME=
+
+# A manifest that cannot be read is reported as such, not as an index.
+cat > /tmp/shim/crane <<EOF
+#!/busybox/sh
+[ "\$1" = manifest ] && { echo "registry unavailable" >&2; exit 1; }
+exec $(command -v crane) "\$@"
+EOF
+if PATH=/tmp/shim:$PATH plugin "$REG/src:amd64" linux/amd64 "$REG/unreadable:abc" latest; then
+  bad "an unreadable manifest was accepted"
+elif ! says "cannot read the manifest of $REG/unreadable:abc"; then
+  bad "an unreadable manifest was not reported as such"
 else
-  ok "a password without registry and username fails"
+  ok "an unreadable manifest is reported as unreadable"
 fi
 
 [ "$fails" -eq 0 ] || { echo "$fails test(s) failed"; exit 1; }

@@ -11,6 +11,11 @@
 #   target     ref the result is pushed to
 #   tags       extra tags moved to target only after it verifies (optional)
 #   registry, username, password   login, when password is set (optional)
+#
+# With a password, the plugin runs only on a push or manual pipeline of the default
+# branch, logs in only to OCI_INDEX_REGISTRY and writes only under OCI_INDEX_PREFIX.
+# Those come from the environment, not from settings: Woodpecker refuses a secret to
+# any step that sets its own environment, so no pipeline can widen them.
 set -euf
 
 die() { echo "oci-index: $*" >&2; exit 1; }
@@ -26,7 +31,18 @@ TARGET=${PLUGIN_TARGET:-}
 
 if [ -n "${PLUGIN_PASSWORD:-}" ]; then
   [ -n "${PLUGIN_REGISTRY:-}" ] && [ -n "${PLUGIN_USERNAME:-}" ] || die "password needs registry and username"
-  printf '%s' "$PLUGIN_PASSWORD" | crane auth login "$PLUGIN_REGISTRY" -u "$PLUGIN_USERNAME" --password-stdin >/dev/null
+  default=${CI_REPO_DEFAULT_BRANCH:-}
+  case "${CI_PIPELINE_EVENT:-}:${CI_COMMIT_BRANCH:-}" in
+    push:"$default" | manual:"$default") [ -n "$default" ] ;;
+    *) false ;;
+  esac || die "the token is only used on a push or manual pipeline of the default branch"
+  registry=${OCI_INDEX_REGISTRY:-ghcr.io}
+  prefix=${OCI_INDEX_PREFIX:-ghcr.io/flux-point-studios/}
+  [ "$PLUGIN_REGISTRY" = "$registry" ] || die "the token may only be sent to $registry"
+  for ref in $TARGET $(echo "$SOURCES" | sed 's/^[^=]*=//'); do
+    case "$ref" in "$prefix"*) ;; *) die "$ref is outside $prefix" ;; esac
+  done
+  printf '%s' "$PLUGIN_PASSWORD" | crane auth login "$registry" -u "$PLUGIN_USERNAME" --password-stdin >/dev/null
 fi
 
 set --
@@ -45,15 +61,17 @@ if [ "$(echo "$PLATFORMS" | wc -l)" -eq 1 ]; then
   [ "$#" -eq 2 ] || die "one platform takes exactly one source"
   src=$2
   [ "$src" = "$TARGET" ] || crane copy "$src" "$TARGET" >/dev/null
-  # crane reads an index's first matching child as its config, so an index here would
-  # verify as whichever platform it happens to lead with.
-  crane manifest "$TARGET" | jq -e '.config' >/dev/null || die "$src is an index, not a single image"
+  manifest=$(crane manifest "$TARGET") || die "cannot read the manifest of $TARGET"
+  # crane config resolves an index to its linux/amd64 child, so without this an index
+  # carrying any amd64 entry would pass an amd64 check.
+  echo "$manifest" | jq -e '.config' >/dev/null || die "$src is an index, not a single image"
   got=$(crane config "$TARGET" | jq -r '.os + "/" + .architecture' | words)
 else
   crane index append "$@" -t "$TARGET"
+  manifest=$(crane manifest "$TARGET") || die "cannot read the manifest of $TARGET"
   # crane writes each entry's platform from the source image's config, so this checks
   # what was actually built, not what the sources were named.
-  got=$(crane manifest "$TARGET" | jq -r '.manifests[].platform | .os + "/" + .architecture' | words)
+  got=$(echo "$manifest" | jq -r '.manifests[].platform | .os + "/" + .architecture' | words)
 fi
 want=$(echo "$PLATFORMS" | words)
 [ "$got" = "$want" ] || die "platforms [${got% }] do not match the expected [${want% }]; extra tags left unchanged"
