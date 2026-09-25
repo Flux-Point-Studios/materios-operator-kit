@@ -1,12 +1,15 @@
 #!/busybox/sh
 # Exercises oci-index.sh against crane's in-memory registry. Runs in the plugin's own
-# base image (crane/debug), locally or as a CI step:
+# base image (crane/debug) with the plugin's pinned jq fetched in, locally or as a CI step:
 #   docker run --rm -v "$PWD:/src" -w /src --entrypoint /busybox/sh <crane/debug image> ci/oci-index/test.sh
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REG=localhost:5000
 fails=0
+
+/busybox/sh "$HERE/fetch-jq.sh" /tmp/jq
+PATH=/tmp/jq:$PATH
 
 crane registry serve --address "$REG" >/tmp/registry.log 2>&1 &
 i=0
@@ -74,6 +77,27 @@ if plugin "$REG/src:arm64,$REG/src:amd64" linux/amd64,linux/arm64 "$REG/order:ab
 else
   bad "a reordered source list was rejected or mis-indexed"
 fi
+
+# One platform publishes the image itself, as a single-arch build always has, so
+# deploy scripts that pull or pin it see the same kind of manifest as before.
+if plugin "/tmp/layout-amd64=$REG/one:abc" linux/amd64 "$REG/one:abc" latest \
+  && crane manifest "$REG/one:abc" | jq -e '.config' >/dev/null \
+  && same "$REG/one:abc" "$REG/src:amd64" && same "$REG/one:latest" "$REG/one:abc"; then
+  ok "one platform publishes the pushed image itself, not an index, under every tag"
+else
+  bad "one platform did not publish the plain image under every tag"
+fi
+if plugin "$REG/src:amd64" linux/amd64 "$REG/onecopy:abc" latest && same "$REG/onecopy:abc" "$REG/src:amd64"; then
+  ok "one platform copies a source ref that differs from target"
+else
+  bad "one platform did not copy its source to target"
+fi
+rejects "one platform with an image built for another fails" onewrong "do not match the expected" \
+  "/tmp/layout-arm64=$REG/onewrong:abc" linux/amd64
+rejects "one platform with two sources fails" onetwo "one platform takes exactly one source" \
+  "$REG/src:amd64,$REG/src:also-amd64" linux/amd64
+rejects "one platform whose source is an index fails" oneidx "is an index, not a single image" \
+  "$REG/app:abc" linux/amd64
 
 rejects "an index missing an expected platform fails" wrongarch "do not match the expected" \
   "$REG/src:amd64,$REG/src:also-amd64" linux/amd64,linux/arm64

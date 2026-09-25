@@ -105,13 +105,15 @@ steps:
       - mkdir -p /tmp/registry
       - crane registry serve --address localhost:5000 --disk /tmp/registry >/tmp/registry.log 2>&1 &
       - until crane catalog localhost:5000 >/dev/null 2>&1; do sleep 0.2; done
+      - /busybox/sh ci/oci-index/fetch-jq.sh /tmp/jq
+      - export PATH=/tmp/jq:$$PATH
       - /busybox/sh ci/oci-index/oci-index.sh
     when: *on_pr
 
   # Moves :latest only once the index is verified to carry both platforms, so a failed
   # leg never leaves :latest single-arch.
   - name: publish-index
-    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:fa9b1a3baeb2bc943b07cd71cd0511681904801369f24f39882be71346c7db6a
+    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:62cdd8775b51a46474e242ac33cfbb9aea58856162bd1e126173e62bd9d791ec
     settings:
       registry: ghcr.io
       username: realdecimalist
