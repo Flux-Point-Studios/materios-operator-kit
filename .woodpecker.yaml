@@ -25,7 +25,7 @@ variables:
   - &crane gcr.io/go-containerregistry/crane/debug:v0.22.1@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
   # The plugin already on GHCR, which pushes the plugin image built here. A plugin change
   # moves publish-index to the new digest first; this pin follows once that is on GHCR.
-  - &oci_index_in_service ghcr.io/flux-point-studios/materios-operator-kit@sha256:fa9b1a3baeb2bc943b07cd71cd0511681904801369f24f39882be71346c7db6a
+  - &oci_index_in_service ghcr.io/flux-point-studios/materios-operator-kit@sha256:d3178aaf4dc548dda5bd2d15a09f7c650ac1325fa7bc9215a861a3f34774c84b
   # The crane debug image ships busybox under /busybox and has no /bin/sh.
   - &busybox_entrypoint ["/busybox/sh", "-c", "echo $$CI_SCRIPT | base64 -d | /busybox/sh -e"]
   # --reproducible makes the plugin's digest a function of its sources alone, which is
