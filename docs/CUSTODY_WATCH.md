@@ -85,7 +85,8 @@ WantedBy=multi-user.target
 ```
 
 `LoadCredential` hands the service its config and keys in a directory only it can
-read (`%d`), where the config's relative `project_id_file` finds them.
+read (`%d`), where the config's relative `project_id_file` finds them; the unit needs
+one `LoadCredential=` line for each key file its config names.
 `custody-watch-failed.service` is a oneshot with the same `EnvironmentFile` running
 `python -m daemon.custody_watch page-failure --unit custody-watch.service`, so a unit
 that exhausts its restarts pages too. It reads no config, so a config that keeps the
