@@ -128,6 +128,9 @@ class Store:
     def delete(self, name: str) -> None:
         self._db.execute("DELETE FROM state WHERE name = ?", (name,))
 
+    def delete_prefix(self, prefix: str) -> None:
+        self._db.execute("DELETE FROM state WHERE substr(name, 1, ?) = ?", (len(prefix), prefix))
+
     def add(self, finding: rules.Finding, now: float) -> bool:
         """Store a finding unless one with its key exists; True when it is new."""
         cursor = self._db.execute(
@@ -185,9 +188,14 @@ _BADGE = {rules.CRITICAL: "\U0001f6a8 **CRITICAL** @here", rules.ALERT: "\u26a0\
           rules.INFO: "\u2139\ufe0f **INFO**"}
 
 
+def _plain(text: str) -> str:
+    """``text`` with every backtick replaced, so text taken from the chain can neither
+    close the page's code block nor open one of its own."""
+    return text.replace("`", "\u02cb")
+
+
 def _fenced(text: str, room: int) -> str:
-    # A fence inside chain-supplied text would end the code block early.
-    text = text.replace("```", "`\u200b``")
+    text = _plain(text)
     if len(text) > room:
         text = text[:room - 12] + "\n(truncated)"
     return f"```\n{text}\n```"
@@ -203,7 +211,7 @@ def page_message(findings: list[rules.Finding], headline_only: bool = False) -> 
     else:
         title = f"{len(findings)} findings from {findings[0].group}"
         body = "\n".join(f"[{f.severity.name}] {f.headline}" for f in findings)
-    head = f"{_BADGE[severity]} custody-watch\n**{title}**\n"
+    head = f"{_BADGE[severity]} custody-watch\n**{_plain(title)}**\n"
     if headline_only:
         content = head + f"(the full page was rejected by the webhook {FALLBACK_AFTER} times; " \
                          "its details are in the watcher's state database)"
@@ -439,8 +447,11 @@ class MateriosSource:
         self._store = store
         self._cursor_key = f"cursor:{self.name}"
         self._authorities = frozenset(rules.account_bytes(a) for a in config.authority_accounts)
-        self._decoders: dict[int, rules.RuntimeDecoder] = {}
+        # Keyed by genesis and spec version: a reset chain may reuse a spec version with
+        # another pallet layout.
+        self._decoders: dict[tuple[str, int], rules.RuntimeDecoder] = {}
         self._decoder: rules.RuntimeDecoder | None = None
+        self._genesis: str | None = None
 
     @property
     def position(self) -> str:
@@ -490,6 +501,7 @@ class MateriosSource:
         """A new genesis means the chain was reset: page it, forget what was learned about
         the old chain, and watch the new one from its finalized head."""
         genesis = self._rpc("chain_getBlockHash", [0])
+        self._genesis = genesis
         name = f"genesis:{self.name}"
         stored = self._store.get(name)
         with self._store.transaction():
@@ -497,6 +509,7 @@ class MateriosSource:
             if stored is None or stored == genesis:
                 return False
             self._store.retire(f"{self.name}:", f"@{stored}")
+            self._store.delete_prefix(f"metadata:{self.name}:{stored}:")
             self._store.add(rules.Finding(
                 rules.CRITICAL, f"{self.name}:genesis:{genesis}",
                 f"{self.name} genesis changed: the chain was reset",
@@ -505,6 +518,7 @@ class MateriosSource:
             self._store.delete(f"committee:{self.name}")
             self.start_at(head)
         self._decoder = None
+        self._decoders.clear()
         return True
 
     def _sudo_key(self, head_hash: str, head: int, now: float) -> bytes | None:
@@ -531,13 +545,15 @@ class MateriosSource:
             params = []
             logger.warning("%s: state at %s is pruned; decoding with the current runtime, spec %s",
                            self.name, at_hash, version)
-        if version not in self._decoders:
-            metadata = self._store.get(f"metadata:{self.name}:{version}")
+        cache = (self._genesis, version)
+        if cache not in self._decoders:
+            name = f"metadata:{self.name}:{self._genesis}:{version}"
+            metadata = self._store.get(name)
             if metadata is None:
                 metadata = self._rpc("state_getMetadata", params)
-                self._store.put(f"metadata:{self.name}:{version}", metadata)
-            self._decoders[version] = rules.RuntimeDecoder(metadata)
-        return self._decoders[version]
+                self._store.put(name, metadata)
+            self._decoders[cache] = rules.RuntimeDecoder(metadata)
+        return self._decoders[cache]
 
     def _events(self, block_hash: str, decoder: rules.RuntimeDecoder) -> dict[int, list[str]] | None:
         """The block's events by extrinsic, or None when the node has pruned them, serves

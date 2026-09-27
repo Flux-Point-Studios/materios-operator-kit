@@ -310,7 +310,40 @@ _CALL_SEVERITY: dict[tuple[str, str], Severity] = {
     ("NativeTokenManagement", "transfer_tokens"): ALERT,
     ("PalletSession", "set_keys"): ALERT,
     ("PalletSession", "purge_keys"): ALERT,
+    ("RootTimelock", _ANY): CRITICAL,
 }
+# Calls of the spec-238 runtime that move no custody or authority. A call in neither
+# table pages as an ALERT, so one a runtime upgrade adds is reviewed, not ignored.
+_ROUTINE = frozenset({
+    ("System", "remark"), ("System", "remark_with_event"),
+    ("Timestamp", "set"),
+    *(("Balances", f) for f in (
+        "transfer_allow_death", "transfer_keep_alive", "transfer_all", "upgrade_accounts", "burn")),
+    *(("Multisig", f) for f in ("as_multi_threshold_1", "as_multi", "approve_as_multi", "cancel_as_multi")),
+    *(("Utility", f) for f in ("batch", "as_derivative", "batch_all", "force_batch")),
+    ("Treasury", "check_status"),
+    *(("Vesting", f) for f in ("vest", "vest_other", "vested_transfer", "merge_schedules")),
+    *(("OrinqReceipts", f) for f in (
+        "submit_receipt", "attest_availability_cert", "submit_anchor", "submit_receipt_v2", "bond", "unbond",
+        "expire_receipt_fee")),
+    ("Motra", "set_delegatee"), ("Motra", "claim_motra"),
+    ("SessionCommitteeManagement", "set"),
+    ("BlockRewards", "set_current_block_beneficiary"),
+    *(("IntentSettlement", f) for f in (
+        "submit_intent", "attest_intent", "request_voucher", "request_credit_refund", "settle_claim",
+        "expire_policy_mirror", "credit_deposit", "settle_batch_atomic", "attest_batch_intents",
+        "request_batch_vouchers", "submit_batch_intents", "request_settle", "attest_settle",
+        "request_batch_settle", "attest_batch_settle", "request_expire_policy", "attest_expire_policy",
+        "post_settlement_bond", "slash_bad_settlement_evidence", "release_settlement_bond")),
+    ("TeeAttestation", "submit_evidence"),
+    *(("Billing", f) for f in (
+        "topup_self", "topup_for", "pay_request", "request_withdrawal", "execute_withdrawal", "cancel_withdrawal",
+        "prune_paid_requests")),
+    ("Oracle", "submit_price"),
+    *(("PerpEngine", f) for f in (
+        "open_position", "close_position", "deposit_margin", "withdraw_margin", "liquidate", "settle_funding",
+        "adjust_leverage", "reserve_keeper_bond", "release_keeper_bond")),
+})
 _MULTISIG_CALLS = {"as_multi", "as_multi_threshold_1", "approve_as_multi", "cancel_as_multi"}
 _BATCH_CALLS = {"batch", "batch_all", "force_batch"}
 
@@ -391,10 +424,17 @@ _ROOT = "Root"
 @dataclass(frozen=True)
 class _Site:
     """A privileged call in an extrinsic's call tree; ``inert`` when its origin cannot
-    dispatch it."""
+    dispatch it, ``unlisted`` when it is in neither call table."""
     path: str
     severity: Severity
     inert: bool
+    unlisted: bool
+
+    def line(self, counted: bool) -> str:
+        notes = [" (cannot take effect from this origin)"] if self.inert and not counted else []
+        if self.unlisted:
+            notes.append(" (in neither the severity table nor the routine list)")
+        return f"{self.severity.name}: {self.path}{''.join(notes)}"
 
 
 @dataclass
@@ -482,14 +522,19 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     if any(isinstance(o, bytes) and o in tree.authority for o in (origin, inner)):
         tree.involved = True
     severity = _severity(module, function, args, origin, inner, tree)
+    unlisted = severity is None and (module, function) not in _ROUTINE
+    if unlisted:
+        severity = ALERT
     if severity is not None:
-        tree.sites.append(_Site(" > ".join(path), severity, inert))
+        tree.sites.append(_Site(" > ".join(path), severity, inert, unlisted))
     for value in args.values():
         for child in ([value] if _is_call(value) else value if isinstance(value, list) else []):
             if _is_call(child):
                 _walk(child, inner, tree, depth + 1, path, inert)
 
 
+MAX_SITE_LINES = 20
+MAX_TREE_LINES = 200
 RUNTIME_ENVIRONMENT_UPDATED = "0x08"
 
 
@@ -570,16 +615,25 @@ def _classify_extrinsic(chain: str, number: int, index: int, ext: dict, events: 
         if not tree.involved and any(e.startswith("System.ExtrinsicFailed") for e in own):
             counted = []
             notes.append("dispatch failed: nothing took effect")
-        elif not tree.involved and any(s.inert for s in tree.sites):
+        elif not tree.involved:
             counted = [s for s in tree.sites if not s.inert]
-            notes.append("cannot take effect from this origin: " + ", ".join(s.path for s in tree.sites if s.inert))
     severity = CRITICAL if by_sudo else max((s.severity for s in counted), default=INFO)
+    # Calls that count lead, most severe and then innermost first, so the headline and
+    # the top of a truncated page name the call that matters.
+    ranked = sorted(tree.sites, key=lambda s: (s not in counted, -s.severity, -s.path.count(" > ")))
     call = ext["call"]
+    top = ranked[0].path if ranked else f"{call['call_module']}.{call['call_function']}"
+    sites = [s.line(s in counted) for s in ranked[:MAX_SITE_LINES]]
+    if len(ranked) > MAX_SITE_LINES:
+        sites.append(f"... {len(ranked) - MAX_SITE_LINES:,} more privileged calls")
+    lines = tree.lines[:MAX_TREE_LINES]
+    if len(tree.lines) > MAX_TREE_LINES:
+        lines.append(f"... {len(tree.lines) - MAX_TREE_LINES:,} more calls in the tree")
     return Finding(
         severity=severity,
         key=f"{chain}:{number}:{index}",
-        headline=f"{chain} #{number} extrinsic {index}: {call['call_module']}.{call['call_function']}",
-        details=tuple(notes + tree.lines),
+        headline=f"{chain} #{number} extrinsic {index}: {top}",
+        details=tuple(notes + sites + ["call tree:"] + lines),
         group=None if tree.involved or signer is None else f"{chain} signer {render_account(signer)}",
     )
 

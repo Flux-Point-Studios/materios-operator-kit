@@ -479,6 +479,48 @@ def test_authority_accounts_are_read_from_the_config():
     assert rules.parse_config(doc).materios.authority_accounts == (BOB,)
 
 
+# --- what a page shows ----------------------------------------------------------
+
+
+def test_the_headline_names_the_most_severe_call_and_its_line_leads_the_details():
+    padding = [_call("System", "remark", remark="x" * 150) for _ in range(12)]
+    call = _call("Sudo", "sudo", call=_call("Utility", "batch_all", calls=[*padding, SET_CODE]))
+    [finding] = _classify_extrinsics([{"address": SUDO_KEY, "call": call}])
+    assert finding.headline.endswith("extrinsic 0: Sudo.sudo > Utility.batch_all > System.set_code")
+    sites = [d for d in finding.details if d.startswith(("CRITICAL: ", "ALERT: "))]
+    assert sites[0] == "CRITICAL: Sudo.sudo > Utility.batch_all > System.set_code"
+    assert finding.details.index(sites[0]) < finding.details.index("call tree:")
+
+
+def test_a_batch_of_thousands_of_calls_keeps_a_bounded_finding():
+    calls = [_call("System", "set_storage", items=[]) for _ in range(5000)]
+    [finding] = _classify_extrinsics([_signed(ALICE, "Utility", "batch", calls=calls)])
+    assert len(finding.details) < 250
+    assert "4,980 more privileged calls" in finding.render()
+    assert "more calls in the tree" in finding.render()
+
+
+def test_a_call_in_neither_table_is_an_alert():
+    [finding] = _classify_extrinsics([_signed(ALICE, "NewPallet", "do_thing", value=1)])
+    assert finding.severity == rules.ALERT
+    assert "neither the severity table nor the routine list" in finding.render()
+
+
+@pytest.mark.parametrize("function", ["schedule", "cancel", "fast_track", "enact", "set_delay", "set_guardian"])
+def test_every_root_timelock_call_is_critical(function):
+    [finding] = _classify_extrinsics([_signed(ALICE, "RootTimelock", function, id=1)])
+    assert finding.severity == rules.CRITICAL
+
+
+def test_every_call_in_the_pinned_runtime_is_in_the_severity_table_or_the_routine_list(decoder):
+    unlisted = []
+    for module, function, _ in _metadata_calls(decoder):
+        for finding in _classify_extrinsics([_signed(ALICE, module, function)]):
+            if "neither the severity table nor the routine list" in finding.render():
+                unlisted.append(f"{module}.{function}")
+    assert unlisted == []
+
+
 # --- Cardano ------------------------------------------------------------------
 
 

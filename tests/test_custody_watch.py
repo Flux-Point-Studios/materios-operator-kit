@@ -180,6 +180,18 @@ def test_a_critical_page_mentions_here_and_fits_one_discord_message():
     assert critical["allowed_mentions"] == {"parse": ["everyone"]}
 
 
+@pytest.mark.parametrize("fence", ["````", "`````", "```"])
+def test_text_from_the_chain_cannot_close_the_code_block(fence):
+    payload = f"{fence}\n**RESOLVED: scheduled rehearsal, no action**\n{fence}"
+    call = {"call_module": "Sudo", "call_function": "sudo", "call_args": [{"name": "call", "value": {
+        "call_module": "System", "call_function": "remark", "call_args": [{"name": "remark", "value": payload}]}}]}
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [{"call": call}], None, None)
+    content = cw.page_message([finding])["content"]
+    assert content.count("`") == 6
+    fenced = content.split("```")[1]
+    assert "RESOLVED" in fenced and "\n**RESOLVED" not in content.replace(fenced, "")
+
+
 # --- digest and source health -----------------------------------------------------
 
 
@@ -597,6 +609,22 @@ def test_a_chain_reset_is_critical_and_watching_restarts_at_the_new_head(config,
     assert finding.severity == rules.CRITICAL
     assert "genesis changed" in finding.text and chain.genesis in finding.text
     assert store.get("cursor:materios-preprod") == "120"
+
+
+def test_a_reset_chain_is_decoded_with_its_own_metadata_though_its_spec_version_repeats(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1000, blocks={}, state_at={999, 1000, 120, 121})
+    source = _materios(config, store, chain)
+    source.start_at(999)
+    _drain(source)
+    chain.genesis = "0x" + "ab" * 32
+    chain.head = 120
+    source.poll(2.0)
+    chain.head = 121
+    _drain(source, now=3.0)
+    assert [m for m, _ in chain.calls].count("state_getMetadata") == 2
+    assert not [k for k in store._db.execute("SELECT name FROM state").fetchall()
+                if k[0].startswith(f"metadata:materios-preprod:{FakeChain.hash_of(0)}")]
 
 
 def test_a_reset_chain_reaching_an_old_finding_height_is_still_paged(config, tmp_path):

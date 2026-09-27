@@ -1,5 +1,6 @@
 import http.server
 import json
+import socket
 import threading
 
 import pytest
@@ -61,6 +62,52 @@ def test_a_rejection_carries_its_status_and_discords_retry_after(webhook):
     with pytest.raises(discord.DiscordError) as refused:
         discord.post_json(webhook, {"content": "x"})
     assert (refused.value.status, refused.value.retry_after) == (400, None)
+
+
+@pytest.fixture
+def not_http():
+    """A listener that answers with a line that is not an HTTP status line."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+
+    def answer():
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            conn.recv(65536)
+            conn.sendall(b"SSH-2.0-OpenSSH_9.6\r\n")
+            conn.close()
+
+    threading.Thread(target=answer, daemon=True).start()
+    yield f"http://127.0.0.1:{listener.getsockname()[1]}/api/webhooks/1/SECRET-TOKEN"
+    listener.close()
+
+
+def test_a_reply_that_is_not_http_raises_without_leaking_the_token(not_http):
+    with pytest.raises(discord.DiscordError) as err:
+        discord.post_json(not_http, {"content": "x"}, timeout=5)
+    assert "SECRET-TOKEN" not in str(err.value)
+    assert err.value.status is None
+
+
+def test_the_cert_daemon_and_watchtower_survive_a_reply_that_is_not_http(not_http, monkeypatch, caplog):
+    import asyncio
+
+    from daemon.cert_daemon import CertDaemon
+    from daemon.config import DaemonConfig
+    from daemon.watchtower import Watchtower
+
+    daemon = CertDaemon.__new__(CertDaemon)
+    daemon.config = DaemonConfig(discord_webhook_url=not_http)
+    asyncio.run(daemon.send_discord("Daemon starting up", "info"))
+    monkeypatch.setenv("BLOB_GATEWAY_URL", "http://gateway.invalid")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", not_http)
+    Watchtower()._send_discord("t", "d", 0)
+    assert caplog.text.count("webhook unreachable") == 2
+    assert "SECRET-TOKEN" not in caplog.text
 
 
 def test_an_unreachable_webhook_raises_without_leaking_the_token():

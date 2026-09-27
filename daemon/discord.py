@@ -6,6 +6,7 @@ checks the status, reports success for alerts nobody receives. The webhook token
 sits in the URL path, so no error raised here may carry the URL.
 """
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -42,7 +43,7 @@ def post_json(webhook_url: str, payload: dict, *, timeout: float = 10.0) -> None
             status = response.status
     except urllib.error.HTTPError as e:
         raise DiscordError(f"webhook answered HTTP {e.code}", e.code, _retry_after(e.headers)) from None
-    except (urllib.error.URLError, OSError, ValueError) as e:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
         raise DiscordError(f"webhook unreachable: {type(e).__name__}") from None
     if not 200 <= status < 300:
         raise DiscordError(f"webhook answered HTTP {status}", status)
