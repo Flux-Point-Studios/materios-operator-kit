@@ -152,7 +152,8 @@
         "cmatra-claim-validator",
         "cmatra-mint-policy"
       ],
-      "status": "experimental"
+      "status": "experimental",
+      "terminal": true
     }
   ]
 }
