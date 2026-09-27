@@ -579,12 +579,12 @@ class CardanoSource:
         return f"cursor:{self.name}:policy:{policy_id}"
 
     def start_at(self, height: int) -> None:
-        """Watch addresses from ``height`` and every asset under the policies from its first mint."""
+        """Watch addresses and the mints and burns under every policy from ``height``."""
         with self._store.transaction():
             for address in self._addresses:
                 self._store.put(self._address_key(address), str(height))
             for policy in self._network.policies:
-                self._store.put(self._policy_key(policy.policy_id), "baselined")
+                self._store.put(self._policy_key(policy.policy_id), str(height))
             self._store.put(f"cursor:{self.name}:tip", str(height))
 
     def rewind(self, seconds: int) -> None:
@@ -608,7 +608,10 @@ class CardanoSource:
         if age > self._stale_seconds:
             raise SourceError(f"{self.name}: chain tip {tip['height']} is {int(age) // 60} min old")
         height = tip["height"]
-        pending: dict[str, None] = {}
+        # tx hash -> the height at or below which it is history rather than a move; an
+        # asset's history carries no heights, so a mint older than ``start_at`` is only
+        # recognized once its transaction is read.
+        pending: dict[str, int | None] = {}
         cursors: dict[str, str] = {f"cursor:{self.name}:tip": str(height)}
 
         for address in self._addresses:
@@ -622,7 +625,9 @@ class CardanoSource:
                 pending[row["tx_hash"]] = None
 
         for policy in self._network.policies:
-            baselined = self._store.get(self._policy_key(policy.policy_id)) is not None
+            marker = self._store.get(self._policy_key(policy.policy_id))
+            baselined = marker is not None
+            floor = int(marker) if baselined and marker.isdigit() else None
             cursors[self._policy_key(policy.policy_id)] = "baselined"
             for asset in self._pages(f"/assets/policy/{policy.policy_id}"):
                 unit = asset["asset"]
@@ -635,19 +640,23 @@ class CardanoSource:
                     history = list(self._pages(f"/assets/{unit}/history", first_page=first_page, order="asc"))
                     offset = (first_page - 1) * PAGE
                     for entry in history[seen - offset:count - offset]:
-                        pending[entry["tx_hash"]] = None
+                        pending.setdefault(entry["tx_hash"], floor)
                 cursors[key] = str(count)
 
-        for tx_hash in pending:
+        for tx_hash, floor in pending.items():
             if not self._store.processed(f"{self.name}:{tx_hash}"):
-                self._classify(tx_hash, now)
+                self._classify(tx_hash, now, floor)
         with self._store.transaction():
             for key, value in cursors.items():
                 self._store.put(key, value)
         return True
 
-    def _classify(self, tx_hash: str, now: float) -> None:
+    def _classify(self, tx_hash: str, now: float, floor: int | None) -> None:
         tx = self._api.get(f"/txs/{tx_hash}")
+        if tx is not None and floor is not None and tx["block_height"] <= floor:
+            with self._store.transaction():
+                self._store.mark_processed(f"{self.name}:{tx_hash}", now)
+            return
         utxos = self._api.get(f"/txs/{tx_hash}/utxos")
         if tx is None or utxos is None:
             raise SourceError(f"{self.name}: blockfrost does not serve transaction {tx_hash} yet")

@@ -513,8 +513,11 @@ class FakeBlockfrost:
         self.routes = {"/blocks/latest": {"height": tip, "time": time}}
         self.calls = []
 
-    def add_tx(self, name: str, address: str | None = None, height: int | None = None):
+    def add_tx(self, name: str, address: str | None = None, height: int | None = None,
+               tx_hash: str | None = None):
         doc = copy.deepcopy(_tx(name))
+        if tx_hash is not None:
+            doc["tx"]["hash"] = tx_hash
         tx_hash = doc["tx"]["hash"]
         if height is not None:
             doc["tx"]["block_height"] = height
@@ -630,6 +633,22 @@ def test_a_new_asset_under_a_watched_policy_is_read_from_its_first_mint(config, 
     source.poll(_at("2026-09-27T01:02:00"))
     [finding] = store.findings()
     assert finding.severity == rules.CRITICAL
+
+
+def test_a_backtest_reports_only_the_mints_inside_its_window(config, tmp_path):
+    store, network, api, source = _baselined(config, tmp_path)
+    unit = network.pool.cmatra_unit
+    policy = network.policies[0].policy_id
+    before = api.add_tx("mint_v2")
+    inside = api.add_tx("mint_v2", height=13_500_005, tx_hash="ab" * 32)
+    api.routes[f"/assets/policy/{policy}"] = [{"asset": unit, "quantity": "2"}]
+    api.routes[f"/assets/{unit}"] = {"mint_or_burn_count": 2}
+    api.routes[f"/assets/{unit}/history"] = [{"tx_hash": before, "action": "minted", "amount": "1"},
+                                             {"tx_hash": inside, "action": "minted", "amount": "1"}]
+    api.routes["/blocks/latest"]["height"] = 13_500_010
+    report = cw.backtest([source], store, now=_at("2026-09-27T01:01:00"))
+    assert [f.key for f in report] == [f"cardano-mainnet:{inside}"]
+    assert report[0].severity == rules.CRITICAL
 
 
 def test_an_address_blockfrost_has_never_seen_has_no_transactions(config, tmp_path):
