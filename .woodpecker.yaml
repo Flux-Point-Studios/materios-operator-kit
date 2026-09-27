@@ -70,6 +70,9 @@ steps:
       platforms:
         - linux/amd64
       target: ghcr.io/flux-point-studios/materios-operator-kit:ci-oci-index
+      # Declared empty so a run variable cannot supply tags: this target shares the operator
+      # image's repository, and a :latest moved here would reach every operator.
+      tags: ""
     when: *on_main
 
   # publish-index runs the plugin by digest, and the gchr_token secret's image filter

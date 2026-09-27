@@ -15,6 +15,10 @@ stored, and only then deletes every global, organization and other repository co
 new token to rotate. pin changes the plugin digests every copy admits, the filter step of a plugin
 upgrade.
 
+Woodpecker lets any of its users with push on a repository edit that repository's secrets, where
+only an admin may edit a global one. A repository copy's filter is therefore only as fixed as the
+set of Woodpecker users: plan and apply name every user who is not an admin.
+
 Environment: WOODPECKER_SERVER, WOODPECKER_TOKEN_FILE (a file holding an admin API token),
 GITHUB_API_URL (default https://api.github.com), REGISTRY_URL (default https://ghcr.io).
 """
@@ -89,15 +93,18 @@ class Woodpecker:
             raise Refused(f"{method} {path}: HTTP {status} {reply[:200]}")
         return json.loads(raw) if raw.strip() else None
 
+    def listing(self, path):
+        items, page = [], 1
+        while True:
+            batch = self.call("GET", f"{path}?perPage=50&page={page}") or []
+            items += batch
+            if len(batch) < 50:
+                return items
+            page += 1
+
     def inventory(self):
         """All repositories, and every copy of the secret with the API path that addresses it."""
-        repos, page = [], 1
-        while True:
-            batch = self.call("GET", f"/repos?perPage=50&page={page}") or []
-            repos += batch
-            if len(batch) < 50:
-                break
-            page += 1
+        repos = self.listing("/repos")
         orgs = sorted({r["org_id"] for r in repos})
         for o in orgs:
             org = self.call("GET", f"/orgs/{o}") or {}
@@ -158,6 +165,13 @@ def plan_changes(repos, copies, names):
     writes = [("update" if r["full_name"] in held else "create", r) for r in goal]
     retire = [c for c in copies if c["scope"] != "repo" or c["where"] not in keep]
     return images, events, writes, retire
+
+
+def warn_non_admins(woodpecker):
+    users = sorted(u["login"] for u in woodpecker.listing("/users") if not u.get("admin"))
+    if users:
+        print(f"warning: Woodpecker users {', '.join(users)} are not admins; any of them with push on a "
+              f"repository below can change the filter of its {SECRET} copy")
 
 
 def print_plan(images, events, writes, retire):
@@ -227,6 +241,7 @@ def apply(woodpecker, github_api, registry_url, token_file, names):
     repos, copies = woodpecker.inventory()
     images, events, writes, retire = plan_changes(repos, copies, names)
     print_plan(images, events, writes, retire)
+    warn_non_admins(woodpecker)
     for action, repo in writes:
         body = {"value": token, "images": images, "events": events}
         if action == "update":
@@ -286,6 +301,7 @@ def main(argv):
         if args.command == "plan":
             repos, copies = woodpecker.inventory()
             print_plan(*plan_changes(repos, copies, args.repo))
+            warn_non_admins(woodpecker)
         elif args.command == "apply":
             apply(woodpecker, os.environ.get("GITHUB_API_URL", "https://api.github.com"),
                   os.environ.get("REGISTRY_URL", f"https://{REGISTRY}"), args.token_file, args.repo)

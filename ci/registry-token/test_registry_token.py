@@ -54,7 +54,10 @@ class Fake:
         self.org_secrets = {1: {}, 2: {}}
         self.repo_secrets = {r["id"]: {} for r in REPOS}
         self.writes = []
+        self.users = [{"login": "realdecimalist", "admin": True}]
         self.stored_images = None
+        self.stored_events = None
+        self.ignore_deletes = False
         self.echo_rejections = None
         self.github_calls = []
         self.registry_tokens = {}
@@ -64,9 +67,9 @@ class Fake:
         return [{"name": n, "images": s["images"], "events": sorted(s["events"])} for n, s in secrets.items()]
 
     def woodpecker(self, method, parts, query, body):
-        if parts == ["repos"]:
+        if parts in (["repos"], ["users"]):
             page, per = int(query.get("page", ["1"])[0]), int(query.get("perPage", ["50"])[0])
-            return 200, REPOS[(page - 1) * per:page * per]
+            return 200, (REPOS if parts == ["repos"] else self.users)[(page - 1) * per:page * per]
         if parts[0] == "orgs" and len(parts) == 2:
             org = int(parts[1])
             return 200, {"id": org, "name": ORGS[org]} if org in ORGS else {"name": ""}
@@ -91,12 +94,14 @@ class Fake:
                 return 422, self.echo_rejections + json.dumps(body)
             if body["name"] in store:
                 return 500, "exists"
-            store[body["name"]] = secret(body["value"], self.stored_images or body["images"], body["events"])
+            store[body["name"]] = secret(body["value"], self.stored_images or body["images"],
+                                         self.stored_events or body["events"])
             return 200, {"name": body["name"]}
         if not rest or rest[0] not in store:
             return 404, "not found"
         if method == "DELETE":
-            del store[rest[0]]
+            if not self.ignore_deletes:
+                del store[rest[0]]
             return 204, None
         if method == "PATCH":
             s = store[rest[0]]
@@ -105,7 +110,7 @@ class Fake:
             if body.get("images") is not None:
                 s["images"] = list(self.stored_images or body["images"])
             if body.get("events") is not None:
-                s["events"] = list(body["events"])
+                s["events"] = list(self.stored_events or body["events"])
             return 200, {"name": rest[0]}
         return 405, "method"
 
@@ -410,6 +415,65 @@ class RegistryTokenTest(unittest.TestCase):
         self.assertEqual(code, 1, text)
         self.assertIn(OTHER_IMAGE, text)
         self.assertEqual(self.fake.writes, [])
+
+    def test_apply_keeps_the_global_copy_when_a_stored_event_filter_does_not_match(self):
+        self.global_state()
+        self.fake.stored_events = ["pull_request", "push"]
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("did not store the expected filter", text)
+        self.assertIn("gchr_token", self.fake.global_secrets)
+        self.assertFalse([w for w in self.fake.writes if w[0] == "DELETE"])
+
+    def test_apply_refuses_when_a_deleted_copy_is_still_listed(self):
+        self.global_state()
+        self.fake.ignore_deletes = True
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("copies remain after deletion", text)
+        self.assertIn("global gchr_token", text)
+        self.assertNotIn("done:", text)
+
+    def test_pin_refuses_when_woodpecker_does_not_store_the_new_filter(self):
+        for r in REPOS[:3]:
+            self.fake.repo_secrets[r["id"]]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        self.fake.stored_images = [PLUGIN]
+        code, text = self.run_tool("pin", "--add", NEXT_PLUGIN)
+        self.assertEqual(code, 1, text)
+        self.assertIn("did not store the new filter", text)
+
+    def test_plan_names_every_woodpecker_user_who_is_not_an_admin(self):
+        self.global_state()
+        self.fake.users += [{"login": "collaborator", "admin": False}, {"login": "second-admin", "admin": True}]
+        code, text = self.run_tool("plan", *self.repo_args())
+        self.assertEqual(code, 0, text)
+        warnings = [line for line in text.splitlines() if line.startswith("warning:")]
+        self.assertEqual(len(warnings), 1, text)
+        self.assertIn("collaborator", warnings[0])
+        self.assertNotIn("second-admin", warnings[0])
+        self.assertIn("push", warnings[0])
+
+    def test_apply_names_every_woodpecker_user_who_is_not_an_admin_before_it_writes(self):
+        self.global_state()
+        self.fake.users.append({"login": "collaborator", "admin": False})
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 0, text)
+        self.assertLess(text.index("warning:"), text.index("done:"))
+        self.assertIn("collaborator", text)
+
+    def test_plan_reads_every_page_of_woodpecker_users(self):
+        self.global_state()
+        self.fake.users += [{"login": f"admin-{i}", "admin": True} for i in range(60)]
+        self.fake.users.append({"login": "last-page-user", "admin": False})
+        code, text = self.run_tool("plan", *self.repo_args())
+        self.assertEqual(code, 0, text)
+        self.assertIn("last-page-user", text)
+
+    def test_plan_with_only_admins_prints_no_warning(self):
+        self.global_state()
+        code, text = self.run_tool("plan", *self.repo_args())
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("warning:", text)
 
     def test_pin_adds_and_drops_a_plugin_digest_on_every_copy(self):
         for r in REPOS[:3]:
