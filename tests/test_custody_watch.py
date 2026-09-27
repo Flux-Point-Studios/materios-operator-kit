@@ -397,6 +397,18 @@ def test_a_block_whose_state_is_pruned_is_still_classified(config, tmp_path):
     assert "events unavailable" in finding.text
 
 
+def test_events_that_cannot_be_decoded_do_not_hold_the_block_back(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1829226, blocks={1829226: "block_1829226.json"},
+                      state_at={1829225, 1829226}, events_hex="0x04ff")
+    source = _materios(config, store, chain)
+    source.start_at(1829225)
+    assert source.poll(1.0)
+    [finding] = store.findings()
+    assert finding.severity == rules.CRITICAL and "events unavailable" in finding.text
+    assert store.get("cursor:materios-preprod") == "1829226"
+
+
 def test_a_runtime_upgrade_block_reloads_metadata_for_the_blocks_after_it(config, tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     chain = FakeChain(head=1829228, blocks={1829227: "block_1829227.json.gz"},

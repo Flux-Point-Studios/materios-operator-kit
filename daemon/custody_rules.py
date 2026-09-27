@@ -406,7 +406,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
         if severity is None:
             continue
         if events is None:
-            notes.append("events unavailable (block state pruned): dispatch result not verified")
+            notes.append("events unavailable (state pruned or undecodable): dispatch result not verified")
         else:
             shown = [e for e in events.get(index, []) if not e.startswith(EVENT_NOISE)]
             notes.append("result: " + (", ".join(shown) if shown else "no events"))

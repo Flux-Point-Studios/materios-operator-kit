@@ -464,11 +464,19 @@ class MateriosSource:
         return self._decoders[version]
 
     def _events(self, block_hash: str, decoder: rules.RuntimeDecoder) -> dict[int, list[str]] | None:
+        """The block's events by extrinsic, or None when the node has pruned them or they
+        do not decode; the finding then says its dispatch result is unverified."""
         try:
             raw = self._rpc("state_getStorage", [SYSTEM_EVENTS_STORAGE, block_hash])
         except SubstrateRequestException:
             return None
-        return decoder.events(raw) if raw else {}
+        if not raw:
+            return {}
+        try:
+            return decoder.events(raw)
+        except Exception as e:  # scalecodec raises any type on bytes it cannot place
+            logger.warning("%s: events at %s do not decode: %s: %s", self.name, block_hash, type(e).__name__, e)
+            return None
 
     def _block(self, number: int, block_hash: str, sudo_key: bytes | None, now: float) -> None:
         block = self._rpc("chain_getBlock", [block_hash])["block"]
