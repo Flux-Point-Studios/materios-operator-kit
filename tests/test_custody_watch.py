@@ -472,6 +472,25 @@ def test_a_chain_reset_is_critical_and_watching_restarts_at_the_new_head(config,
     assert store.get("cursor:materios-preprod") == "120"
 
 
+def test_a_reset_chain_reaching_an_old_finding_height_is_still_paged(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1829210, blocks={1829210: "block_1829210.json"}, state_at={1829210})
+    source = _materios(config, store, chain)
+    source.start_at(1829209)
+    _drain(source)
+    cw.Pager(Posts()).flush(store, 1.0)
+
+    chain.genesis = "0x" + "ab" * 32
+    chain.head = 1829209
+    source.poll(2.0)
+    chain.head = 1829210
+    _drain(source, now=3.0)
+    posts = Posts()
+    cw.Pager(posts).flush(store, 3.0)
+    assert "genesis changed" in posts.text()
+    assert "materios-preprod #1829210 extrinsic 2: Multisig.as_multi" in posts.text()
+
+
 def test_a_dropped_connection_is_reopened_before_polling(config, tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     chain = FakeChain(head=1000, blocks={}, state_at={1000})

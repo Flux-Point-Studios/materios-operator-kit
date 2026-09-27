@@ -133,6 +133,12 @@ class Store:
              json.dumps(finding.details), now))
         return cursor.rowcount == 1
 
+    def retire(self, prefix: str, suffix: str) -> None:
+        """Append ``suffix`` to every finding key under ``prefix``, so a reset chain's
+        findings at heights the old chain already used are not taken for duplicates."""
+        self._db.execute("UPDATE finding SET key = key || ? WHERE substr(key, 1, ?) = ?",
+                         (suffix, len(prefix), prefix))
+
     def processed(self, key: str) -> bool:
         return self._db.execute("SELECT 1 FROM processed WHERE key = ?", (key,)).fetchone() is not None
 
@@ -421,6 +427,7 @@ class MateriosSource:
             self._store.put(name, genesis)
             if stored is None or stored == genesis:
                 return False
+            self._store.retire(f"{self.name}:", f"@{stored}")
             self._store.add(rules.Finding(
                 rules.CRITICAL, f"{self.name}:genesis:{genesis}",
                 f"{self.name} genesis changed: the chain was reset",
