@@ -127,7 +127,7 @@
     {
       "id": "oci-index-plugin",
       "name": "OCI multi-arch index plugin",
-      "desc": "Woodpecker plugin (crane + jq), the only image the org GHCR token (gchr_token) is released to. It pushes credential-less kaniko OCI layouts, and publishes one platform as a plain image or several as a verified multi-arch index, moving extra tags only after verification. With the token it refuses any pipeline but a push or manual one of the default branch; Woodpecker re-applies those CI_ values over a run's variables, so that check holds. Its registry and prefix limits read OCI_INDEX_ variables that a manual run's variables can set, and a run's variables fill any setting a step leaves undeclared, so beyond the branch check the boundary is the secret's event and image filters, the default branch's pipeline file, and who may start runs on Woodpecker. Publishes operator-kit, materios-gateway, anchor-worker, anchor-worker-materios and saturnswap-backend.",
+      "desc": "Woodpecker plugin (crane + jq), the only image the org GHCR token (gchr_token) is released to. It pushes credential-less kaniko OCI layouts, and publishes one platform as a plain image or several as a verified multi-arch index, moving extra tags only after verification. With the token it refuses all but a push or manual pipeline of the default branch (Woodpecker re-applies those CI_ values over a run's variables). A run's variables can set its registry and prefix limits and any setting a step leaves undeclared, so past the branch check the boundary is the secret's filters and who may start runs. Publishes operator-kit, materios-gateway, anchor-worker, anchor-worker-materios and saturnswap-backend.",
       "kind": "toolkit",
       "paths": [
         "ci/oci-index"
@@ -138,7 +138,7 @@
     {
       "id": "registry-token-scope",
       "name": "Registry token scope",
-      "desc": "Keeps the GHCR publish token (gchr_token) as repository-level Woodpecker secrets on exactly the repositories that publish through the OCI index plugin, each copy admitting only the plugin's pinned digests. plan lists every copy and the change; apply accepts only a classic write:packages token of the plugin's login that the registry lets open an upload in the plugin's package, stores it, checks what Woodpecker stored, then deletes every global, organization and stray copy (run it again to rotate); pin adds or drops a digest of the plugin image, and only of it, on every copy during a plugin upgrade. Woodpecker lets a user with push on a repository edit that repository's copy, so plan and apply name every Woodpecker user who is not an admin; a test holds every step handed the token in this repository to declaring every plugin input.",
+      "desc": "Keeps the GHCR publish token (gchr_token) as repository-level Woodpecker secrets on exactly the repositories that publish through the OCI index plugin, each copy admitting only the plugin's pinned digests. plan lists every copy and the change; apply accepts only a classic write:packages token of the plugin's login that the registry lets open an upload in the plugin's package, stores it, checks what Woodpecker stored, then deletes every global, organization and stray copy (run it again to rotate); pin adds or drops a digest of the plugin image, and only of it, on every copy during a plugin upgrade. Any Woodpecker user with push on a holder can edit its copy, so plan and apply name every Woodpecker user who is not an admin.",
       "kind": "toolkit",
       "paths": [
         "ci/registry-token"
