@@ -426,6 +426,7 @@ class _Site:
     """A privileged call in an extrinsic's call tree; ``inert`` when its origin cannot
     dispatch it, ``unlisted`` when it is in neither call table."""
     path: str
+    depth: int
     severity: Severity
     inert: bool
     unlisted: bool
@@ -513,6 +514,20 @@ _DERIVED = frozenset({*(("Utility", f) for f in (*_BATCH_CALLS, "with_weight", "
                       *(("Multisig", f) for f in _MULTISIG_CALLS)})
 
 
+MAX_PATH = 200
+MAX_SITE_LINES = 20
+MAX_TREE_LINES = 200
+
+
+def _abridged(path: tuple[str, ...]) -> str:
+    """A call path short enough for a headline; the outermost and innermost calls
+    survive however deep the nesting."""
+    text = " > ".join(path)
+    if len(text) <= MAX_PATH:
+        return text
+    return f"{path[0]} > \u2026 {len(path) - 2} calls \u2026 > {path[-1]}"
+
+
 def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...], inert: bool,
           proven: bool) -> None:
     """Record ``call`` and every call it wraps. A subtree is inert when its origin is an
@@ -535,15 +550,13 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     if unlisted:
         severity = ALERT
     if severity is not None:
-        tree.sites.append(_Site(" > ".join(path), severity, inert, unlisted))
+        tree.sites.append(_Site(_abridged(path), depth, severity, inert, unlisted))
     for value in args.values():
         for child in ([value] if _is_call(value) else value if isinstance(value, list) else []):
             if _is_call(child):
                 _walk(child, inner, tree, depth + 1, path, inert, inner_proven)
 
 
-MAX_SITE_LINES = 20
-MAX_TREE_LINES = 200
 RUNTIME_ENVIRONMENT_UPDATED = "0x08"
 
 
@@ -630,7 +643,7 @@ def _classify_extrinsic(chain: str, number: int, index: int, ext: dict, events: 
     # Calls that count lead, most severe and then innermost first, so the headline and
     # the top of a truncated page name the call that matters.
     live = {id(s) for s in counted}
-    ranked = sorted(tree.sites, key=lambda s: (id(s) not in live, -s.severity, -s.path.count(" > ")))
+    ranked = sorted(tree.sites, key=lambda s: (id(s) not in live, -s.severity, -s.depth))
     call = ext["call"]
     top = ranked[0].path if ranked else f"{call['call_module']}.{call['call_function']}"
     sites = [s.line(id(s) in live) for s in ranked[:MAX_SITE_LINES]]

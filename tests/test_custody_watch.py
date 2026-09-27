@@ -180,6 +180,19 @@ def test_a_critical_page_mentions_here_and_fits_one_discord_message():
     assert critical["allowed_mentions"] == {"parse": ["everyone"]}
 
 
+def test_a_deeply_nested_call_still_pages_within_discords_limit_naming_the_inner_call():
+    call = {"call_module": "System", "call_function": "set_code", "call_args": [{"name": "code", "value": "0x00"}]}
+    for _ in range(250):
+        call = {"call_module": "Utility", "call_function": "batch", "call_args": [{"name": "calls", "value": [call]}]}
+    call = {"call_module": "Sudo", "call_function": "sudo", "call_args": [{"name": "call", "value": call}]}
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [{"address": SUDO_KEY, "call": call}], None,
+                                              rules.account_bytes(SUDO_KEY))
+    for headline_only in (False, True):
+        content = cw.page_message([finding], headline_only)["content"]
+        assert len(content) <= 2000
+        assert "Sudo.sudo" in content and "System.set_code" in content
+
+
 @pytest.mark.parametrize("fence", ["````", "`````", "```"])
 def test_text_from_the_chain_cannot_close_the_code_block(fence):
     payload = f"{fence}\n**RESOLVED: scheduled rehearsal, no action**\n{fence}"

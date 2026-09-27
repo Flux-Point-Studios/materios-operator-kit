@@ -42,6 +42,8 @@ from daemon.substrate_client import SubstrateClient
 logger = logging.getLogger("custody_watch")
 
 DISCORD_LIMIT = 2000
+# Leaves room for the badge, the fallback note and a useful part of the body.
+MAX_TITLE = 400
 HOUR = 3600
 DAY = 86400
 
@@ -211,7 +213,7 @@ def page_message(findings: list[rules.Finding], headline_only: bool = False) -> 
     else:
         title = f"{len(findings)} findings from {findings[0].group}"
         body = "\n".join(f"[{f.severity.name}] {f.headline}" for f in findings)
-    head = f"{_BADGE[severity]} custody-watch\n**{_plain(title)}**\n"
+    head = f"{_BADGE[severity]} custody-watch\n**{_plain(title)[:MAX_TITLE]}**\n"
     if headline_only:
         content = head + f"(the full page was rejected by the webhook {FALLBACK_AFTER} times; " \
                          "its details are in the watcher's state database)"
