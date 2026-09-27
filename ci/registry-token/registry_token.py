@@ -8,27 +8,35 @@ ci/oci-index plugin, and each copy admits only the plugin's pinned digests.
   apply --token-file PATH [--repo OWNER/NAME ...]
   pin   (--add IMAGE@sha256:DIGEST | --drop IMAGE@sha256:DIGEST)
 
-apply stores the token on exactly the named repositories (by default, the ones already holding a
-copy) with the filter of the copy it replaces, checks what Woodpecker stored, and only then
-deletes every global, organization and other repository copy. Run it with a new token to rotate.
-pin changes the plugin digests every copy admits, the filter step of a plugin upgrade.
+apply first proves the token may push to the plugin's own package (it opens an upload session
+there and cancels it). It then stores the token on exactly the named repositories (by default, the
+ones already holding a copy) with the filter of the copy it replaces, checks what Woodpecker
+stored, and only then deletes every global, organization and other repository copy. Run it with a
+new token to rotate. pin changes the plugin digests every copy admits, the filter step of a plugin
+upgrade.
 
 Environment: WOODPECKER_SERVER, WOODPECKER_TOKEN_FILE (a file holding an admin API token),
-GITHUB_API_URL (default https://api.github.com).
+GITHUB_API_URL (default https://api.github.com), REGISTRY_URL (default https://ghcr.io).
 """
 import argparse
+import base64
 import json
 import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+from http.client import HTTPException
 
 SECRET = "gchr_token"
 PLUGIN_LOGIN = "realdecimalist"
 PACKAGES_ORG = "Flux-Point-Studios"
 PACKAGE_SCOPES = {"write:packages", "read:packages"}
-PINNED = re.compile(r"^[a-z0-9._/-]+@sha256:[0-9a-f]{64}$")
+REGISTRY = "ghcr.io"
+PLUGIN_PACKAGE = "flux-point-studios/materios-operator-kit"
+PINNED = re.compile(re.escape(f"{REGISTRY}/{PLUGIN_PACKAGE}") + r"@sha256:[0-9a-f]{64}")
+CLASSIC_TOKEN = re.compile(r"ghp_[A-Za-z0-9]{36}")
 
 
 class Refused(Exception):
@@ -44,8 +52,11 @@ def http(method, url, auth, body=None):
             return response.status, response.headers, response.read()
     except urllib.error.HTTPError as e:
         return e.code, e.headers, e.read()
-    except (urllib.error.URLError, TimeoutError) as e:
+    except OSError as e:
         raise Refused(f"{method} {url}: {getattr(e, 'reason', e)}") from None
+    except (ValueError, HTTPException) as e:
+        # Their messages can quote a header value, and the Authorization header holds a token.
+        raise Refused(f"{method} {url}: malformed request or response ({type(e).__name__})") from None
 
 
 def read_secret_file(path):
@@ -56,6 +67,8 @@ def read_secret_file(path):
         raise Refused(f"cannot read {path}: {e.strerror}") from None
     if not value:
         raise Refused(f"{path}: token file is empty")
+    if not re.fullmatch(r"[\x21-\x7e]+", value):
+        raise Refused(f"{path}: the file must hold one token on one line")
     return value
 
 
@@ -70,7 +83,10 @@ class Woodpecker:
     def call(self, method, path, body=None):
         status, _, raw = http(method, self.api + path, self._auth, body)
         if status >= 300:
-            raise Refused(f"{method} {path}: HTTP {status} {raw.decode(errors='replace')[:200]}")
+            reply = raw.decode(errors="replace")
+            if body and body.get("value"):
+                reply = reply.replace(body["value"], "<token>")
+            raise Refused(f"{method} {path}: HTTP {status} {reply[:200]}")
         return json.loads(raw) if raw.strip() else None
 
     def inventory(self):
@@ -82,8 +98,14 @@ class Woodpecker:
             if len(batch) < 50:
                 break
             page += 1
+        orgs = sorted({r["org_id"] for r in repos})
+        for o in orgs:
+            org = self.call("GET", f"/orgs/{o}") or {}
+            if org.get("id") != o or not org.get("name"):
+                raise Refused(f"a repository belongs to organization {o}, which Woodpecker does not have; "
+                              "its secrets listing would be another scope's")
         scopes = [("global", "global", "")]
-        scopes += [("org", f"org {o}", f"/orgs/{o}") for o in sorted({r["org_id"] for r in repos})]
+        scopes += [("org", f"org {o}", f"/orgs/{o}") for o in orgs]
         scopes += [("repo", r["full_name"], f"/repos/{r['id']}") for r in repos]
         copies = []
         for scope, where, prefix in scopes:
@@ -100,9 +122,10 @@ def describe(copy):
 
 
 def require_pinned(images):
-    loose = [i for i in images if not PINNED.match(i)]
+    loose = [i for i in images if not PINNED.fullmatch(i)]
     if not images or loose:
-        raise Refused(f"the filter must admit only images pinned by digest, not: {', '.join(loose) or 'any image'}")
+        raise Refused(f"the filter must admit only {REGISTRY}/{PLUGIN_PACKAGE} pinned by digest, "
+                      f"not: {', '.join(loose) or 'any image'}")
 
 
 def current_filter(copies):
@@ -147,8 +170,8 @@ def print_plan(images, events, writes, retire):
 
 def check_token(github_api, token):
     """Public facts about a token that may hold the publish credential; refuse any other kind."""
-    if not token.startswith("ghp_"):
-        raise Refused("GitHub Packages accepts only a classic personal access token (ghp_...)")
+    if not CLASSIC_TOKEN.fullmatch(token):
+        raise Refused("GitHub Packages accepts only a classic personal access token (ghp_ and 36 letters or digits)")
     status, headers, raw = http("GET", f"{github_api}/user", "token " + token)
     if status != 200:
         raise Refused(f"GitHub rejected the token: HTTP {status}")
@@ -169,6 +192,23 @@ def check_token(github_api, token):
     return f"classic token of {login}, scopes {', '.join(sorted(scopes))}, expires {expiry}"
 
 
+def prove_push(registry_url, token):
+    """The registry opens an upload session only for a credential that may push; cancel the one opened."""
+    basic = base64.b64encode(f"{PLUGIN_LOGIN}:{token}".encode()).decode()
+    status, _, raw = http("GET", f"{registry_url}/token?service={REGISTRY}&scope=repository:{PLUGIN_PACKAGE}:pull,push",
+                          "Basic " + basic)
+    if status != 200:
+        raise Refused(f"{REGISTRY} refused the token: HTTP {status}")
+    bearer = "Bearer " + json.loads(raw)["token"]
+    uploads = f"{registry_url}/v2/{PLUGIN_PACKAGE}/blobs/uploads/"
+    status, headers, _ = http("POST", uploads, bearer)
+    location = headers.get("Location")
+    if status != 202 or not location:
+        raise Refused(f"{REGISTRY} refused an upload to {PLUGIN_PACKAGE} with the token: HTTP {status}")
+    status, _, _ = http("DELETE", urllib.parse.urljoin(uploads, location), bearer)
+    return f"may push to {REGISTRY}/{PLUGIN_PACKAGE} (probe upload opened; its cancel answered HTTP {status})"
+
+
 def verify(woodpecker, names, images, events):
     _, copies = woodpecker.inventory()
     stored = {c["where"]: c for c in copies if c["scope"] == "repo"}
@@ -180,21 +220,19 @@ def verify(woodpecker, names, images, events):
     return copies
 
 
-def apply(woodpecker, github_api, token_file, names):
+def apply(woodpecker, github_api, registry_url, token_file, names):
     token = read_secret_file(token_file)
-    try:
-        print("token:", check_token(github_api, token))
-        repos, copies = woodpecker.inventory()
-        images, events, writes, retire = plan_changes(repos, copies, names)
-        print_plan(images, events, writes, retire)
-        for action, repo in writes:
-            body = {"value": token, "images": images, "events": events}
-            if action == "update":
-                woodpecker.call("PATCH", f"/repos/{repo['id']}/secrets/{SECRET}", body)
-            else:
-                woodpecker.call("POST", f"/repos/{repo['id']}/secrets", {"name": SECRET, **body})
-    except Refused as e:
-        raise Refused(str(e).replace(token, "<token>")) from None
+    print("token:", check_token(github_api, token))
+    print("token:", prove_push(registry_url, token))
+    repos, copies = woodpecker.inventory()
+    images, events, writes, retire = plan_changes(repos, copies, names)
+    print_plan(images, events, writes, retire)
+    for action, repo in writes:
+        body = {"value": token, "images": images, "events": events}
+        if action == "update":
+            woodpecker.call("PATCH", f"/repos/{repo['id']}/secrets/{SECRET}", body)
+        else:
+            woodpecker.call("POST", f"/repos/{repo['id']}/secrets", {"name": SECRET, **body})
     goal = [repo["full_name"] for _, repo in writes]
     verify(woodpecker, goal, images, events)
     for copy in retire:
@@ -249,7 +287,8 @@ def main(argv):
             repos, copies = woodpecker.inventory()
             print_plan(*plan_changes(repos, copies, args.repo))
         elif args.command == "apply":
-            apply(woodpecker, os.environ.get("GITHUB_API_URL", "https://api.github.com"), args.token_file, args.repo)
+            apply(woodpecker, os.environ.get("GITHUB_API_URL", "https://api.github.com"),
+                  os.environ.get("REGISTRY_URL", f"https://{REGISTRY}"), args.token_file, args.repo)
         else:
             pin(woodpecker, args.add, args.drop)
     except Refused as e:

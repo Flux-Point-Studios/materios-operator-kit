@@ -1,6 +1,7 @@
 import contextlib
 import copy
 import io
+import base64
 import json
 import os
 import tempfile
@@ -13,6 +14,7 @@ import registry_token
 
 PLUGIN = "ghcr.io/flux-point-studios/materios-operator-kit@sha256:" + "d3" * 32
 NEXT_PLUGIN = "ghcr.io/flux-point-studios/materios-operator-kit@sha256:" + "a1" * 32
+OTHER_IMAGE = "ghcr.io/flux-point-studios/materios-gateway@sha256:" + "e5" * 32
 EVENTS = ["cron", "deployment", "manual", "push", "release", "tag"]
 WOODPECKER_TOKEN = "wp-admin-token"
 NEW_TOKEN = "ghp_" + "N" * 36
@@ -26,6 +28,7 @@ REPOS = [
     {"id": 4, "full_name": "Org/docs", "org_id": 2},
     {"id": 5, "full_name": "user/app", "org_id": 1},
 ]
+ORGS = {1: "user", 2: "Org"}
 
 GITHUB_USERS = {
     NEW_TOKEN: ("realdecimalist", "read:packages, write:packages", 200),
@@ -33,8 +36,10 @@ GITHUB_USERS = {
     "ghp_" + "R" * 36: ("realdecimalist", "read:packages", 200),
     "ghp_" + "S" * 36: ("someone-else", "write:packages", 200),
     "ghp_" + "P" * 36: ("realdecimalist", "write:packages", 403),
+    "ghp_" + "D" * 36: ("realdecimalist", "write:packages", 200),
     "github_pat_" + "F" * 82: ("realdecimalist", None, 403),
 }
+PUSHERS = {NEW_TOKEN}
 
 
 def secret(value, images, events):
@@ -50,7 +55,10 @@ class Fake:
         self.repo_secrets = {r["id"]: {} for r in REPOS}
         self.writes = []
         self.stored_images = None
-        self.echo_rejections = False
+        self.echo_rejections = None
+        self.github_calls = []
+        self.registry_tokens = {}
+        self.uploads = {}
 
     def listing(self, secrets):
         return [{"name": n, "images": s["images"], "events": sorted(s["events"])} for n, s in secrets.items()]
@@ -59,11 +67,15 @@ class Fake:
         if parts == ["repos"]:
             page, per = int(query.get("page", ["1"])[0]), int(query.get("perPage", ["50"])[0])
             return 200, REPOS[(page - 1) * per:page * per]
+        if parts[0] == "orgs" and len(parts) == 2:
+            org = int(parts[1])
+            return 200, {"id": org, "name": ORGS[org]} if org in ORGS else {"name": ""}
         if parts[0] == "secrets":
             store = self.global_secrets
             rest = parts[1:]
         elif parts[0] == "orgs" and parts[2] == "secrets":
-            store = self.org_secrets[int(parts[1])]
+            # Woodpecker answers an unknown organization with the secrets stored under no organization.
+            store = self.org_secrets.get(int(parts[1]), self.global_secrets)
             rest = parts[3:]
         elif parts[0] == "repos" and parts[2] == "secrets":
             store = self.repo_secrets[int(parts[1])]
@@ -75,8 +87,8 @@ class Fake:
         if method != "GET":
             self.writes.append((method, "/" + "/".join(parts)))
         if method == "POST" and not rest:
-            if self.echo_rejections:
-                return 422, "Error inserting secret. " + json.dumps(body)
+            if self.echo_rejections is not None:
+                return 422, self.echo_rejections + json.dumps(body)
             if body["name"] in store:
                 return 500, "exists"
             store[body["name"]] = secret(body["value"], self.stored_images or body["images"], body["events"])
@@ -98,6 +110,7 @@ class Fake:
         return 405, "method"
 
     def github(self, parts, token):
+        self.github_calls.append("/".join(parts))
         if token not in GITHUB_USERS:
             return 401, {"message": "Bad credentials"}, {}
         login, scopes, packages = GITHUB_USERS[token]
@@ -108,6 +121,28 @@ class Fake:
         if parts[:3] == ["orgs", "Flux-Point-Studios", "packages"]:
             return packages, ([] if packages == 200 else {"message": "no"}), headers
         return 404, {"message": "Not Found"}, headers
+
+    def registry(self, method, parts, auth):
+        """The GHCR token exchange and upload sessions: an upload opens only for a token that may push."""
+        if parts == ["token"]:
+            login, _, token = base64.b64decode(auth.removeprefix("Basic ")).decode().partition(":")
+            if login != "realdecimalist" or token not in GITHUB_USERS:
+                return 401, {"errors": [{"code": "UNAUTHORIZED"}]}, {}
+            bearer = f"registry-bearer-{len(self.registry_tokens)}"
+            self.registry_tokens[bearer] = token
+            return 200, {"token": bearer}, {}
+        token = self.registry_tokens.get(auth.removeprefix("Bearer "))
+        path = "/" + "/".join(parts)
+        if method == "POST" and path == "/v2/flux-point-studios/materios-operator-kit/blobs/uploads":
+            if token not in PUSHERS:
+                return 403, {"errors": [{"code": "DENIED"}]}, {}
+            session = f"{path}/session-{len(self.uploads)}"
+            self.uploads[session] = "open"
+            return 202, None, {"Location": "/ghcr" + session}
+        if method == "DELETE" and self.uploads.get(path) == "open" and token in PUSHERS:
+            self.uploads[path] = "cancelled"
+            return 204, None, {}
+        return 404, {"errors": [{"code": "NOT_FOUND"}]}, {}
 
 
 def serve(fake):
@@ -127,8 +162,10 @@ def serve(fake):
                     status, payload = 401, "unauthorized"
                 else:
                     status, payload = fake.woodpecker(self.command, parts[1:], parse_qs(url.query), body)
-            else:
+            elif parts[:1] == ["gh"]:
                 status, payload, headers = fake.github(parts[1:], auth.removeprefix("token "))
+            else:
+                status, payload, headers = fake.registry(self.command, parts[1:], auth)
             data = b"" if payload is None else (json.dumps(payload) if not isinstance(payload, str) else payload).encode()
             self.send_response(status)
             for k, v in headers.items():
@@ -153,7 +190,9 @@ class RegistryTokenTest(unittest.TestCase):
         wp_file = os.path.join(self.dir.name, "woodpecker")
         with open(wp_file, "w") as f:
             f.write(WOODPECKER_TOKEN + "\n")
-        self.env = {"WOODPECKER_SERVER": base, "WOODPECKER_TOKEN_FILE": wp_file, "GITHUB_API_URL": base + "/gh"}
+        self.wp_file = wp_file
+        self.env = {"WOODPECKER_SERVER": base, "WOODPECKER_TOKEN_FILE": wp_file, "GITHUB_API_URL": base + "/gh",
+                    "REGISTRY_URL": base + "/ghcr"}
 
     def tearDown(self):
         self.server.shutdown()
@@ -180,7 +219,7 @@ class RegistryTokenTest(unittest.TestCase):
                 else:
                     os.environ[k] = v
         text = out.getvalue() + err.getvalue()
-        for value in [NEW_TOKEN, OLD_VALUE, WOODPECKER_TOKEN, *GITHUB_USERS]:
+        for value in [NEW_TOKEN, OLD_VALUE, WOODPECKER_TOKEN, *GITHUB_USERS, *self.fake.registry_tokens]:
             self.assertNotIn(value, text)
         return code, text
 
@@ -305,11 +344,72 @@ class RegistryTokenTest(unittest.TestCase):
 
     def test_apply_keeps_the_token_out_of_a_rejection_that_echoes_it(self):
         self.global_state()
-        self.fake.echo_rejections = True
+        self.fake.echo_rejections = "Error inserting secret. "
         code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
         self.assertEqual(code, 1, text)
         self.assertIn("HTTP 422", text)
         self.assertIn("gchr_token", self.fake.global_secrets)
+
+    def test_apply_keeps_every_part_of_the_token_out_of_a_truncated_echo(self):
+        self.global_state()
+        start = len('{"name": "gchr_token", "value": "')
+        self.fake.echo_rejections = "x" * (195 - start)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("HTTP 422", text)
+        self.assertNotIn(NEW_TOKEN[:5], text)
+
+    def test_apply_refuses_a_token_file_holding_the_token_twice(self):
+        self.assert_refused_without_writes(NEW_TOKEN + "\n" + NEW_TOKEN, "one line")
+
+    def test_apply_refuses_a_token_that_is_not_shaped_like_a_classic_token(self):
+        self.assert_refused_without_writes(NEW_TOKEN + "x", "classic")
+        self.assertEqual(self.fake.github_calls, [])
+
+    def test_a_woodpecker_token_file_holding_the_token_twice_is_refused(self):
+        self.global_state()
+        with open(self.wp_file, "w") as f:
+            f.write(WOODPECKER_TOKEN + "\n" + WOODPECKER_TOKEN + "\n")
+        code, text = self.run_tool("plan", *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("one line", text)
+
+    def test_a_request_the_http_client_rejects_is_refused_without_its_header(self):
+        with self.assertRaises(registry_token.Refused) as caught:
+            registry_token.http("GET", self.env["GITHUB_API_URL"] + "/user", "token first-line\nsecond-line")
+        self.assertNotIn("first-line", str(caught.exception))
+        self.assertNotIn("second-line", str(caught.exception))
+
+    def test_apply_proves_the_token_can_push_and_cancels_the_probe_upload(self):
+        self.global_state()
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 0, text)
+        self.assertEqual(list(self.fake.uploads.values()), ["cancelled"])
+
+    def test_apply_refuses_a_token_the_registry_will_not_let_push(self):
+        self.assert_refused_without_writes("ghp_" + "D" * 36, "upload")
+
+    def test_plan_refuses_a_repository_whose_organization_woodpecker_does_not_have(self):
+        self.global_state()
+        REPOS.append({"id": 6, "full_name": "gone/app", "org_id": 7})
+        self.fake.repo_secrets[6] = {}
+        try:
+            code, text = self.run_tool("plan", *self.repo_args())
+            self.assertEqual(code, 1, text)
+            self.assertIn("organization 7", text)
+            code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+            self.assertEqual(code, 1, text)
+            self.assertEqual(self.fake.writes, [])
+            self.assertIn("gchr_token", self.fake.global_secrets)
+        finally:
+            REPOS.pop()
+
+    def test_apply_refuses_to_spread_a_filter_that_admits_another_image_by_digest(self):
+        self.fake.global_secrets["gchr_token"] = secret(OLD_VALUE, [PLUGIN, OTHER_IMAGE], EVENTS)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn(OTHER_IMAGE, text)
+        self.assertEqual(self.fake.writes, [])
 
     def test_pin_adds_and_drops_a_plugin_digest_on_every_copy(self):
         for r in REPOS[:3]:
@@ -333,6 +433,13 @@ class RegistryTokenTest(unittest.TestCase):
         for r in REPOS[:3]:
             self.fake.repo_secrets[r["id"]]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
         code, text = self.run_tool("pin", "--add", "ghcr.io/flux-point-studios/materios-operator-kit:ci-oci-index")
+        self.assertEqual(code, 1, text)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_pin_refuses_a_digest_of_an_image_that_is_not_the_plugin(self):
+        for r in REPOS[:3]:
+            self.fake.repo_secrets[r["id"]]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        code, text = self.run_tool("pin", "--add", "docker.io/library/alpine@sha256:" + "ee" * 32)
         self.assertEqual(code, 1, text)
         self.assertEqual(self.fake.writes, [])
 

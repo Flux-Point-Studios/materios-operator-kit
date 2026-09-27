@@ -138,7 +138,7 @@
     {
       "id": "registry-token-scope",
       "name": "Registry token scope",
-      "desc": "Keeps the GHCR publish token (gchr_token) as repository-level Woodpecker secrets on exactly the repositories that publish through the OCI index plugin, each copy admitting only the plugin's pinned digests. plan lists every copy and the change; apply accepts only a classic write:packages token of the plugin's login, stores it, checks what Woodpecker stored, then deletes every global, organization and stray copy (run it again to rotate); pin adds or drops a plugin digest on every copy during a plugin upgrade.",
+      "desc": "Keeps the GHCR publish token (gchr_token) as repository-level Woodpecker secrets on exactly the repositories that publish through the OCI index plugin, each copy admitting only the plugin's pinned digests. plan lists every copy and the change; apply accepts only a classic write:packages token of the plugin's login that the registry lets open an upload in the plugin's package, stores it, checks what Woodpecker stored, then deletes every global, organization and stray copy (run it again to rotate); pin adds or drops a digest of the plugin image, and only of it, on every copy during a plugin upgrade.",
       "kind": "toolkit",
       "paths": [
         "ci/registry-token"
