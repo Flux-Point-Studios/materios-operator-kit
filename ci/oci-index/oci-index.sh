@@ -12,11 +12,16 @@
 #   tags       extra tags moved to target only after it verifies (optional)
 #   registry, username, password   login, when password is set (optional)
 #
-# With a password, the plugin runs only on a push or manual pipeline of the default
-# branch, logs in only to OCI_INDEX_REGISTRY and writes only under OCI_INDEX_PREFIX.
-# Those come from the environment, not from settings: Woodpecker refuses a secret to
-# any step that sets its own environment, so no pipeline can widen them.
+# With a password, the plugin runs only on the first run of a push or manual pipeline of
+# the default branch, logs in only to REGISTRY and writes only under PREFIX. Woodpecker
+# sets the CI_* values checked here over a run's variables. A restart (CI_PIPELINE_PARENT
+# other than 0) is refused: it runs its stored configuration, however old, with the
+# restart's variables. REGISTRY and PREFIX are fixed here because a run's variables reach
+# a plugin step's environment.
 set -euf
+
+REGISTRY=ghcr.io
+PREFIX=ghcr.io/flux-point-studios/
 
 die() { echo "oci-index: $*" >&2; exit 1; }
 list() { echo "$1" | tr ',' '\n' | sed '/^$/d'; }
@@ -36,13 +41,12 @@ if [ -n "${PLUGIN_PASSWORD:-}" ]; then
     push:"$default" | manual:"$default") [ -n "$default" ] ;;
     *) false ;;
   esac || die "the token is only used on a push or manual pipeline of the default branch"
-  registry=${OCI_INDEX_REGISTRY:-ghcr.io}
-  prefix=${OCI_INDEX_PREFIX:-ghcr.io/flux-point-studios/}
-  [ "$PLUGIN_REGISTRY" = "$registry" ] || die "the token may only be sent to $registry"
+  [ "${CI_PIPELINE_PARENT:-}" = 0 ] || die "the token is not used on a restarted pipeline"
+  [ "$PLUGIN_REGISTRY" = "$REGISTRY" ] || die "the token may only be sent to $REGISTRY"
   for ref in $TARGET $(echo "$SOURCES" | sed 's/^[^=]*=//'); do
-    case "$ref" in "$prefix"*) ;; *) die "$ref is outside $prefix" ;; esac
+    case "$ref" in "$PREFIX"*) ;; *) die "$ref is outside $PREFIX" ;; esac
   done
-  printf '%s' "$PLUGIN_PASSWORD" | crane auth login "$registry" -u "$PLUGIN_USERNAME" --password-stdin >/dev/null
+  printf '%s' "$PLUGIN_PASSWORD" | crane auth login "$REGISTRY" -u "$PLUGIN_USERNAME" --password-stdin >/dev/null
 fi
 
 set --

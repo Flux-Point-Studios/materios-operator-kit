@@ -164,7 +164,7 @@ steps:
   # Moves :latest only once the index is verified to carry both platforms, so a failed
   # leg never leaves :latest single-arch.
   - name: publish-index
-    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:d3178aaf4dc548dda5bd2d15a09f7c650ac1325fa7bc9215a861a3f34774c84b
+    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:3be11aea2fe20862edd106ad4686e4a6bf10a0da3730ee53c28b407287b836b5
     settings:
       registry: ghcr.io
       username: realdecimalist

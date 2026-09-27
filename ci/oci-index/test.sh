@@ -124,15 +124,24 @@ else
   ok "a missing target fails"
 fi
 
-# With the token present the plugin only runs where a pipeline cannot choose its own
-# environment: those limits come from OCI_INDEX_* and CI_* variables that a
-# secret-holding plugin step cannot set, and the tests set them here.
+# With the token the plugin runs only on a first push or manual pipeline of the default
+# branch, and only toward the registry and prefix fixed in the script. The token tests run
+# a copy whose two fixed values name the local registry instead.
+LOCAL=/tmp/oci-index-local.sh
+sed -e "s|^REGISTRY=ghcr.io\$|REGISTRY=$REG|" -e "s|^PREFIX=ghcr.io/flux-point-studios/\$|PREFIX=$REG/fps/|" \
+  "$HERE/oci-index.sh" >"$LOCAL"
+changed=$(diff -U0 "$HERE/oci-index.sh" "$LOCAL" | awk '/^(---|\+\+\+|@@)/ { next } /^[-+]/ { n++ } END { print n + 0 }')
+if [ "$changed" -eq 4 ]; then
+  ok "the plugin fixes its registry and prefix, one line each"
+else
+  echo "the local copy changed $changed lines, not 4" >/tmp/plugin.out
+  bad "the plugin does not fix its registry and prefix, one line each"
+fi
 authorized() {
-  CI_PIPELINE_EVENT=push CI_COMMIT_BRANCH=main CI_REPO_DEFAULT_BRANCH=main \
-  OCI_INDEX_REGISTRY=$REG OCI_INDEX_PREFIX=$REG/fps/ \
+  CI_PIPELINE_EVENT=push CI_COMMIT_BRANCH=main CI_REPO_DEFAULT_BRANCH=main CI_PIPELINE_PARENT=0 \
   PLUGIN_REGISTRY=$REG PLUGIN_USERNAME=ci PLUGIN_PASSWORD=s3cret-token "$@"
 }
-env_run() { env "$@" /busybox/sh "$HERE/oci-index.sh" >/tmp/plugin.out 2>&1; }
+env_run() { env "$@" /busybox/sh "$LOCAL" >/tmp/plugin.out 2>&1; }
 # token_rejects NAME PATTERN VAR=VALUE...: an authorized run with those overrides must
 # fail for PATTERN and write nothing.
 denied=0
@@ -173,6 +182,17 @@ token_rejects "the token is only sent to the allowed registry" "may only be sent
 token_rejects "the target must be under the allowed prefix" "outside $REG/fps/" PLUGIN_TARGET="$REG/elsewhere:abc"
 token_rejects "a source must be under the allowed prefix" "outside $REG/fps/" PLUGIN_SOURCES="/tmp/layout-amd64=$REG/elsewhere:abc"
 token_rejects "a password without a username fails" "password needs registry and username" PLUGIN_USERNAME=
+# A restart runs its stored configuration with the restart's variables, however old it is.
+token_rejects "the token is refused on a restarted pipeline" "not used on a restarted pipeline" CI_PIPELINE_PARENT=4
+token_rejects "the token is refused without the parent metadata" "not used on a restarted pipeline" CI_PIPELINE_PARENT=
+
+# The plugin as shipped refuses the local registry even when variables name it.
+if authorized env OCI_INDEX_REGISTRY=$REG OCI_INDEX_PREFIX=$REG/fps/ PLUGIN_SOURCES="/tmp/layout-amd64=$REG/fps/shipped:abc" \
+  PLUGIN_PLATFORMS=linux/amd64 PLUGIN_TARGET="$REG/fps/shipped:abc" PLUGIN_TAGS=latest \
+  /busybox/sh "$HERE/oci-index.sh" >/tmp/plugin.out 2>&1; then bad "variables moved the registry: accepted"
+elif exists "$REG/fps/shipped:abc"; then bad "variables moved the registry: wrote the target"
+elif ! says "may only be sent to ghcr.io"; then bad "variables moved the registry: failed for another reason"
+else ok "variables cannot move the registry or prefix"; fi
 
 # A manifest that cannot be read is reported as such, not as an index.
 cat > /tmp/shim/crane <<EOF
