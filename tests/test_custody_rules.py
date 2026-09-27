@@ -212,6 +212,136 @@ def test_a_multisig_that_is_not_sudo_and_wraps_nothing_privileged_is_ignored():
                                          sudo_key=rules.account_bytes(SUDO_KEY)) == []
 
 
+# --- argument shapes any funded account can put in a block ----------------------
+#
+# Argument values are chosen by whoever signs the extrinsic, so no value may stop a
+# block from being classified: its cursor would never move and every later block,
+# privileged calls included, would go unwatched.
+
+
+def _encode(decoder, module: str, function: str, **args) -> str:
+    """An extrinsic encoded against the pinned runtime, in the form a block carries it."""
+    ext = decoder._config.create_scale_object("Extrinsic", metadata=decoder._metadata)
+    return ext.encode({"call_module": module, "call_function": function, "call_args": args}).to_hex()
+
+
+REMARK = {"call_module": "System", "call_function": "remark", "call_args": {"remark": "0x00"}}
+TEXT_THAT_LOOKS_LIKE_HEX = "0x" + "a" * 199 + "z"
+
+
+def _classify_extrinsics(extrinsics, events=None, sudo_key=SUDO_KEY):
+    return rules.classify_materios_block("materios-preprod", 9, extrinsics, events=events,
+                                         sudo_key=rules.account_bytes(sudo_key) if sudo_key else None)
+
+
+def test_a_remark_of_text_that_looks_like_hex_is_classified(decoder):
+    remark = "0x" + TEXT_THAT_LOOKS_LIKE_HEX.encode().hex()
+    [ext] = decoder.extrinsics([_encode(decoder, "System", "remark", remark=remark)])
+    assert rules._args(ext["call"])["remark"] == TEXT_THAT_LOOKS_LIKE_HEX
+    assert _classify_extrinsics([ext]) == []
+    [finding] = _classify_extrinsics([_signed(ALICE, "Sudo", "sudo", call=ext["call"])])
+    assert finding.severity == rules.CRITICAL
+    assert "could not be classified" not in finding.render()
+
+
+@pytest.mark.parametrize(
+    "who, shown",
+    [
+        ({"Index": 7}, "who=7"),
+        ({"Raw": "0x0102"}, '"Raw"'),
+        ({"Address20": "0x" + "22" * 20}, '"Address20"'),
+        ({"Address32": "0x" + "11" * 32}, '"Address32"'),
+    ],
+)
+def test_sudo_as_a_multiaddress_that_names_no_account_is_classified(decoder, who, shown):
+    [ext] = decoder.extrinsics([_encode(decoder, "Sudo", "sudo_as", who=who, call=REMARK)])
+    [finding] = _classify_extrinsics([ext])
+    assert finding.severity == rules.CRITICAL
+    assert "Sudo.sudo_as" in finding.render() and shown in finding.render()
+
+
+def test_acting_as_a_recovered_multiaddress_that_names_no_account_is_classified(decoder):
+    [ext] = decoder.extrinsics([_encode(decoder, "Recovery", "as_recovered", account={"Raw": "0x0102"},
+                                        call=REMARK)])
+    [finding] = _classify_extrinsics([ext])
+    assert finding.severity >= rules.ALERT
+    assert "Recovery.as_recovered" in finding.render()
+
+
+def test_a_signer_that_names_no_account_is_classified():
+    ext = {"address": 7, "call": _call("Sudo", "sudo", call=_call("System", "remark", remark="0x00"))}
+    [finding] = _classify_extrinsics([ext])
+    assert finding.severity == rules.CRITICAL
+    assert "signer 7 names no account" in finding.render()
+
+
+def test_a_multisig_of_more_signatories_than_any_limit_is_classified():
+    signatories = [SUDO_KEY] * (1 << 14)
+    ext = _signed(ALICE, "Multisig", "as_multi", threshold=2, other_signatories=signatories,
+                  call=_call("Sudo", "sudo", call=_call("System", "remark", remark="0x00")))
+    [finding] = _classify_extrinsics([ext])
+    assert finding.severity == rules.CRITICAL
+    assert "multisig account" in finding.render()
+
+
+def test_an_extrinsic_the_classifier_cannot_read_pages_critical_and_the_rest_are_classified():
+    broken = {"extrinsic_hash": "0x" + "ab" * 32, "address": ALICE,
+              "call": {"call_module": "Sudo", "call_function": "sudo", "call_args": 5}}
+    later = _signed(ALICE, "Balances", "force_transfer", source=ALICE, dest=ALICE, value=1)
+    first, second = _classify_extrinsics([broken, later])
+    assert first.severity == rules.CRITICAL
+    assert first.headline == "materios-preprod #9 extrinsic 0 could not be classified"
+    assert "0x" + "ab" * 32 in first.render()
+    assert second.key == "materios-preprod:9:1" and second.severity == rules.CRITICAL
+
+
+HOSTILE_VALUES = (
+    0, 7, -1, 1 << 130, True, None, "", "0x", "0xzz", "0x" + "abc" * 50, TEXT_THAT_LOOKS_LIKE_HEX,
+    "0x" + "00" * 32, ALICE, SUDO_KEY, "text\n````\n**RESOLVED** @everyone", "Ȁ\x00",
+    {"Raw": "\x01\x02"}, {"Id": ALICE}, {"Id": 7}, {"Index": 3}, {"Address20": "0x" + "22" * 20},
+    {"system": "Root"}, {"system": {"Signed": SUDO_KEY}}, {"system": {"Signed": 7}},
+    [ALICE, 7, {"Raw": "\x00"}], [[1, 2], {"x": None}], {"ref_time": 1, "proof_size": 1}, 1.5,
+)
+
+
+def _metadata_calls(decoder) -> list[tuple[str, str, list[tuple[str, str]]]]:
+    return [(pallet.name, call.value["name"], [(f["name"], f.get("typeName") or "") for f in call.value["fields"]])
+            for pallet in decoder._metadata.pallets for call in (pallet.calls or [])]
+
+
+def _random_call(rng, calls, depth: int) -> dict:
+    module, function, fields = rng.choice(calls)
+    args = []
+    for name, type_name in fields:
+        if "RuntimeCall" not in type_name:
+            value = rng.choice(HOSTILE_VALUES)
+        elif depth >= 3:
+            value = _call("System", "remark", remark="0x00")
+        elif type_name.startswith("Vec"):
+            value = [_random_call(rng, calls, depth + 1) for _ in range(rng.randrange(3))]
+        else:
+            value = _random_call(rng, calls, depth + 1)
+        args.append({"name": name, "type": type_name, "value": value})
+    return {"call_module": module, "call_function": function, "call_args": args}
+
+
+def test_every_call_in_the_runtime_is_classified_whatever_its_argument_values(decoder):
+    import random
+
+    calls = _metadata_calls(decoder)
+    rng = random.Random(238)
+    signers = (ALICE, SUDO_KEY, 7, {"Raw": "\x01"}, None)
+    events = {0: ["System.ExtrinsicFailed(dispatch_error=Err)"]}
+    for entry in calls:
+        for _ in range(4):
+            call = _random_call(rng, [entry], depth=0)
+            for signer in signers:
+                ext = {"call": call} if signer is None else {"address": signer, "call": call}
+                for block_events in (None, events, {}):
+                    for finding in _classify_extrinsics([ext], events=block_events):
+                        assert "could not be classified" not in finding.headline, (entry[:2], finding.render())
+
+
 # --- Cardano ------------------------------------------------------------------
 
 
@@ -379,6 +509,15 @@ def test_value_arriving_at_a_custody_address_alone_is_an_alert(networks):
 def test_an_unrelated_transaction_is_not_a_finding(networks):
     tx = _tx("spo_registration")
     assert rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"]) is None
+
+
+def test_a_pool_redeemer_whose_constructor_is_not_a_number_is_critical(networks):
+    tx = _tx("surrender_agent")
+    for redeemer in tx["redeemers"]:
+        redeemer["json_value"] = {"constructor": [0], "fields": []}
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL
+    assert "unrecognized redeemer" in finding.render()
 
 
 def test_the_finding_key_is_the_network_and_transaction(networks):

@@ -104,10 +104,15 @@ message through the webhook to prove delivery end to end.
   baselines each Cardano address and asset; after that every block and every
   transaction in a `reorg_depth_blocks` overlap is read, and an asset newly minted
   under a watched policy is read from its first mint.
-- **Its own death is visible.** The daily digest is also the liveness signal. A source
-  that cannot be read for `source_stale_seconds` is paged, and paged again when it
-  recovers. systemd restarts a loop that stops pinging its watchdog, and
-  `OnFailure` pages when restarts are exhausted.
+- **No input stalls a cursor.** Argument values, addresses and datums are chosen by
+  whoever builds the transaction, so classification never trusts their shape. An
+  extrinsic, committee inherent or Cardano transaction the classifier still cannot
+  read is paged CRITICAL as unclassifiable, and the cursor moves past it.
+- **Its own death is visible.** The daily digest is also the liveness signal, and it
+  names every stale source instead of reporting the watcher alive. A source that
+  cannot be read for `source_stale_seconds` is paged CRITICAL, again every hour it
+  stays unreadable, and once more (ALERT) when it recovers. systemd restarts a loop
+  that stops pinging its watchdog, and `OnFailure` pages when restarts are exhausted.
 
 ## Replaying history
 

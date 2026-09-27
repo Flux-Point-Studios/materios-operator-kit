@@ -205,6 +205,39 @@ def test_a_failing_source_raises_one_stale_alert_then_one_recovery(config, tmp_p
     assert "recovered" in posts.payloads[1]["content"]
 
 
+def test_a_source_that_stays_stale_is_paged_critical_every_hour(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    posts = Posts()
+    clock = [_at("2026-09-27T01:00:00")]
+    watch = _watch(config, store, [StubSource("materios-preprod", fail=True)], posts, clock)
+    watch.cycle()
+    clock[0] += config.source_stale_seconds + 60
+    watch.cycle()
+    for _ in range(5):
+        clock[0] += 600
+        watch.cycle()
+    assert len(posts.payloads) == 1
+    clock[0] += 3600
+    watch.cycle()
+    assert len(posts.payloads) == 2
+    assert all(p["content"].startswith("\U0001f6a8 **CRITICAL** @here") for p in posts.payloads)
+    assert "materios-preprod stale for 12" in posts.payloads[1]["content"]
+
+
+def test_the_digest_names_a_stale_source_instead_of_calling_the_watcher_alive(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    posts = Posts()
+    clock = [_at("2026-09-27T12:00:00")]
+    watch = _watch(config, store, [StubSource("materios-preprod", fail=True), StubSource("cardano-mainnet")],
+                   posts, clock)
+    watch.cycle()
+    clock[0] = _at("2026-09-27T13:00:00")
+    watch.cycle()
+    digest = next(p["content"] for p in posts.payloads if "daily digest" in p["content"])
+    assert "alive" not in digest
+    assert "STALE: materios-preprod" in digest
+
+
 def test_a_restart_after_downtime_gives_sources_a_chance_before_calling_them_stale(config, tmp_path):
     db = str(tmp_path / "state.db")
     clock = [_at("2026-09-27T01:00:00")]
@@ -246,9 +279,10 @@ class FakeChain:
     stands for the node's unpruned window.
     """
 
-    def __init__(self, head: int, blocks: dict[int, str], state_at=None, events_hex=None):
+    def __init__(self, head: int, blocks: dict[int, str], state_at=None, events_hex=None, extra=None):
         self.head = head
         self.blocks = blocks
+        self.extra = extra or {}
         self.state_at = set(state_at or ())
         self.events_hex = events_hex
         self.sudo_key = "0x" + rules.account_bytes(SUDO_KEY).hex()
@@ -274,7 +308,7 @@ class FakeChain:
 
     def _block(self, number: int) -> dict:
         name = self.blocks.get(number, ROUTINE_BLOCK)
-        extrinsics = json.loads(_read(f"materios/{name}"))["extrinsics"]
+        extrinsics = json.loads(_read(f"materios/{name}"))["extrinsics"] + self.extra.get(number, [])
         logs = self.headers.get(str(number), {}).get("digest", {}).get("logs", [])
         header = {"number": hex(number), "parentHash": self.hash_of(number - 1), "digest": {"logs": logs}}
         return {"block": {"header": header, "extrinsics": extrinsics}}
@@ -491,6 +525,43 @@ def test_a_reset_chain_reaching_an_old_finding_height_is_still_paged(config, tmp
     assert "materios-preprod #1829210 extrinsic 2: Multisig.as_multi" in posts.text()
 
 
+def _hostile_remark(chain) -> str:
+    """A remark whose text reads as hex until its last character, encoded as a block carries it."""
+    decoder = rules.RuntimeDecoder(chain.metadata)
+    ext = decoder._config.create_scale_object("Extrinsic", metadata=decoder._metadata)
+    text = "0x" + "a" * 199 + "z"
+    return ext.encode({"call_module": "System", "call_function": "remark",
+                       "call_args": {"remark": "0x" + text.encode().hex()}}).to_hex()
+
+
+def test_a_hostile_argument_does_not_stall_the_privileged_calls_after_it(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1000, blocks={1000: "block_1587358.json"}, state_at={1000})
+    chain.extra[999] = [_hostile_remark(chain)]
+    source = _materios(config, store, chain)
+    source.start_at(998)
+    _drain(source)
+    assert store.get("cursor:materios-preprod") == "1000"
+    [finding] = [f for f in store.findings() if f.severity == rules.CRITICAL]
+    assert "Sudo.set_key" in finding.text
+
+
+def test_a_committee_inherent_that_cannot_be_read_pages_and_the_cursor_moves_on(config, tmp_path, monkeypatch):
+    def unreadable(extrinsics):
+        raise KeyError("validators")
+
+    monkeypatch.setattr(rules, "committee_of", unreadable)
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1000, blocks={1000: "block_2029707.json"}, state_at={1000})
+    source = _materios(config, store, chain)
+    source.start_at(999)
+    _drain(source)
+    assert store.get("cursor:materios-preprod") == "1000"
+    [finding] = store.findings()
+    assert finding.severity == rules.CRITICAL
+    assert "committee inherent could not be classified" in finding.text and "KeyError" in finding.text
+
+
 def test_a_dropped_connection_is_reopened_before_polling(config, tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     chain = FakeChain(head=1000, blocks={}, state_at={1000})
@@ -649,6 +720,21 @@ def test_a_backtest_reports_only_the_mints_inside_its_window(config, tmp_path):
     report = cw.backtest([source], store, now=_at("2026-09-27T01:01:00"))
     assert [f.key for f in report] == [f"cardano-mainnet:{inside}"]
     assert report[0].severity == rules.CRITICAL
+
+
+def test_a_transaction_the_classifier_cannot_read_pages_critical_once(config, tmp_path, monkeypatch):
+    def unreadable(network, tx, utxos, redeemers):
+        raise TypeError("unhashable type: 'list'")
+
+    monkeypatch.setattr(rules, "classify_cardano_tx", unreadable)
+    store, network, api, source = _baselined(config, tmp_path)
+    tx_hash = api.add_tx("surrender_agent", address=network.pool.address, height=13_500_010)
+    assert source.poll(_at("2026-09-27T01:01:00"))
+    source.poll(_at("2026-09-27T01:02:00"))
+    [finding] = store.findings()
+    assert finding.severity == rules.CRITICAL
+    assert finding.key == f"cardano-mainnet:{tx_hash}"
+    assert "could not be classified" in finding.text and "TypeError" in finding.text
 
 
 def test_an_address_blockfrost_has_never_seen_has_no_transactions(config, tmp_path):

@@ -22,6 +22,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -293,6 +294,21 @@ def account_bytes(account: str) -> bytes:
     return bytes.fromhex(ss58_decode(account))
 
 
+def _account(value) -> bytes | None:
+    """The account an AccountId or MultiAddress value names, or None for the Index, Raw,
+    Address20 and Address32 variants (which the runtime's lookup rejects) and for any
+    value that names no account."""
+    if isinstance(value, dict) and set(value) == {"Id"}:
+        value = value["Id"]
+    if not isinstance(value, str):
+        return None
+    try:
+        raw = account_bytes(value)
+    except ValueError:
+        return None
+    return raw if len(raw) == 32 else None
+
+
 def render_account(account: bytes) -> str:
     return ss58_encode(account.hex(), SS58_FORMAT)
 
@@ -302,7 +318,10 @@ def _compact(n: int) -> bytes:
         return bytes([n << 2])
     if n < 1 << 14:
         return ((n << 2) | 1).to_bytes(2, "little")
-    raise ValueError(f"signatory count {n} exceeds any multisig limit")
+    if n < 1 << 30:
+        return ((n << 2) | 2).to_bytes(4, "little")
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "little")
+    return bytes([((len(raw) - 4) << 2) | 3]) + raw
 
 
 def multisig_account(signatories: list[bytes], threshold: int) -> bytes:
@@ -320,21 +339,29 @@ def _is_call(value) -> bool:
     return isinstance(value, dict) and "call_module" in value
 
 
+_LONG_HEX = re.compile(r"0x(?:[0-9a-fA-F]{2}){65,}")
+
+
 def _render_value(value) -> str:
-    if isinstance(value, str) and value.startswith("0x") and len(value) > 2 + 2 * 64:
+    """A decoded argument as one line. Byte strings too long to read are shown as their
+    hash; everything else goes through JSON, so text from the chain keeps its quotes
+    and its newlines stay escaped."""
+    if isinstance(value, str) and _LONG_HEX.fullmatch(value):
         raw = bytes.fromhex(value[2:])
         return f"<{len(raw)} bytes blake2_256 0x{hashlib.blake2b(raw, digest_size=32).hexdigest()}>"
-    if isinstance(value, str):
-        return value if len(value) <= 200 else json.dumps(value)[:200] + "\u2026"
     text = json.dumps(value, default=str)
     return text if len(text) <= 400 else text[:400] + "\u2026"
 
 
-def _signer(ext: dict) -> bytes | None:
-    address = ext.get("address")
-    if isinstance(address, dict):
-        address = address.get("Id")
-    return account_bytes(address) if address else None
+def _multisig_origin(function: str, args: dict, origin: bytes | None) -> bytes | None:
+    """The multisig account a Multisig call dispatches as, or None when its signatories
+    or threshold do not name one."""
+    threshold = 1 if function == "as_multi_threshold_1" else args.get("threshold")
+    others = args.get("other_signatories")
+    if origin is None or not isinstance(threshold, int) or not 0 <= threshold < 1 << 16 or not isinstance(others, list):
+        return None
+    signatories = [origin, *(_account(s) for s in others)]
+    return None if None in signatories else multisig_account(signatories, threshold)
 
 
 def _walk(call: dict, origin: bytes | None, sudo_key: bytes | None, depth: int, lines: list[str]) -> Severity | None:
@@ -351,17 +378,15 @@ def _walk(call: dict, origin: bytes | None, sudo_key: bytes | None, depth: int, 
     if module == "Utility" and function in _BATCH_CALLS:
         inner_origin = origin
     elif module == "Sudo" and function == "sudo_as":
-        inner_origin = account_bytes(args["who"])
+        inner_origin = _account(args.get("who"))
     elif module == "Recovery" and function == "as_recovered":
-        inner_origin = account_bytes(args["account"])
-    elif module == "Multisig" and function in _MULTISIG_CALLS and origin is not None:
-        threshold = 1 if function == "as_multi_threshold_1" else args["threshold"]
-        signatories = [origin, *(account_bytes(s) for s in args["other_signatories"])]
-        inner_origin = multisig_account(signatories, threshold)
-        if sudo_key is not None and inner_origin == sudo_key:
+        inner_origin = _account(args.get("account"))
+    elif module == "Multisig" and function in _MULTISIG_CALLS:
+        inner_origin = _multisig_origin(function, args, origin)
+        if inner_origin is not None and inner_origin == sudo_key:
             severity = CRITICAL
             lines.append(f"{'  ' * depth}  multisig account is Sudo.Key {render_account(sudo_key)}")
-        else:
+        elif inner_origin is not None:
             lines.append(f"{'  ' * depth}  multisig account {render_account(inner_origin)}")
 
     for value in args.values():
@@ -382,42 +407,67 @@ def runtime_upgraded(header: dict) -> bool:
     return RUNTIME_ENVIRONMENT_UPDATED in header["digest"]["logs"]
 
 
+def unclassifiable(key: str, what: str, error: Exception, *details: str) -> Finding:
+    """The CRITICAL raised in place of a classification that failed, so the item is
+    still paged and its cursor still moves."""
+    return Finding(CRITICAL, key, f"{what} could not be classified",
+                   details=(*details, f"{type(error).__name__}: {error}"[:200]))
+
+
 def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
                             events: dict[int, list[str]] | None, sudo_key: bytes | None) -> list[Finding]:
     findings = []
     for index, ext in enumerate(extrinsics):
+        key = f"{chain}:{number}:{index}"
         if "undecodable" in ext:
             raw = bytes.fromhex(ext["undecodable"][2:])
             findings.append(Finding(
                 severity=ALERT,
-                key=f"{chain}:{number}:{index}",
+                key=key,
                 headline=f"{chain} #{number} extrinsic {index} could not be decoded against the runtime metadata",
                 details=(f"{len(raw)} bytes blake2_256 0x{hashlib.blake2b(raw, digest_size=32).hexdigest()}",
                          ext["error"]),
             ))
             continue
-        signer = _signer(ext)
-        lines: list[str] = []
-        severity = _walk(ext["call"], signer, sudo_key, 0, lines)
-        notes = [f"signer {render_account(signer)}" if signer else "unsigned"]
-        if signer is not None and signer == sudo_key:
-            severity = CRITICAL
-            notes.append("signed by Sudo.Key")
-        if severity is None:
-            continue
-        if events is None:
-            notes.append("events unavailable (state pruned or undecodable): dispatch result not verified")
-        else:
-            shown = [e for e in events.get(index, []) if not e.startswith(EVENT_NOISE)]
-            notes.append("result: " + (", ".join(shown) if shown else "no events"))
-        call = ext["call"]
-        findings.append(Finding(
-            severity=severity,
-            key=f"{chain}:{number}:{index}",
-            headline=f"{chain} #{number} extrinsic {index}: {call['call_module']}.{call['call_function']}",
-            details=tuple(notes + lines),
-        ))
+        try:
+            finding = _classify_extrinsic(chain, number, index, ext, events, sudo_key)
+        except Exception as e:  # argument values are the signer's choice; none may stall the block
+            finding = unclassifiable(key, f"{chain} #{number} extrinsic {index}", e,
+                                     f"extrinsic hash {ext.get('extrinsic_hash')}")
+        if finding is not None:
+            findings.append(finding)
     return findings
+
+
+def _classify_extrinsic(chain: str, number: int, index: int, ext: dict,
+                        events: dict[int, list[str]] | None, sudo_key: bytes | None) -> Finding | None:
+    address = ext.get("address")
+    signer = _account(address)
+    lines: list[str] = []
+    severity = _walk(ext["call"], signer, sudo_key, 0, lines)
+    if address is None:
+        notes = ["unsigned"]
+    elif signer is None:
+        notes = [f"signer {_render_value(address)} names no account"]
+    else:
+        notes = [f"signer {render_account(signer)}"]
+    if signer is not None and signer == sudo_key:
+        severity = CRITICAL
+        notes.append("signed by Sudo.Key")
+    if severity is None:
+        return None
+    if events is None:
+        notes.append("events unavailable (state pruned or undecodable): dispatch result not verified")
+    else:
+        shown = [e for e in events.get(index, []) if not e.startswith(EVENT_NOISE)]
+        notes.append("result: " + (", ".join(shown) if shown else "no events"))
+    call = ext["call"]
+    return Finding(
+        severity=severity,
+        key=f"{chain}:{number}:{index}",
+        headline=f"{chain} #{number} extrinsic {index}: {call['call_module']}.{call['call_function']}",
+        details=tuple(notes + lines),
+    )
 
 
 def committee_of(extrinsics: list[dict]) -> tuple[tuple[str, ...], ...] | None:
@@ -526,9 +576,10 @@ def _entitlement(deposited: dict[str, int], redemptions: tuple[Redemption, ...])
 
 
 def _redeemer_name(pool: SurrenderPool, json_value) -> str:
-    if isinstance(json_value, dict) and "constructor" in json_value:
-        return pool.redeemers.get(json_value["constructor"], f"constructor {json_value['constructor']}")
-    return f"unrecognized redeemer {json.dumps(json_value)[:80]}"
+    constructor = json_value.get("constructor") if isinstance(json_value, dict) else None
+    if isinstance(constructor, int) and constructor in pool.redeemers:
+        return pool.redeemers[constructor]
+    return f"unrecognized redeemer {json.dumps(json_value, default=str)[:80]}"
 
 
 def _classify_pool(network: CardanoNetwork, spent: list[dict], produced: list[dict],

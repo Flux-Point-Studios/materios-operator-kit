@@ -270,16 +270,19 @@ class Watch:
                 store.delete(f"health:{name}:stale-since")
 
     def _check_stale(self, now: float) -> None:
+        """Page a source that has not been read for ``source_stale_seconds``, and page it
+        again every hour it stays that way."""
         store = self._store
         for source in self._sources:
             name = source.name
             last_ok = max(float(store.get(f"health:{name}:ok") or 0), self._started)
-            if now - last_ok <= self._config.source_stale_seconds or store.get(f"health:{name}:stale-since"):
+            overdue = now - last_ok - self._config.source_stale_seconds
+            if overdue <= 0:
                 continue
             error = store.get(f"health:{name}:error") or "no poll has completed"
             with store.transaction():
                 store.add(rules.Finding(
-                    rules.ALERT, f"custody-watch:{name}:stale:{int(last_ok)}",
+                    rules.CRITICAL, f"custody-watch:{name}:stale:{int(last_ok)}:{int(overdue // 3600)}",
                     f"custody-watch: {name} stale for {int(now - last_ok) // 60} min; "
                     f"moves on it are not being watched",
                     details=(f"last successful poll {_utc(last_ok)}", f"last error: {error}"), kind="watcher"), now)
@@ -302,7 +305,9 @@ class Watch:
 
     def digest_message(self, routine: list[StoredFinding], now: float) -> dict:
         store = self._store
-        lines = [f"\U0001f4cb **custody-watch daily digest** {_utc(now)}: alive", "sources:"]
+        stale = [s.name for s in self._sources if store.get(f"health:{s.name}:stale-since")]
+        state = f"STALE: {', '.join(stale)}" if stale else "alive"
+        lines = [f"\U0001f4cb **custody-watch daily digest** {_utc(now)}: {state}", "sources:"]
         for source in self._sources:
             ok = store.get(f"health:{source.name}:ok")
             position = store.get(f"health:{source.name}:position")
@@ -498,7 +503,12 @@ class MateriosSource:
             if events is not None:
                 findings = rules.classify_materios_block(self.name, number, extrinsics, events, sudo_key)
 
-        committee = rules.committee_of(extrinsics)
+        try:
+            committee = rules.committee_of(extrinsics)
+        except Exception as e:  # the inherent's shape is the block author's; it must not stall the cursor
+            committee = None
+            findings.append(rules.unclassifiable(f"{self.name}:{number}:committee",
+                                                 f"{self.name} #{number}: the committee inherent", e))
         with self._store.transaction():
             if committee is not None:
                 name = f"committee:{self.name}"
@@ -664,7 +674,10 @@ class CardanoSource:
         for redeemer in redeemers:
             datum = self._api.get(f"/scripts/datum/{redeemer['redeemer_data_hash']}")
             redeemer["json_value"] = datum["json_value"] if datum else None
-        finding = rules.classify_cardano_tx(self._network, tx, utxos, redeemers)
+        try:
+            finding = rules.classify_cardano_tx(self._network, tx, utxos, redeemers)
+        except Exception as e:  # a transaction's contents are its builder's; none may stall the cursor
+            finding = rules.unclassifiable(f"{self.name}:{tx_hash}", f"{self.name} tx {tx_hash}", e)
         with self._store.transaction():
             self._store.mark_processed(f"{self.name}:{tx_hash}", now)
             if finding is not None:
