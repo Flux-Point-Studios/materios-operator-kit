@@ -1,3 +1,4 @@
+import functools
 import logging
 import os
 import threading
@@ -247,7 +248,6 @@ class SubstrateClient:
         # is a property aliasing the write conn for backward compatibility.
         self._write = _WsConn("write")
         self._read = _WsConn("read")
-        self.keypair = Keypair.create_from_uri(config.signer_uri)
         # Bounded-timeout + reconnect knobs (tasks #288 + #156). Each is
         # overridable via env so operators can tune in prod without a
         # re-deploy; the defaults are conservative.
@@ -289,6 +289,11 @@ class SubstrateClient:
         self._reconnect_lock: threading.RLock = threading.RLock()
         # Injectable so backoff tests can run instantaneously.
         self._backoff_sleep = time.sleep
+
+    @functools.cached_property
+    def keypair(self) -> Keypair:
+        """Derived on first use, so a client that only reads never holds a signer."""
+        return Keypair.create_from_uri(self.config.signer_uri)
 
     def connect(self) -> bool:
         """Open the write + read SubstrateInterface connections.
@@ -563,6 +568,10 @@ class SubstrateClient:
             f"remains disconnected (streak={conn.consecutive_reconnect_failures}). "
             f"Next user-call will retry."
         )
+
+    def rpc(self, method: str, params: list) -> Any:
+        """A raw JSON-RPC read on the read conn, under the bounded timeout."""
+        return self._call("rpc_request", method, params, conn=self._read)["result"]
 
     def get_finalized_head_number(self) -> int:
         head_hash = self._call("get_chain_finalised_head", conn=self._read)
