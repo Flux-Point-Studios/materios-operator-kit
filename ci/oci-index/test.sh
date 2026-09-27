@@ -124,7 +124,7 @@ else
   ok "a missing target fails"
 fi
 
-# With the token the plugin runs only on a first push or manual pipeline of the default
+# With the token the plugin runs only on the first run of a push pipeline of the default
 # branch, and only toward the registry and prefix fixed in the script. The token tests run
 # a copy whose two fixed values name the local registry instead.
 LOCAL=/tmp/oci-index-local.sh
@@ -175,9 +175,11 @@ else
   bad "the authorized login path exited non-zero"
 fi
 
-token_rejects "the token is refused on a pull request" "push or manual pipeline of the default branch" CI_PIPELINE_EVENT=pull_request
-token_rejects "the token is refused off the default branch" "push or manual pipeline of the default branch" CI_COMMIT_BRANCH=feature
-token_rejects "the token is refused without branch metadata" "push or manual pipeline of the default branch" CI_COMMIT_BRANCH= CI_REPO_DEFAULT_BRANCH=
+token_rejects "the token is refused on a pull request" "push pipeline of the default branch" CI_PIPELINE_EVENT=pull_request
+# A manual run, like a restart, carries variables chosen by whoever starts it.
+token_rejects "the token is refused on a manual pipeline" "push pipeline of the default branch" CI_PIPELINE_EVENT=manual
+token_rejects "the token is refused off the default branch" "push pipeline of the default branch" CI_COMMIT_BRANCH=feature
+token_rejects "the token is refused without branch metadata" "push pipeline of the default branch" CI_COMMIT_BRANCH= CI_REPO_DEFAULT_BRANCH=
 token_rejects "the token is only sent to the allowed registry" "may only be sent to $REG" PLUGIN_REGISTRY=evil.example
 token_rejects "the target must be under the allowed prefix" "outside $REG/fps/" PLUGIN_TARGET="$REG/elsewhere:abc"
 token_rejects "a source must be under the allowed prefix" "outside $REG/fps/" PLUGIN_SOURCES="/tmp/layout-amd64=$REG/elsewhere:abc"

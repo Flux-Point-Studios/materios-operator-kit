@@ -12,12 +12,13 @@
 #   tags       extra tags moved to target only after it verifies (optional)
 #   registry, username, password   login, when password is set (optional)
 #
-# With a password, the plugin runs only on the first run of a push or manual pipeline of
-# the default branch, logs in only to REGISTRY and writes only under PREFIX. Woodpecker
-# sets the CI_* values checked here over a run's variables. A restart (CI_PIPELINE_PARENT
-# other than 0) is refused: it runs its stored configuration, however old, with the
-# restart's variables. REGISTRY and PREFIX are fixed here because a run's variables reach
-# a plugin step's environment.
+# With a password, the plugin runs only on the first run of a push pipeline of the default
+# branch, logs in only to REGISTRY and writes only under PREFIX. Woodpecker sets the CI_*
+# values checked here over a run's variables. A manual run and a restart (CI_PIPELINE_PARENT
+# other than 0) are refused: both carry variables chosen by whoever starts them, which fill
+# any setting a step leaves undeclared, and a restart runs its stored configuration however
+# old. REGISTRY and PREFIX are fixed here because a run's variables reach a plugin step's
+# environment.
 set -euf
 
 REGISTRY=ghcr.io
@@ -38,9 +39,9 @@ if [ -n "${PLUGIN_PASSWORD:-}" ]; then
   [ -n "${PLUGIN_REGISTRY:-}" ] && [ -n "${PLUGIN_USERNAME:-}" ] || die "password needs registry and username"
   default=${CI_REPO_DEFAULT_BRANCH:-}
   case "${CI_PIPELINE_EVENT:-}:${CI_COMMIT_BRANCH:-}" in
-    push:"$default" | manual:"$default") [ -n "$default" ] ;;
+    push:"$default") [ -n "$default" ] ;;
     *) false ;;
-  esac || die "the token is only used on a push or manual pipeline of the default branch"
+  esac || die "the token is only used on a push pipeline of the default branch"
   [ "${CI_PIPELINE_PARENT:-}" = 0 ] || die "the token is not used on a restarted pipeline"
   [ "$PLUGIN_REGISTRY" = "$REGISTRY" ] || die "the token may only be sent to $REGISTRY"
   for ref in $TARGET $(echo "$SOURCES" | sed 's/^[^=]*=//'); do
