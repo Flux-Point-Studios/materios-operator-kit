@@ -7,7 +7,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 
 | Source | CRITICAL (immediate, `@here`) | ALERT (immediate) | INFO (daily digest) |
 |---|---|---|---|
-| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Recovery`, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, `Sudo.Key` changing | session key changes, equivocation reports, native token transfers, committee membership changes, an extrinsic the runtime metadata cannot decode | committee rotations with unchanged membership |
+| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Recovery`, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, `Sudo.Key` changing, a new genesis (chain reset) | session key changes, equivocation reports, native token transfers, committee membership changes, an extrinsic the runtime metadata cannot decode | committee rotations with unchanged membership |
 | Cardano custody addresses | any outflow | any inflow | reads as a reference input |
 | Cardano contract addresses | per address, as configured | per address, as configured | |
 | Cardano policies | mint or burn, as configured | as configured | |

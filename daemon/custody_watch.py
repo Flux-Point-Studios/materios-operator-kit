@@ -391,6 +391,8 @@ class MateriosSource:
     def poll(self, now: float) -> bool:
         """Process up to ``MAX_BLOCKS_PER_POLL`` blocks; True once at the finalized head."""
         head_hash, head = self._head()
+        if self._reset(head, now):
+            return True
         sudo_key = self._sudo_key(head_hash, head, now)
 
         cursor = self._store.get(self._cursor_key)
@@ -408,6 +410,26 @@ class MateriosSource:
         for number, block_hash in zip(range(first, last + 1), hashes):
             self._block(number, block_hash, sudo_key, now)
         return last == head
+
+    def _reset(self, head: int, now: float) -> bool:
+        """A new genesis means the chain was reset: page it, forget what was learned about
+        the old chain, and watch the new one from its finalized head."""
+        genesis = self._rpc("chain_getBlockHash", [0])
+        name = f"genesis:{self.name}"
+        stored = self._store.get(name)
+        with self._store.transaction():
+            self._store.put(name, genesis)
+            if stored is None or stored == genesis:
+                return False
+            self._store.add(rules.Finding(
+                rules.CRITICAL, f"{self.name}:genesis:{genesis}",
+                f"{self.name} genesis changed: the chain was reset",
+                details=(f"from {stored}", f"to   {genesis}", f"watching again from finalized #{head}")), now)
+            self._store.delete(f"sudo-key:{self.name}")
+            self._store.delete(f"committee:{self.name}")
+            self.start_at(head)
+        self._decoder = None
+        return True
 
     def _sudo_key(self, head_hash: str, head: int, now: float) -> bytes | None:
         raw = self._rpc("state_getStorage", [SUDO_KEY_STORAGE, head_hash]) or ""

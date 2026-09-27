@@ -257,6 +257,7 @@ class FakeChain:
         self.calls = []
         self.connected = True
         self.connects = 0
+        self.genesis = None
 
     def connect(self):
         self.connects += 1
@@ -288,6 +289,8 @@ class FakeChain:
             return self.hash_of(self.head)
         if method == "chain_getHeader":
             return {"number": hex(self.number_of(params[0]))}
+        if method == "chain_getBlockHash" and params[0] == 0 and self.genesis:
+            return self.genesis
         if method == "chain_getBlockHash":
             numbers = params[0]
             return [self.hash_of(n) for n in numbers] if isinstance(numbers, list) else self.hash_of(numbers)
@@ -438,6 +441,23 @@ def test_a_sudo_key_that_changes_is_critical(config, tmp_path):
     [finding] = store.findings()
     assert finding.severity == rules.CRITICAL
     assert "Sudo.Key changed" in finding.text and SUDO_KEY in finding.text
+
+
+def test_a_chain_reset_is_critical_and_watching_restarts_at_the_new_head(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=5000, blocks={}, state_at={5000, 120})
+    source = _materios(config, store, chain)
+    source.poll(1.0)
+    assert store.findings() == []
+
+    chain.genesis = "0x" + "ab" * 32
+    chain.head = 120
+    chain.sudo_key = "0x" + rules.account_bytes("5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY").hex()
+    assert source.poll(2.0)
+    [finding] = store.findings()
+    assert finding.severity == rules.CRITICAL
+    assert "genesis changed" in finding.text and chain.genesis in finding.text
+    assert store.get("cursor:materios-preprod") == "120"
 
 
 def test_a_dropped_connection_is_reopened_before_polling(config, tmp_path):
