@@ -500,6 +500,18 @@ def test_a_batch_of_thousands_of_calls_keeps_a_bounded_finding():
     assert "more calls in the tree" in finding.render()
 
 
+def test_a_batch_as_large_as_a_block_allows_is_classified_in_linear_time():
+    import time
+
+    inert = _call("Balances", "force_transfer", source=ALICE, dest=BOB, value=1)
+    live = _call("Recovery", "create_recovery", friends=[BOB], threshold=1, delay_period=0)
+    calls = [inert, live] * 10_000
+    started = time.monotonic()
+    [finding] = _classify_extrinsics([_signed(ALICE, "Utility", "force_batch", calls=calls)], events=SUCCEEDED)
+    assert time.monotonic() - started < 10
+    assert finding.severity == rules.ALERT
+
+
 def test_a_call_in_neither_table_is_an_alert():
     [finding] = _classify_extrinsics([_signed(ALICE, "NewPallet", "do_thing", value=1)])
     assert finding.severity == rules.ALERT

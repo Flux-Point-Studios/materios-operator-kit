@@ -620,10 +620,11 @@ def _classify_extrinsic(chain: str, number: int, index: int, ext: dict, events: 
     severity = CRITICAL if by_sudo else max((s.severity for s in counted), default=INFO)
     # Calls that count lead, most severe and then innermost first, so the headline and
     # the top of a truncated page name the call that matters.
-    ranked = sorted(tree.sites, key=lambda s: (s not in counted, -s.severity, -s.path.count(" > ")))
+    live = {id(s) for s in counted}
+    ranked = sorted(tree.sites, key=lambda s: (id(s) not in live, -s.severity, -s.path.count(" > ")))
     call = ext["call"]
     top = ranked[0].path if ranked else f"{call['call_module']}.{call['call_function']}"
-    sites = [s.line(s in counted) for s in ranked[:MAX_SITE_LINES]]
+    sites = [s.line(id(s) in live) for s in ranked[:MAX_SITE_LINES]]
     if len(ranked) > MAX_SITE_LINES:
         sites.append(f"... {len(ranked) - MAX_SITE_LINES:,} more privileged calls")
     lines = tree.lines[:MAX_TREE_LINES]
