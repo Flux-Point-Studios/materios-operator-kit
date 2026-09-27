@@ -1,0 +1,343 @@
+{
+ "network": "mainnet",
+ "tx": {
+  "hash": "3f964e6fa1e607ae5dc4a9bc6ba49feeb57c1caf2baa1ddedb7d6e6b14561708",
+  "block": "b3b2ce9058bbd5fc6fefa59bf695c6b45d84a78ee6680a9047fe365dab3d94ed",
+  "block_height": 1000002,
+  "block_time": 1780000040,
+  "slot": 101000002,
+  "index": 0,
+  "output_amount": [
+   {
+    "unit": "lovelace",
+    "quantity": "49701001"
+   },
+   {
+    "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313135",
+    "quantity": "1"
+   },
+   {
+    "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313234",
+    "quantity": "1"
+   },
+   {
+    "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313436",
+    "quantity": "1"
+   },
+   {
+    "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d3230",
+    "quantity": "1"
+   },
+   {
+    "unit": "0889a2d542897f0c7eefed47d2d809bd8d8ec78881bd4ff9464f683a000de1405046505042202d204261646765206f6620486f6e6f722023333338",
+    "quantity": "1"
+   },
+   {
+    "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+    "quantity": "1308538815849"
+   },
+   {
+    "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+    "quantity": "720701990576087"
+   },
+   {
+    "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+    "quantity": "112791750482"
+   },
+   {
+    "unit": "97bbb7db0baef89caefce61b8107ac74c7a7340166b39d906f174bec54616c6f73",
+    "quantity": "76595"
+   },
+   {
+    "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233833",
+    "quantity": "1"
+   },
+   {
+    "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233837",
+    "quantity": "1"
+   },
+   {
+    "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233839",
+    "quantity": "1"
+   },
+   {
+    "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233939",
+    "quantity": "1"
+   },
+   {
+    "unit": "ea153b5d4864af15a1079a94a0e2486d6376fa28aafad272d15b243a0014df10536861726473",
+    "quantity": "43144044"
+   }
+  ],
+  "fees": "258663",
+  "deposit": "0",
+  "size": 2232,
+  "invalid_before": "187594752",
+  "invalid_hereafter": "187605752",
+  "utxo_count": 6,
+  "withdrawal_count": 0,
+  "mir_cert_count": 0,
+  "delegation_count": 0,
+  "stake_cert_count": 0,
+  "pool_update_count": 0,
+  "pool_retire_count": 0,
+  "asset_mint_or_burn_count": 0,
+  "redeemer_count": 1,
+  "valid_contract": true,
+  "treasury_donation": "0"
+ },
+ "utxos": {
+  "hash": "3f964e6fa1e607ae5dc4a9bc6ba49feeb57c1caf2baa1ddedb7d6e6b14561708",
+  "inputs": [
+   {
+    "address": "addr1w8s6rqdjlzm5he27v9s202p8vjumza8qfsmufm2f6dy68hg9mn27a",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "1500000"
+     },
+     {
+      "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+      "quantity": "722010529391936"
+     }
+    ],
+    "tx_hash": "6c7fde6d2baa287a1607d2edcd58427addc98ebcbfd0c891051e97f1cd8265cf",
+    "output_index": 1,
+    "data_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+    "inline_datum": "d87980",
+    "reference_script_hash": null,
+    "collateral": false,
+    "reference": false
+   },
+   {
+    "address": "addr1v94vsmrfq9mp67hnj44j46awt66l6xynkc3mymuhzxluhpcky3adk",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "48459664"
+     },
+     {
+      "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313135",
+      "quantity": "1"
+     },
+     {
+      "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313234",
+      "quantity": "1"
+     },
+     {
+      "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313436",
+      "quantity": "1"
+     },
+     {
+      "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d3230",
+      "quantity": "1"
+     },
+     {
+      "unit": "0889a2d542897f0c7eefed47d2d809bd8d8ec78881bd4ff9464f683a000de1405046505042202d204261646765206f6620486f6e6f722023333338",
+      "quantity": "1"
+     },
+     {
+      "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+      "quantity": "112791750482"
+     },
+     {
+      "unit": "97bbb7db0baef89caefce61b8107ac74c7a7340166b39d906f174bec54616c6f73",
+      "quantity": "76595"
+     },
+     {
+      "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233833",
+      "quantity": "1"
+     },
+     {
+      "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233837",
+      "quantity": "1"
+     },
+     {
+      "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233839",
+      "quantity": "1"
+     },
+     {
+      "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233939",
+      "quantity": "1"
+     },
+     {
+      "unit": "ea153b5d4864af15a1079a94a0e2486d6376fa28aafad272d15b243a0014df10536861726473",
+      "quantity": "43144044"
+     }
+    ],
+    "tx_hash": "6c7fde6d2baa287a1607d2edcd58427addc98ebcbfd0c891051e97f1cd8265cf",
+    "output_index": 3,
+    "data_hash": null,
+    "inline_datum": null,
+    "reference_script_hash": null,
+    "collateral": false,
+    "reference": false
+   },
+   {
+    "address": "addr1v94vsmrfq9mp67hnj44j46awt66l6xynkc3mymuhzxluhpcky3adk",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "48459664"
+     }
+    ],
+    "tx_hash": "6c7fde6d2baa287a1607d2edcd58427addc98ebcbfd0c891051e97f1cd8265cf",
+    "output_index": 3,
+    "data_hash": null,
+    "inline_datum": null,
+    "reference_script_hash": null,
+    "collateral": true,
+    "reference": false
+   }
+  ],
+  "outputs": [
+   {
+    "address": "addr1v94vsmrfq9mp67hnj44j46awt66l6xynkc3mymuhzxluhpcky3adk",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "1500000"
+     },
+     {
+      "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+      "quantity": "1308538815849"
+     }
+    ],
+    "output_index": 0,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": null
+   },
+   {
+    "address": "addr1w8s6rqdjlzm5he27v9s202p8vjumza8qfsmufm2f6dy68hg9mn27a",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "1500000"
+     },
+     {
+      "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+      "quantity": "720701990576087"
+     }
+    ],
+    "output_index": 1,
+    "data_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+    "inline_datum": "d87980",
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": "e0caacdf9041fe515af52d138791f6fa85277eb2d97a2a302a8623cb5836d859"
+   },
+   {
+    "address": "addr1wy5gl6nh5rm8f3sgp2ka3mfu5skdt2fqhu0spsxnucesdeqatlhxl",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "16500000"
+     },
+     {
+      "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313135",
+      "quantity": "1"
+     },
+     {
+      "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313234",
+      "quantity": "1"
+     },
+     {
+      "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d313436",
+      "quantity": "1"
+     },
+     {
+      "unit": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b954324144414d3230",
+      "quantity": "1"
+     },
+     {
+      "unit": "0889a2d542897f0c7eefed47d2d809bd8d8ec78881bd4ff9464f683a000de1405046505042202d204261646765206f6620486f6e6f722023333338",
+      "quantity": "1"
+     },
+     {
+      "unit": "97bbb7db0baef89caefce61b8107ac74c7a7340166b39d906f174bec54616c6f73",
+      "quantity": "76595"
+     },
+     {
+      "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233833",
+      "quantity": "1"
+     },
+     {
+      "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233837",
+      "quantity": "1"
+     },
+     {
+      "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233839",
+      "quantity": "1"
+     },
+     {
+      "unit": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2000de140427261776c2050617373233939",
+      "quantity": "1"
+     },
+     {
+      "unit": "ea153b5d4864af15a1079a94a0e2486d6376fa28aafad272d15b243a0014df10536861726473",
+      "quantity": "43144044"
+     }
+    ],
+    "output_index": 2,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": null
+   },
+   {
+    "address": "addr1v94vsmrfq9mp67hnj44j46awt66l6xynkc3mymuhzxluhpcky3adk",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "30201001"
+     },
+     {
+      "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+      "quantity": "112791750482"
+     }
+    ],
+    "output_index": 3,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": null
+   },
+   {
+    "address": "addr1v94vsmrfq9mp67hnj44j46awt66l6xynkc3mymuhzxluhpcky3adk",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "44635671"
+     }
+    ],
+    "output_index": 4,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": true,
+    "reference_script_hash": null,
+    "consumed_by_tx": null
+   }
+  ]
+ },
+ "redeemers": [
+  {
+   "tx_index": 0,
+   "purpose": "spend",
+   "script_hash": "e1a181b2f8b74be55e6160a7a82764b9b174e04c37c4ed49d349a3dd",
+   "redeemer_data_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+   "datum_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+   "unit_mem": "60477",
+   "unit_steps": "19518097",
+   "fee": "4897",
+   "json_value": {
+    "fields": [],
+    "constructor": 0
+   }
+  }
+ ]
+}

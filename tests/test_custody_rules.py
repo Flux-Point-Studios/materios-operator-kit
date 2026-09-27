@@ -1,0 +1,387 @@
+"""Custody and authority-move classification against real chain history.
+
+Materios fixtures are complete finalized blocks from the live preprod chain,
+decoded with the live runtime's metadata. Cardano fixtures are Blockfrost
+responses for real transactions; wallet (key-hash) credentials and transaction
+ids are pseudonymized, while contract addresses, policies, amounts, datums and
+redeemers are as they are on chain. The two custody-wallet fixtures also carry a
+synthetic block position, and the outflow synthetic amounts.
+"""
+
+import copy
+import gzip
+import json
+from pathlib import Path
+
+import pytest
+
+from daemon import custody_rules as rules
+
+FIX = Path(__file__).parent / "fixtures" / "custody"
+SUDO_KEY = "5H2M5Dbt8hSfSCXS6hfEBPR1N21yh679finzcfMEwD62i7iP"
+SPEC_238_CODE_HASH = "0xae5e94cef78cb63c58079c46b32b11e6f8c371ea9a701feeb5a4600c0e76edb4"
+
+
+def _read(name: str) -> bytes:
+    raw = (FIX / name).read_bytes()
+    return gzip.decompress(raw) if name.endswith(".gz") else raw
+
+
+@pytest.fixture(scope="module")
+def decoder():
+    return rules.RuntimeDecoder(_read("materios/metadata_spec238.hex.gz").decode())
+
+
+def _block(name: str) -> dict:
+    return json.loads(_read(f"materios/{name}"))
+
+
+def _findings(decoder, name: str, sudo_key: str | None = SUDO_KEY):
+    block = _block(name)
+    extrinsics = decoder.extrinsics(block["extrinsics"])
+    return rules.classify_materios_block(
+        "materios-preprod", block["number"], extrinsics,
+        events=None, sudo_key=rules.account_bytes(sudo_key) if sudo_key else None,
+    )
+
+
+# --- Materios -----------------------------------------------------------------
+
+
+def test_the_sudo_multisig_account_is_derived_from_the_signatories(decoder):
+    ext = decoder.extrinsics(_block("block_1829210.json")["extrinsics"])[2]
+    args = {a["name"]: a["value"] for a in ext["call"]["call_args"]}
+    signatories = [ext["address"], *args["other_signatories"]]
+    account = rules.multisig_account([rules.account_bytes(s) for s in signatories], args["threshold"])
+    assert account == rules.account_bytes(SUDO_KEY)
+
+
+@pytest.mark.parametrize("block", ["block_1829210.json", "block_1829226.json"])
+def test_each_leg_of_the_runtime_upgrade_authorization_is_critical(decoder, block):
+    [finding] = _findings(decoder, block)
+    text = finding.render()
+    assert finding.severity == rules.CRITICAL
+    assert finding.key == f"materios-preprod:{block[6:13]}:2"
+    assert "Multisig.as_multi" in text and "Sudo.sudo" in text
+    assert "System.authorize_upgrade" in text and SPEC_238_CODE_HASH in text
+    assert "multisig account is Sudo.Key" in text
+
+
+def test_applying_the_upgrade_is_critical_and_names_the_code_hash(decoder):
+    [finding] = _findings(decoder, "block_1829227.json.gz")
+    text = finding.render()
+    assert finding.severity == rules.CRITICAL
+    assert "System.apply_authorized_upgrade" in text
+    assert "unsigned" in text
+    assert "845484 bytes" in text and SPEC_238_CODE_HASH in text
+
+
+@pytest.mark.parametrize(
+    "block, expected",
+    [
+        ("block_1645150.json", ["Recovery.create_recovery", "multisig account is Sudo.Key"]),
+        ("block_1587358.json", ["Sudo.set_key", SUDO_KEY]),
+        ("block_1570580.json", ["Utility.batch_all", "OrinqReceipts.set_break_glass_aura_keys",
+                                "OrinqReceipts.set_break_glass_floor_enabled"]),
+        ("block_1292725.json", ["OrinqReceipts.reset_candidate_liveness"]),
+        ("block_735803.json", ["System.set_storage"]),
+        ("block_534612.json", ["Grandpa.note_stalled"]),
+        ("block_95132.json", ["TeeAttestation.set_disabled"]),
+    ],
+)
+def test_historical_root_and_custody_calls_are_critical(decoder, block, expected):
+    [finding] = _findings(decoder, block)
+    assert finding.severity == rules.CRITICAL
+    for fragment in expected:
+        assert fragment in finding.render()
+
+
+def test_routine_traffic_raises_nothing(decoder):
+    for name in ("block_2029707.json", "block_2034370_with_events.json"):
+        assert _findings(decoder, name) == []
+
+
+def test_the_committee_rotation_inherent_yields_the_seated_committee(decoder):
+    extrinsics = decoder.extrinsics(_block("block_2029707.json")["extrinsics"])
+    committee = rules.committee_of(extrinsics)
+    assert committee is not None and len(committee) == 5
+
+
+def test_an_unchanged_committee_rotation_goes_to_the_digest(decoder):
+    committee = rules.committee_of(decoder.extrinsics(_block("block_2029707.json")["extrinsics"]))
+    finding = rules.committee_change("materios-preprod", 2029707, committee, committee)
+    assert finding.severity == rules.INFO and finding.kind == "committee"
+
+
+def test_a_changed_committee_is_an_alert(decoder):
+    committee = rules.committee_of(decoder.extrinsics(_block("block_2029707.json")["extrinsics"]))
+    previous = committee[1:]
+    finding = rules.committee_change("materios-preprod", 2029707, previous, committee)
+    assert finding.severity == rules.ALERT
+    assert committee[0][0] in finding.render()
+
+
+def test_an_extrinsic_the_runtime_metadata_cannot_decode_is_an_alert(decoder):
+    block = _block("block_2029707.json")
+    garbage = "0x" + (bytes([12, 4, 0xFE, 0x01]) + bytes(2)).hex()
+    extrinsics = decoder.extrinsics(block["extrinsics"] + [garbage])
+    [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
+                                              events=None, sudo_key=None)
+    assert finding.severity == rules.ALERT
+    assert finding.key == f"materios-preprod:{block['number']}:{len(block['extrinsics'])}"
+    assert "could not be decoded" in finding.render()
+
+
+def test_a_runtime_upgrade_is_read_from_the_block_digest():
+    headers = json.loads(_read("materios/headers_spec238_upgrade.json"))
+    assert rules.runtime_upgraded(headers["1829227"])
+    assert not rules.runtime_upgraded(headers["1829226"])
+
+
+def test_events_are_grouped_by_extrinsic(decoder):
+    block = _block("block_2034370_with_events.json")
+    events = decoder.events(block["events"])
+    assert all(isinstance(i, int) for i in events)
+    assert "System.ExtrinsicSuccess" in events[0]
+
+
+def test_dispatch_results_are_attached_to_the_alert(decoder):
+    block = _block("block_1829226.json")
+    extrinsics = decoder.extrinsics(block["extrinsics"])
+    events = {2: ["Multisig.MultisigExecuted(result=Ok)", "Sudo.Sudid(sudo_result=Ok)", "System.UpgradeAuthorized"]}
+    [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
+                                              events=events, sudo_key=rules.account_bytes(SUDO_KEY))
+    assert "Sudo.Sudid(sudo_result=Ok)" in finding.render()
+
+
+def test_a_block_whose_state_is_pruned_says_so(decoder):
+    block = _block("block_1829226.json")
+    extrinsics = decoder.extrinsics(block["extrinsics"])
+    [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
+                                              events=None, sudo_key=None)
+    assert "events unavailable" in finding.render()
+
+
+# No privileged call of these kinds has ever been dispatched on the chain, so these
+# use the decoder's output shape rather than a captured block.
+def _signed(signer: str, module: str, function: str, **args) -> dict:
+    return {"address": signer, "call": _call(module, function, **args)}
+
+
+def _call(module: str, function: str, **args) -> dict:
+    return {"call_module": module, "call_function": function,
+            "call_args": [{"name": k, "type": "", "value": v} for k, v in args.items()]}
+
+
+ALICE = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
+
+
+@pytest.mark.parametrize(
+    "call, severity",
+    [
+        (_call("Balances", "force_set_balance", who=ALICE, new_free=1), rules.CRITICAL),
+        (_call("Balances", "force_transfer", source=ALICE, dest=ALICE, value=1), rules.CRITICAL),
+        (_call("Treasury", "spend_local", amount=1, beneficiary=ALICE), rules.CRITICAL),
+        (_call("Treasury", "payout", index=0), rules.CRITICAL),
+        (_call("SessionCommitteeManagement", "set_main_chain_scripts", main_chain_scripts={}), rules.CRITICAL),
+        (_call("PalletSession", "set_keys", keys={}, proof="0x"), rules.ALERT),
+        (_call("Grandpa", "report_equivocation", equivocation_proof={}, key_owner_proof={}), rules.ALERT),
+        (_call("NativeTokenManagement", "transfer_tokens", token_amount=1), rules.ALERT),
+        (_call("Utility", "dispatch_as", as_origin={"system": "Root"},
+               call=_call("Balances", "transfer_keep_alive", dest=ALICE, value=1)), rules.CRITICAL),
+    ],
+)
+def test_privileged_calls_without_history_are_classified(call, severity):
+    [finding] = rules.classify_materios_block("materios-preprod", 1, [{"address": ALICE, "call": call}],
+                                              events=None, sudo_key=None)
+    assert finding.severity == severity
+
+
+def test_anything_signed_by_the_sudo_key_is_critical():
+    ext = _signed(SUDO_KEY, "Balances", "transfer_keep_alive", dest=ALICE, value=1)
+    [finding] = rules.classify_materios_block("materios-preprod", 1, [ext], events=None,
+                                              sudo_key=rules.account_bytes(SUDO_KEY))
+    assert finding.severity == rules.CRITICAL
+    assert "signed by Sudo.Key" in finding.render()
+
+
+def test_a_multisig_that_is_not_sudo_and_wraps_nothing_privileged_is_ignored():
+    ext = _signed(ALICE, "Multisig", "as_multi_threshold_1", other_signatories=[SUDO_KEY],
+                  call=_call("Balances", "transfer_keep_alive", dest=ALICE, value=1))
+    assert rules.classify_materios_block("materios-preprod", 1, [ext], events=None,
+                                         sudo_key=rules.account_bytes(SUDO_KEY)) == []
+
+
+# --- Cardano ------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def networks():
+    config = rules.parse_config(json.loads((FIX / "config.json").read_text()))
+    return {n.name: n for n in config.cardano}
+
+
+def _tx(name: str) -> dict:
+    return json.loads((FIX / "cardano" / f"{name}.json").read_text())
+
+
+def _classify(networks, network: str, name: str):
+    tx = _tx(name)
+    return rules.classify_cardano_tx(networks[network], tx["tx"], tx["utxos"], tx["redeemers"])
+
+
+@pytest.mark.parametrize(
+    "name, payout",
+    [
+        ("surrender_agent", 1056778496),
+        ("surrender_agent_shards_t1", 10238574959574),
+        ("surrender_t2_pass", 188339428791),
+        ("surrender_flux_pass_shards", 837837474230),
+        ("surrender_flux_pass_brawlers", 175153213171),
+    ],
+)
+def test_a_surrender_paid_exactly_its_entitlement_goes_to_the_digest(networks, name, payout):
+    finding = _classify(networks, "cardano-mainnet", name)
+    assert finding.severity == rules.INFO
+    assert finding.kind == "surrender"
+    assert finding.amount == payout
+    assert "surrender" in finding.render()
+
+
+def test_an_outflow_from_a_custody_wallet_is_critical(networks):
+    finding = _classify(networks, "cardano-mainnet", "custody_outflow")
+    assert finding.severity == rules.CRITICAL
+    assert "outflow from custody-a" in finding.render()
+
+
+def test_minting_cmatra_is_critical(networks):
+    finding = _classify(networks, "cardano-mainnet", "mint_v2")
+    text = finding.render()
+    assert finding.severity == rules.CRITICAL
+    assert "minted" in text and "cMATRA" in text and "1,000,000,000" in text
+
+
+def test_a_pool_spend_that_is_not_a_surrender_is_critical(networks):
+    finding = _classify(networks, "cardano-mainnet", "pool_rotate")
+    assert finding.severity == rules.CRITICAL
+    assert "pool spent without a surrender" in finding.render()
+
+
+def test_a_custody_wallet_surrendering_through_the_pool_is_critical(networks):
+    finding = _classify(networks, "cardano-mainnet", "custody_wallet_surrender")
+    text = finding.render()
+    assert finding.severity == rules.CRITICAL
+    assert "outflow from custody-c" in text
+    assert "a custody wallet funded this pool spend as the claimant" in text
+
+
+def test_admin_withdraw_is_critical(networks):
+    finding = _classify(networks, "merger-rehearsal-preprod", "rehearsal_admin_withdraw")
+    text = finding.render()
+    assert finding.severity == rules.CRITICAL
+    assert "AdminWithdraw" in text and "non-claimant" in text
+
+
+def test_pool_value_paid_to_an_address_that_surrendered_nothing_is_critical(networks):
+    finding = _classify(networks, "merger-rehearsal-preprod", "rehearsal_surrender")
+    assert finding.severity == rules.CRITICAL
+    assert "non-claimant" in finding.render()
+
+
+@pytest.mark.parametrize(
+    "name, label, severity",
+    [
+        ("d_parameter_upsert", "DParameterValidator", rules.ALERT),
+        ("permissioned_candidates_upsert", "PermissionedCandidatesValidator", rules.ALERT),
+        ("spo_registration", "CommitteeCandidateValidator", rules.ALERT),
+    ],
+)
+def test_every_partner_chain_contract_transaction_is_an_alert(networks, name, label, severity):
+    finding = _classify(networks, "cardano-preprod-partner-chain", name)
+    assert finding.severity >= severity
+    assert label in finding.render()
+
+
+def test_the_governance_wallet_paying_for_a_contract_update_is_critical(networks):
+    finding = _classify(networks, "cardano-preprod-partner-chain", "d_parameter_upsert")
+    assert finding.severity == rules.CRITICAL
+    assert "spent from governance" in finding.render()
+
+
+# Tampered copies of a real surrender: each is what a drain dressed as a surrender
+# would look like once both admin signatures are available.
+def _tampered_surrender(mutate):
+    tx = copy.deepcopy(_tx("surrender_agent"))
+    mutate(tx["utxos"])
+    return tx
+
+
+def _move_cmatra(utxos, source, sink, amount):
+    for out in (source, sink):
+        for a in out["amount"]:
+            if a["unit"].startswith("7ff33a55"):
+                a["quantity"] = str(int(a["quantity"]) + (amount if out is sink else -amount))
+
+
+def _outputs(utxos):
+    pool = next(o for o in utxos["outputs"] if o["address"].startswith("addr1w8s6"))
+    claimant = next(o for o in utxos["outputs"]
+                    if any(a["unit"].startswith("7ff33a55") for a in o["amount"]) and o is not pool)
+    return pool, claimant
+
+
+def test_a_surrender_paying_more_than_the_entitlement_is_critical(networks):
+    def overpay(utxos):
+        pool, claimant = _outputs(utxos)
+        _move_cmatra(utxos, pool, claimant, 5_000_000_000_000)
+
+    tx = _tampered_surrender(overpay)
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL
+    assert "overpaid" in finding.render()
+
+
+def test_a_surrender_that_pays_someone_else_is_critical(networks):
+    stranger = _outputs(_tx("surrender_t2_pass")["utxos"])[1]["address"]
+
+    def redirect(utxos):
+        pool, claimant = _outputs(utxos)
+        claimant["address"] = stranger
+
+    tx = _tampered_surrender(redirect)
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL
+    assert "non-claimant" in finding.render()
+
+
+def test_a_surrender_that_leaves_the_pool_without_its_datum_is_critical(networks):
+    def strip_datum(utxos):
+        pool, _ = _outputs(utxos)
+        pool["inline_datum"] = None
+
+    tx = _tampered_surrender(strip_datum)
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL
+    assert "without an inline datum" in finding.render()
+
+
+def test_value_arriving_at_a_custody_address_alone_is_an_alert(networks):
+    tx = _tx("surrender_agent")
+    network = networks["cardano-mainnet"]
+    quarantine = network.pool.quarantine_address
+    watched = rules.WatchedAddress(label="quarantine", address=quarantine, role="custody", severity=rules.CRITICAL)
+    network = rules.CardanoNetwork(**{**network.__dict__, "addresses": network.addresses + (watched,)})
+    finding = rules.classify_cardano_tx(network, tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.ALERT
+    assert "inflow to quarantine" in finding.render()
+
+
+def test_an_unrelated_transaction_is_not_a_finding(networks):
+    tx = _tx("spo_registration")
+    assert rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"]) is None
+
+
+def test_the_finding_key_is_the_network_and_transaction(networks):
+    tx = _tx("custody_outflow")
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.key == f"cardano-mainnet:{tx['tx']['hash']}"

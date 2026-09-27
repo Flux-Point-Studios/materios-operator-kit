@@ -1,0 +1,216 @@
+{
+ "state_db": ":memory:",
+ "digest_hour_utc": 13,
+ "source_stale_seconds": 900,
+ "materios": {
+  "name": "materios-preprod",
+  "rpc_url": "ws://materios.invalid:9945",
+  "poll_seconds": 6,
+  "state_pruning_blocks": 256
+ },
+ "cardano": [
+  {
+   "name": "cardano-mainnet",
+   "blockfrost_url": "https://blockfrost.invalid/api/v0",
+   "project_id_file": "/nonexistent/blockfrost.key",
+   "poll_seconds": 60,
+   "reorg_depth_blocks": 30,
+   "addresses": [
+    {
+     "label": "custody-a",
+     "address": "addr1v8efuqhk7tdmp9f4wkwjvr2yl0x6ew02ufe3t88lj59ggpcagsu4g",
+     "role": "custody"
+    },
+    {
+     "label": "custody-b",
+     "address": "addr1vylkxr8zvlc6hy96tvel7dz7wcqdfx57n5csg50jc587keg2nnyq7",
+     "role": "custody"
+    },
+    {
+     "label": "custody-c",
+     "address": "addr1v94vsmrfq9mp67hnj44j46awt66l6xynkc3mymuhzxluhpcky3adk",
+     "role": "custody"
+    }
+   ],
+   "policies": [
+    {
+     "label": "cMATRA",
+     "policy_id": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66",
+     "severity": "CRITICAL"
+    },
+    {
+     "label": "cMATRA-v1",
+     "policy_id": "98c61f406f7c8df11ccff49ca1631d8bca9663894537c6c5ee5ed418",
+     "severity": "CRITICAL"
+    }
+   ],
+   "surrender_pool": {
+    "label": "surrender-pool",
+    "address": "addr1w8s6rqdjlzm5he27v9s202p8vjumza8qfsmufm2f6dy68hg9mn27a",
+    "cmatra_unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+    "cmatra_decimals": 6,
+    "quarantine_address": "addr1wy5gl6nh5rm8f3sgp2ka3mfu5skdt2fqhu0spsxnucesdeqatlhxl",
+    "redeemers": {
+     "0": "ProcessSurrender",
+     "1": "AdminWithdraw"
+    },
+    "surrender_redeemer": "ProcessSurrender",
+    "redemptions": [
+     {
+      "key": "AGENT",
+      "unit": "97bbb7db0baef89caefce61b8107ac74c7a7340166b39d906f174bec54616c6f73",
+      "numerator": 449168051406055,
+      "denominator": 970355344
+     },
+     {
+      "key": "SHARDS",
+      "unit": "ea153b5d4864af15a1079a94a0e2486d6376fa28aafad272d15b243a0014df10536861726473",
+      "numerator": 76929202239379,
+      "denominator": 2641564750001
+     },
+     {
+      "key": "FLUX_PASS",
+      "policy_id": "0889a2d542897f0c7eefed47d2d809bd8d8ec78881bd4ff9464f683a",
+      "numerator": 27777511969476,
+      "denominator": 401
+     },
+     {
+      "key": "SE_BRAWLERS",
+      "policy_id": "25c75bbf105310685d51cd3adbdd50b72fdbd99be2cc3757dde7eafc",
+      "numerator": 8541197187044,
+      "denominator": 242
+     },
+     {
+      "key": "BRAWL_PASS_ETD",
+      "policy_id": "d3a197c4814054623432c882c60e6a81e8f3b94158033432529a02d2",
+      "numerator": 4941188455314,
+      "denominator": 44
+     },
+     {
+      "key": "T1_ADAM_PASS",
+      "policy_id": "b46891456b77dbc77c16090fd92a37f087f9a68e953c56b00a20332f",
+      "numerator": 137250603007574,
+      "denominator": 43
+     },
+     {
+      "key": "T2_ADAM_PASS",
+      "policy_id": "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b9",
+      "numerator": 17892245735158,
+      "denominator": 95
+     }
+    ]
+   }
+  },
+  {
+   "name": "cardano-preprod-partner-chain",
+   "blockfrost_url": "https://blockfrost.invalid/api/v0",
+   "project_id_file": "/nonexistent/blockfrost.key",
+   "poll_seconds": 180,
+   "reorg_depth_blocks": 30,
+   "addresses": [
+    {
+     "label": "CommitteeCandidateValidator",
+     "address": "addr_test1wrld9uhaepas48twjy3qevncsyrhjdqnkz2wzu4yzjc2qhq24f4v4",
+     "role": "contract",
+     "severity": "ALERT"
+    },
+    {
+     "label": "DParameterValidator",
+     "address": "addr_test1wp2cyx2swmu838rzaxth5aa0z8zrcuz24unwpwy3dfsxhfgnd0xw8",
+     "role": "contract",
+     "severity": "ALERT"
+    },
+    {
+     "label": "GovernedMapValidator",
+     "address": "addr_test1wzfl9tcpkzy2y65rpfy04283j962g3qhksryd8hk24mlfygjwf46l",
+     "role": "contract",
+     "severity": "ALERT"
+    },
+    {
+     "label": "IlliquidCirculationSupplyValidator",
+     "address": "addr_test1wqlrdfu7vh2wz8xq3v27kgpcc89wc43pdzl7mxrjga3u9qgcvpt84",
+     "role": "contract",
+     "severity": "CRITICAL"
+    },
+    {
+     "label": "PermissionedCandidatesValidator",
+     "address": "addr_test1wzyzwx0kcdgs2hc8t5w0d3g4l7s2qhvv2qcyws0m8sypwxgghu099",
+     "role": "contract",
+     "severity": "ALERT"
+    },
+    {
+     "label": "ReserveValidator",
+     "address": "addr_test1wp4p34g9kkjq09mdeaw563fg2sk3laz420udgpgpxdmpqug23437e",
+     "role": "contract",
+     "severity": "CRITICAL"
+    },
+    {
+     "label": "VersionOracleValidator",
+     "address": "addr_test1wpdva5udy3ltq5yuvaknr0lkxl3hrglwgj7wxakx5egzamqt7sfr3",
+     "role": "contract",
+     "severity": "CRITICAL"
+    },
+    {
+     "label": "governance",
+     "address": "addr_test1vqad2mve9hyt2y4mmgg96dyq57mpeww9pgzlnp4ryq9gt6sa4qtvw",
+     "role": "contract",
+     "severity": "CRITICAL"
+    }
+   ],
+   "policies": [
+    {
+     "label": "DParameter",
+     "policy_id": "38dddaf5198b927b19dac9b28226ab29eddad176d5d81c7748bc2c31",
+     "severity": "ALERT"
+    },
+    {
+     "label": "GovernedMap",
+     "policy_id": "097580f2b70450fab0581a0c276cd68b17acc5e2b8b3ffc72b85dbcd",
+     "severity": "ALERT"
+    },
+    {
+     "label": "IlliquidCirculationSupplyAuthToken",
+     "policy_id": "991416f6858411b71fca00823e770e56af1dea46111a07ea7d887a85",
+     "severity": "ALERT"
+    },
+    {
+     "label": "PermissionedCandidates",
+     "policy_id": "ef2890d1e98247819abcf2df6e891824ed950a4216d36c71ee6f9974",
+     "severity": "ALERT"
+    },
+    {
+     "label": "ReserveAuth",
+     "policy_id": "48176690dada15fd95b493079602f5abc32fffbd4988f32ef49f26e2",
+     "severity": "ALERT"
+    },
+    {
+     "label": "VersionOracle",
+     "policy_id": "ac283f02b411d4e09a5960b060887e59d42af062d1bef9e2812fbe55",
+     "severity": "ALERT"
+    }
+   ]
+  },
+  {
+   "name": "merger-rehearsal-preprod",
+   "blockfrost_url": "https://blockfrost.invalid/api/v0",
+   "project_id_file": "/nonexistent/blockfrost.key",
+   "poll_seconds": 60,
+   "reorg_depth_blocks": 30,
+   "addresses": [],
+   "policies": [],
+   "surrender_pool": {
+    "label": "rehearsal-pool",
+    "address": "addr_test1wz36u5mhq3n7l88eqhjhl835ru6v3z7emea4kd54a8l2hlg3s5t9l",
+    "cmatra_unit": "f82e57137e36e1440471a38018de0ae8d96a7d039daf560435c1b085634d41545241",
+    "cmatra_decimals": 6,
+    "quarantine_address": null,
+    "redeemers": {
+     "0": "ProcessSurrender",
+     "1": "AdminWithdraw"
+    },
+    "surrender_redeemer": "ProcessSurrender",
+    "redemptions": []
+   }
+  }
+ ]
+}

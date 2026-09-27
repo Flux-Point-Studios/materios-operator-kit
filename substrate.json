@@ -136,6 +136,23 @@
       ],
       "consumes": [],
       "status": "live"
+    },
+    {
+      "id": "custody-watch",
+      "name": "Custody watch",
+      "desc": "Read-only watcher that pages Discord on every custody and authority move: root, upgrade, forced-balance, recovery, treasury, finality and committee-gate calls in finalized Materios blocks (decoded through Sudo, Multisig, Utility and Recovery wrappers, with the signer and dispatch result), committee and Sudo.Key changes, transactions at watched Cardano custody and contract addresses, mints and burns under watched policies, and surrender-pool spends checked against the rate-table entitlement. Cursors, dedupe and delivery state persist in SQLite; routine moves and liveness go to a daily digest, and a source that stops being readable is itself paged. Replays any recent window without paging.",
+      "kind": "agent",
+      "paths": [
+        "daemon/custody_watch.py",
+        "daemon/custody_rules.py"
+      ],
+      "consumes": [
+        "daemon-core",
+        "orinq-receipts-pallet",
+        "cmatra-claim-validator",
+        "cmatra-mint-policy"
+      ],
+      "status": "experimental"
     }
   ]
 }
