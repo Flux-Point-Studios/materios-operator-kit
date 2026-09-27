@@ -224,7 +224,7 @@ class RegistryTokenTest(unittest.TestCase):
         return code, text
 
     def global_state(self):
-        """The layout before the move: one filtered global copy and an unfiltered user-org copy."""
+        """Copies outside any repository: a global one and an organization one without an image filter."""
         self.fake.global_secrets["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
         self.fake.org_secrets[1]["gchr_token"] = secret(OLD_VALUE, [], EVENTS)
 
