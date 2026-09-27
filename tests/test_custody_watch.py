@@ -677,3 +677,11 @@ def test_the_systemd_watchdog_is_pinged_through_the_notify_socket(tmp_path, monk
     assert receiver.recv(64) == b"WATCHDOG=1"
     monkeypatch.delenv("NOTIFY_SOCKET")
     cw.sd_notify("WATCHDOG=1")
+
+
+def test_a_relative_key_file_resolves_against_the_config_directory(tmp_path):
+    doc = json.loads((FIX / "config.json").read_text())
+    doc["cardano"][0]["project_id_file"] = "blockfrost-mainnet.key"
+    config = rules.parse_config(doc, base_dir=tmp_path)
+    assert config.cardano[0].project_id_file == str(tmp_path / "blockfrost-mainnet.key")
+    assert config.cardano[1].project_id_file == "/nonexistent/blockfrost.key"

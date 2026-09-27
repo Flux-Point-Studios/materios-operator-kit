@@ -25,6 +25,7 @@ import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from scalecodec.base import RuntimeConfigurationObject, ScaleBytes
 from scalecodec.type_registry import load_type_registry_preset
@@ -129,7 +130,9 @@ class WatchConfig:
 ADDRESS_ROLES = ("custody", "contract")
 
 
-def parse_config(doc: dict) -> WatchConfig:
+def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
+    """``base_dir`` anchors relative key paths, so a config handed over by systemd
+    ``LoadCredential`` can name its sibling key files."""
     materios = doc.get("materios")
     return WatchConfig(
         state_db=doc["state_db"],
@@ -142,11 +145,11 @@ def parse_config(doc: dict) -> WatchConfig:
             state_pruning_blocks=int(materios.get("state_pruning_blocks", 256)),
             start_block=materios.get("start_block"),
         ) if materios else None,
-        cardano=tuple(_parse_network(n) for n in doc.get("cardano", [])),
+        cardano=tuple(_parse_network(n, base_dir) for n in doc.get("cardano", [])),
     )
 
 
-def _parse_network(doc: dict) -> CardanoNetwork:
+def _parse_network(doc: dict, base_dir: Path | None) -> CardanoNetwork:
     addresses = []
     for a in doc.get("addresses", []):
         if a["role"] not in ADDRESS_ROLES:
@@ -157,7 +160,7 @@ def _parse_network(doc: dict) -> CardanoNetwork:
     return CardanoNetwork(
         name=doc["name"],
         blockfrost_url=doc["blockfrost_url"].rstrip("/"),
-        project_id_file=doc["project_id_file"],
+        project_id_file=str(base_dir / doc["project_id_file"]) if base_dir else doc["project_id_file"],
         poll_seconds=int(doc.get("poll_seconds", 60)),
         reorg_depth_blocks=int(doc.get("reorg_depth_blocks", 30)),
         addresses=tuple(addresses),

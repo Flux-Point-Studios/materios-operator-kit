@@ -31,7 +31,7 @@ The configuration lives on the host that runs the watcher, never in this reposit
     {
       "name": "cardano-mainnet",
       "blockfrost_url": "https://cardano-mainnet.blockfrost.io/api/v0",
-      "project_id_file": "/etc/custody-watch/blockfrost-mainnet.key",
+      "project_id_file": "blockfrost-mainnet.key",
       "poll_seconds": 60,
       "reorg_depth_blocks": 30,
       "addresses": [{"label": "<name>", "address": "addr1...", "role": "custody"}],
@@ -43,8 +43,9 @@ The configuration lives on the host that runs the watcher, never in this reposit
 ```
 
 `role` is `custody` (outflow CRITICAL, inflow ALERT) or `contract` (every transaction at
-the address's own `severity`). The webhook comes from `DISCORD_WEBHOOK_URL` in the
-environment; `run` refuses to start without it.
+the address's own `severity`). A relative `project_id_file` is read from the config
+file's directory. The webhook comes from `DISCORD_WEBHOOK_URL` in the environment; `run`
+refuses to start without it.
 
 ## Running it
 
@@ -62,11 +63,12 @@ Type=notify
 NotifyAccess=main
 WatchdogSec=900
 DynamicUser=yes
-EnvironmentFile=/etc/<file holding DISCORD_WEBHOOK_URL>
+EnvironmentFile=/etc/custody-watch/discord.env
+LoadCredential=config.json:/etc/custody-watch/config.json
 LoadCredential=blockfrost-mainnet.key:/etc/custody-watch/blockfrost-mainnet.key
 Environment=PYTHONDONTWRITEBYTECODE=1
 WorkingDirectory=/opt/custody-watch/src
-ExecStart=/opt/custody-watch/venv/bin/python -m daemon.custody_watch --config /etc/custody-watch/config.json run
+ExecStart=/opt/custody-watch/venv/bin/python -m daemon.custody_watch --config %d/config.json run
 Restart=always
 RestartSec=30
 Nice=10
@@ -82,11 +84,11 @@ PrivateTmp=true
 WantedBy=multi-user.target
 ```
 
-With `LoadCredential`, the key a network's `project_id_file` names is
-`/run/credentials/custody-watch.service/blockfrost-mainnet.key`, readable only by the
-service. `custody-watch-failed.service` is a oneshot running
-`python -m daemon.custody_watch --config ... page-failure --unit custody-watch.service`
-with the same `EnvironmentFile`, so a unit that exhausts its restarts pages too.
+`LoadCredential` hands the service its config and keys in a directory only it can
+read (`%d`), where the config's relative `project_id_file` finds them.
+`custody-watch-failed.service` is a oneshot with the same `EnvironmentFile` and config
+credential running `python -m daemon.custody_watch --config %d/config.json page-failure
+--unit custody-watch.service`, so a unit that exhausts its restarts pages too.
 `test-page` sends one message through the webhook to prove delivery end to end.
 
 ## Guarantees

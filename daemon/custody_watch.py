@@ -705,7 +705,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    config = rules.parse_config(json.loads(Path(args.config).read_text()))
+    config_path = Path(args.config)
+    config = rules.parse_config(json.loads(config_path.read_text()), base_dir=config_path.parent)
     if args.command == "backtest":
         return _backtest(config, args.days, args.state, args.materios_rpc)
 
