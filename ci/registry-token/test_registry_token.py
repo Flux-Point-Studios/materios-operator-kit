@@ -1,0 +1,348 @@
+import contextlib
+import copy
+import io
+import json
+import os
+import tempfile
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+import registry_token
+
+PLUGIN = "ghcr.io/flux-point-studios/materios-operator-kit@sha256:" + "d3" * 32
+NEXT_PLUGIN = "ghcr.io/flux-point-studios/materios-operator-kit@sha256:" + "a1" * 32
+EVENTS = ["cron", "deployment", "manual", "push", "release", "tag"]
+WOODPECKER_TOKEN = "wp-admin-token"
+NEW_TOKEN = "ghp_" + "N" * 36
+OLD_VALUE = "ghp_" + "O" * 36
+CONSUMERS = ["Org/kit", "Org/gateway", "Org/backend"]
+
+REPOS = [
+    {"id": 1, "full_name": "Org/kit", "org_id": 2},
+    {"id": 2, "full_name": "Org/gateway", "org_id": 2},
+    {"id": 3, "full_name": "Org/backend", "org_id": 2},
+    {"id": 4, "full_name": "Org/docs", "org_id": 2},
+    {"id": 5, "full_name": "user/app", "org_id": 1},
+]
+
+GITHUB_USERS = {
+    NEW_TOKEN: ("realdecimalist", "read:packages, write:packages", 200),
+    "ghp_" + "B" * 36: ("realdecimalist", "repo, write:packages", 200),
+    "ghp_" + "R" * 36: ("realdecimalist", "read:packages", 200),
+    "ghp_" + "S" * 36: ("someone-else", "write:packages", 200),
+    "ghp_" + "P" * 36: ("realdecimalist", "write:packages", 403),
+    "github_pat_" + "F" * 82: ("realdecimalist", None, 403),
+}
+
+
+def secret(value, images, events):
+    return {"value": value, "images": list(images), "events": list(events)}
+
+
+class Fake:
+    """In-memory Woodpecker secrets API plus the two GitHub endpoints the token check reads."""
+
+    def __init__(self):
+        self.global_secrets = {}
+        self.org_secrets = {1: {}, 2: {}}
+        self.repo_secrets = {r["id"]: {} for r in REPOS}
+        self.writes = []
+        self.stored_images = None
+        self.echo_rejections = False
+
+    def listing(self, secrets):
+        return [{"name": n, "images": s["images"], "events": sorted(s["events"])} for n, s in secrets.items()]
+
+    def woodpecker(self, method, parts, query, body):
+        if parts == ["repos"]:
+            page, per = int(query.get("page", ["1"])[0]), int(query.get("perPage", ["50"])[0])
+            return 200, REPOS[(page - 1) * per:page * per]
+        if parts[0] == "secrets":
+            store = self.global_secrets
+            rest = parts[1:]
+        elif parts[0] == "orgs" and parts[2] == "secrets":
+            store = self.org_secrets[int(parts[1])]
+            rest = parts[3:]
+        elif parts[0] == "repos" and parts[2] == "secrets":
+            store = self.repo_secrets[int(parts[1])]
+            rest = parts[3:]
+        else:
+            return 404, "not found"
+        if method == "GET" and not rest:
+            return 200, self.listing(store)
+        if method != "GET":
+            self.writes.append((method, "/" + "/".join(parts)))
+        if method == "POST" and not rest:
+            if self.echo_rejections:
+                return 422, "Error inserting secret. " + json.dumps(body)
+            if body["name"] in store:
+                return 500, "exists"
+            store[body["name"]] = secret(body["value"], self.stored_images or body["images"], body["events"])
+            return 200, {"name": body["name"]}
+        if not rest or rest[0] not in store:
+            return 404, "not found"
+        if method == "DELETE":
+            del store[rest[0]]
+            return 204, None
+        if method == "PATCH":
+            s = store[rest[0]]
+            if body.get("value"):
+                s["value"] = body["value"]
+            if body.get("images") is not None:
+                s["images"] = list(self.stored_images or body["images"])
+            if body.get("events") is not None:
+                s["events"] = list(body["events"])
+            return 200, {"name": rest[0]}
+        return 405, "method"
+
+    def github(self, parts, token):
+        if token not in GITHUB_USERS:
+            return 401, {"message": "Bad credentials"}, {}
+        login, scopes, packages = GITHUB_USERS[token]
+        headers = {} if scopes is None else {"X-OAuth-Scopes": scopes}
+        headers["github-authentication-token-expiration"] = "2026-12-31 00:00:00 UTC"
+        if parts == ["user"]:
+            return 200, {"login": login}, headers
+        if parts[:3] == ["orgs", "Flux-Point-Studios", "packages"]:
+            return packages, ([] if packages == 200 else {"message": "no"}), headers
+        return 404, {"message": "Not Found"}, headers
+
+
+def serve(fake):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def handle_any(self):
+            url = urlparse(self.path)
+            parts = [p for p in url.path.split("/") if p]
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length)) if length else None
+            auth = self.headers.get("Authorization", "")
+            headers = {}
+            if parts[:1] == ["api"]:
+                if auth != "Bearer " + WOODPECKER_TOKEN:
+                    status, payload = 401, "unauthorized"
+                else:
+                    status, payload = fake.woodpecker(self.command, parts[1:], parse_qs(url.query), body)
+            else:
+                status, payload, headers = fake.github(parts[1:], auth.removeprefix("token "))
+            data = b"" if payload is None else (json.dumps(payload) if not isinstance(payload, str) else payload).encode()
+            self.send_response(status)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        do_GET = do_POST = do_PATCH = do_DELETE = handle_any
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+class RegistryTokenTest(unittest.TestCase):
+    def setUp(self):
+        self.fake = Fake()
+        self.server = serve(self.fake)
+        base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.dir = tempfile.TemporaryDirectory()
+        wp_file = os.path.join(self.dir.name, "woodpecker")
+        with open(wp_file, "w") as f:
+            f.write(WOODPECKER_TOKEN + "\n")
+        self.env = {"WOODPECKER_SERVER": base, "WOODPECKER_TOKEN_FILE": wp_file, "GITHUB_API_URL": base + "/gh"}
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.dir.cleanup()
+
+    def token_file(self, token):
+        path = os.path.join(self.dir.name, "token")
+        with open(path, "w") as f:
+            f.write(token + "\n")
+        return path
+
+    def run_tool(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        saved = {k: os.environ.get(k) for k in self.env}
+        os.environ.update(self.env)
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = registry_token.main(list(argv))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        text = out.getvalue() + err.getvalue()
+        for value in [NEW_TOKEN, OLD_VALUE, WOODPECKER_TOKEN, *GITHUB_USERS]:
+            self.assertNotIn(value, text)
+        return code, text
+
+    def global_state(self):
+        """The layout before the move: one filtered global copy and an unfiltered user-org copy."""
+        self.fake.global_secrets["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        self.fake.org_secrets[1]["gchr_token"] = secret(OLD_VALUE, [], EVENTS)
+
+    def holders(self):
+        return {r["full_name"]: self.fake.repo_secrets[r["id"]]["gchr_token"]
+                for r in REPOS if "gchr_token" in self.fake.repo_secrets[r["id"]]}
+
+    def repo_args(self, names=CONSUMERS):
+        return [a for n in names for a in ("--repo", n)]
+
+    def test_plan_shows_the_move_and_writes_nothing(self):
+        self.global_state()
+        code, text = self.run_tool("plan", *self.repo_args())
+        self.assertEqual(code, 0, text)
+        for name in CONSUMERS:
+            self.assertIn(f"create gchr_token on {name}", text)
+        self.assertIn("delete global gchr_token", text)
+        self.assertIn("delete gchr_token on org 1", text)
+        self.assertIn(PLUGIN, text)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_apply_moves_the_token_to_exactly_the_named_repositories(self):
+        self.global_state()
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 0, text)
+        held = self.holders()
+        self.assertEqual(sorted(held), sorted(CONSUMERS))
+        for s in held.values():
+            self.assertEqual(s["value"], NEW_TOKEN)
+            self.assertEqual(s["images"], [PLUGIN])
+            self.assertEqual(sorted(s["events"]), EVENTS)
+        self.assertEqual(self.fake.global_secrets, {})
+        self.assertEqual(self.fake.org_secrets[1], {})
+
+    def test_apply_rotates_the_existing_copies_when_no_repository_is_named(self):
+        for r in REPOS[:3]:
+            self.fake.repo_secrets[r["id"]]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN))
+        self.assertEqual(code, 0, text)
+        held = self.holders()
+        self.assertEqual(sorted(held), sorted(CONSUMERS))
+        self.assertTrue(all(s["value"] == NEW_TOKEN and s["images"] == [PLUGIN] for s in held.values()))
+
+    def test_apply_deletes_a_copy_on_a_repository_that_was_not_named(self):
+        self.global_state()
+        self.fake.repo_secrets[4]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 0, text)
+        self.assertEqual(sorted(self.holders()), sorted(CONSUMERS))
+        self.assertIn("delete gchr_token on Org/docs", text)
+
+    def assert_refused_without_writes(self, token, fragment):
+        self.global_state()
+        before = copy.deepcopy((self.fake.global_secrets, self.fake.org_secrets, self.fake.repo_secrets))
+        code, text = self.run_tool("apply", "--token-file", self.token_file(token), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn(fragment, text)
+        self.assertEqual(self.fake.writes, [])
+        self.assertEqual((self.fake.global_secrets, self.fake.org_secrets, self.fake.repo_secrets), before)
+
+    def test_apply_refuses_a_fine_grained_token(self):
+        self.assert_refused_without_writes("github_pat_" + "F" * 82, "classic")
+
+    def test_apply_refuses_a_token_with_more_than_package_scopes(self):
+        self.assert_refused_without_writes("ghp_" + "B" * 36, "repo")
+
+    def test_apply_refuses_a_token_that_cannot_write_packages(self):
+        self.assert_refused_without_writes("ghp_" + "R" * 36, "write:packages")
+
+    def test_apply_refuses_a_token_of_another_user(self):
+        self.assert_refused_without_writes("ghp_" + "S" * 36, "someone-else")
+
+    def test_apply_refuses_a_token_the_organization_rejects(self):
+        self.assert_refused_without_writes("ghp_" + "P" * 36, "403")
+
+    def test_apply_refuses_an_unknown_token(self):
+        self.assert_refused_without_writes("ghp_" + "U" * 36, "401")
+
+    def test_apply_refuses_an_empty_token_file(self):
+        self.assert_refused_without_writes("", "token file is empty")
+
+    def test_apply_refuses_a_missing_token_file(self):
+        self.global_state()
+        code, text = self.run_tool("apply", "--token-file", os.path.join(self.dir.name, "absent"), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("cannot read", text)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_apply_refuses_an_unknown_repository(self):
+        self.global_state()
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), "--repo", "Org/missing")
+        self.assertEqual(code, 1, text)
+        self.assertIn("Org/missing", text)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_apply_refuses_to_spread_a_filter_that_admits_an_unpinned_image(self):
+        self.fake.global_secrets["gchr_token"] = secret(OLD_VALUE, [PLUGIN, "woodpeckerci/plugin-kaniko"], EVENTS)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("woodpeckerci/plugin-kaniko", text)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_apply_refuses_when_repository_copies_disagree(self):
+        self.fake.repo_secrets[1]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        self.fake.repo_secrets[2]["gchr_token"] = secret(OLD_VALUE, [NEXT_PLUGIN], EVENTS)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN))
+        self.assertEqual(code, 1, text)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_apply_keeps_the_global_copy_when_a_stored_filter_does_not_match(self):
+        self.global_state()
+        self.fake.stored_images = ["ghcr.io/other/image@sha256:" + "0" * 64]
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("gchr_token", self.fake.global_secrets)
+        self.assertNotIn(("DELETE", "/secrets/gchr_token"), self.fake.writes)
+
+    def test_apply_keeps_the_token_out_of_a_rejection_that_echoes_it(self):
+        self.global_state()
+        self.fake.echo_rejections = True
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("HTTP 422", text)
+        self.assertIn("gchr_token", self.fake.global_secrets)
+
+    def test_pin_adds_and_drops_a_plugin_digest_on_every_copy(self):
+        for r in REPOS[:3]:
+            self.fake.repo_secrets[r["id"]]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        code, text = self.run_tool("pin", "--add", NEXT_PLUGIN)
+        self.assertEqual(code, 0, text)
+        self.assertTrue(all(s["images"] == [PLUGIN, NEXT_PLUGIN] and s["value"] == OLD_VALUE
+                            for s in self.holders().values()))
+        code, text = self.run_tool("pin", "--drop", PLUGIN)
+        self.assertEqual(code, 0, text)
+        self.assertTrue(all(s["images"] == [NEXT_PLUGIN] for s in self.holders().values()))
+
+    def test_pin_refuses_to_drop_the_last_digest(self):
+        for r in REPOS[:3]:
+            self.fake.repo_secrets[r["id"]]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        code, text = self.run_tool("pin", "--drop", PLUGIN)
+        self.assertEqual(code, 1, text)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_pin_refuses_an_unpinned_image(self):
+        for r in REPOS[:3]:
+            self.fake.repo_secrets[r["id"]]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        code, text = self.run_tool("pin", "--add", "ghcr.io/flux-point-studios/materios-operator-kit:ci-oci-index")
+        self.assertEqual(code, 1, text)
+        self.assertEqual(self.fake.writes, [])
+
+    def test_pin_refuses_while_a_global_copy_remains(self):
+        self.global_state()
+        code, text = self.run_tool("pin", "--add", NEXT_PLUGIN)
+        self.assertEqual(code, 1, text)
+        self.assertIn("apply", text)
+        self.assertEqual(self.fake.writes, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

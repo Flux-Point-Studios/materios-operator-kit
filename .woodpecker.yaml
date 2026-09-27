@@ -41,6 +41,11 @@ variables:
       branch: main
 
 steps:
+  - name: test-registry-token
+    image: python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+    commands:
+      - python3 -m unittest discover -s ci/registry-token -v
+
   - name: test-oci-index
     image: *crane
     entrypoint: *busybox_entrypoint
@@ -75,7 +80,7 @@ steps:
     commands:
       - D=$$(cat /woodpecker/oci-index.digest)
       - 'P=$$(sed -n "/^  - name: publish-index$$/,/^  - name: /s/^    image: //p" .woodpecker.yaml)'
-      - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index and the gchr_token image filter to the new digest"; exit 1; }'
+      - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index to the new digest and add it to every gchr_token copy with ci/registry-token pin --add"; exit 1; }'
 
   - name: build-amd64
     image: *kaniko
