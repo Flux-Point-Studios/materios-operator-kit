@@ -1,0 +1,31 @@
+# Settings /kaniko/plugin.sh reads in woodpeckerci/plugin-kaniko@sha256:01e0e325efd8fd2b1a95d207e84780a85ed7f8eb9712d8e79888e0f42ff8b7b3
+# check-kaniko-inputs derives this list from that image and fails on any difference.
+auto_tag
+build_args
+build_args_from_env
+cache
+cache_repo
+cache_ttl
+cleanup
+context
+destinations
+docker_config_json
+dockerfile
+dry_run
+env_file
+extra_opts
+ignore_var_run
+insecure
+insecure_pull
+insecure_registry
+json_key
+log_level
+mirrors
+password
+registry
+repo
+single_snapshot
+skip_tls_verify
+tags
+target
+username

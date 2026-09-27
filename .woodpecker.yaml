@@ -28,12 +28,40 @@ variables:
   - &oci_index_in_service ghcr.io/flux-point-studios/materios-operator-kit@sha256:d3178aaf4dc548dda5bd2d15a09f7c650ac1325fa7bc9215a861a3f34774c84b
   # The crane debug image ships busybox under /busybox and has no /bin/sh.
   - &busybox_entrypoint ["/busybox/sh", "-c", "echo $$CI_SCRIPT | base64 -d | /busybox/sh -e"]
-  # --reproducible makes the plugin's digest a function of its sources alone, which is
-  # what lets check-oci-index-pin compare a rebuild against the pinned digest.
-  - &oci_index_build
-    dockerfile: ci/oci-index/Dockerfile
-    context: ci/oci-index
-    extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/oci-index.digest --oci-layout-path=/woodpecker/oci/oci-index
+  # Every setting the pinned kaniko plugin reads (ci/registry-token/kaniko-plugin-inputs).
+  # Woodpecker fills a setting a step leaves undeclared from a run's variables (a manual
+  # run's, or a restart's query), and publish-index pushes what these builds produce, so
+  # each is declared. "" keeps the plugin's default.
+  - &kaniko_inputs
+    dockerfile: Dockerfile
+    context: ""
+    dry_run: true
+    extra_opts: ""
+    auto_tag: ""
+    build_args: ""
+    build_args_from_env: ""
+    cache: ""
+    cache_repo: ""
+    cache_ttl: ""
+    cleanup: ""
+    destinations: ""
+    docker_config_json: ""
+    env_file: ""
+    ignore_var_run: ""
+    insecure: ""
+    insecure_pull: ""
+    insecure_registry: ""
+    json_key: ""
+    log_level: ""
+    mirrors: ""
+    password: ""
+    registry: ""
+    repo: ""
+    single_snapshot: ""
+    skip_tls_verify: ""
+    tags: ""
+    target: ""
+    username: ""
   - &on_pr
     - event: pull_request
   - &on_main
@@ -46,17 +74,32 @@ steps:
     commands:
       - python3 -m unittest discover -s ci/registry-token -v
 
+  # The pinned plugin's own script decides which settings it reads; this fails once
+  # kaniko-plugin-inputs no longer lists exactly those, as after a kaniko upgrade.
+  - name: check-kaniko-inputs
+    image: *kaniko
+    commands:
+      # The image has no /tmp.
+      - mkdir -p /tmp
+      - grep -o 'PLUGIN_[A-Z_]*' /kaniko/plugin.sh | sed 's/^PLUGIN_//' | tr A-Z a-z | sort -u > /tmp/read
+      - grep -v '^#' ci/registry-token/kaniko-plugin-inputs > /tmp/listed
+      - diff /tmp/listed /tmp/read
+
   - name: test-oci-index
     image: *crane
     entrypoint: *busybox_entrypoint
     commands:
       - /busybox/sh ci/oci-index/test.sh
 
+  # --reproducible makes the plugin's digest a function of its sources alone, which is
+  # what lets check-oci-index-pin compare a rebuild against the pinned digest.
   - name: build-oci-index
     image: *kaniko
     settings:
-      <<: *oci_index_build
-      dry_run: true
+      <<: *kaniko_inputs
+      dockerfile: ci/oci-index/Dockerfile
+      context: ci/oci-index
+      extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/oci-index.digest --oci-layout-path=/woodpecker/oci/oci-index
 
   - name: push-oci-index
     image: *oci_index_in_service
@@ -88,13 +131,13 @@ steps:
   - name: build-amd64
     image: *kaniko
     settings:
-      dry_run: true
+      <<: *kaniko_inputs
       extra_opts: --custom-platform=linux/amd64 --oci-layout-path=/woodpecker/oci/amd64
 
   - name: build-arm64
     image: *kaniko
     settings:
-      dry_run: true
+      <<: *kaniko_inputs
       extra_opts: --custom-platform=linux/arm64 --oci-layout-path=/woodpecker/oci/arm64
 
   # Runs publish-index's exact logic against the real layouts and a throwaway registry,
