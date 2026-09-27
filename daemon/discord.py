@@ -14,7 +14,20 @@ USER_AGENT = "materios-operator-kit/1.0 (+https://github.com/Flux-Point-Studios/
 
 
 class DiscordError(Exception):
-    """The webhook did not accept the post."""
+    """The webhook did not accept the post. ``status`` is the HTTP status when it
+    answered, and ``retry_after`` the seconds a rate-limited webhook asked for."""
+
+    def __init__(self, message: str, status: int | None = None, retry_after: float | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def _retry_after(headers) -> float | None:
+    try:
+        return float(headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        return None
 
 
 def post_json(webhook_url: str, payload: dict, *, timeout: float = 10.0) -> None:
@@ -28,8 +41,8 @@ def post_json(webhook_url: str, payload: dict, *, timeout: float = 10.0) -> None
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = response.status
     except urllib.error.HTTPError as e:
-        raise DiscordError(f"webhook answered HTTP {e.code}") from None
+        raise DiscordError(f"webhook answered HTTP {e.code}", e.code, _retry_after(e.headers)) from None
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise DiscordError(f"webhook unreachable: {type(e).__name__}") from None
     if not 200 <= status < 300:
-        raise DiscordError(f"webhook answered HTTP {status}")
+        raise DiscordError(f"webhook answered HTTP {status}", status)

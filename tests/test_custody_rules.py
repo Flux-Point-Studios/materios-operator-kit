@@ -342,6 +342,143 @@ def test_every_call_in_the_runtime_is_classified_whatever_its_argument_values(de
                         assert "could not be classified" not in finding.headline, (entry[:2], finding.render())
 
 
+# --- attempts that cannot take effect -----------------------------------------
+#
+# Root comes only from Sudo, and Sudo dispatches only for Sudo.Key, so a root-gated
+# call reached from any other account fails at dispatch. Once the block's events are
+# read such an attempt goes to the digest; while they are not, it pages as before.
+
+BOB = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+FAILED = {0: ["System.ExtrinsicFailed(dispatch_error={\"Module\": {\"index\": 7, \"error\": \"0x01000000\"}})"]}
+SUCCEEDED = {0: ["System.ExtrinsicSuccess"]}
+SET_CODE = _call("System", "set_code", code="0x" + "00" * 100)
+
+
+def test_an_ordinary_account_calling_sudo_goes_to_the_digest_once_the_call_failed():
+    ext = _signed(ALICE, "Sudo", "sudo", call=SET_CODE)
+    [failed] = _classify_extrinsics([ext], events=FAILED)
+    assert failed.severity == rules.INFO
+    assert "dispatch failed: nothing took effect" in failed.render()
+    [unverified] = _classify_extrinsics([ext], events=None)
+    assert unverified.severity == rules.CRITICAL
+
+
+@pytest.mark.parametrize(
+    "call, events",
+    [
+        (_call("Utility", "batch", calls=[_call("Sudo", "sudo", call=SET_CODE)]),
+         {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
+        (_call("Utility", "force_batch", calls=[_call("Balances", "force_transfer", source=ALICE, dest=BOB, value=1)]),
+         {0: ["Utility.ItemFailed", "Utility.BatchCompletedWithErrors", "System.ExtrinsicSuccess"]}),
+        (_call("Multisig", "as_multi", threshold=2, other_signatories=[BOB], maybe_timepoint=None,
+               call=_call("Sudo", "sudo", call=SET_CODE)),
+         {0: ["Multisig.NewMultisig", "System.ExtrinsicSuccess"]}),
+        (_call("Utility", "batch", calls=[_call("Utility", "dispatch_as", as_origin={"system": "Root"}, call=SET_CODE)]),
+         {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
+        (_call("Utility", "batch", calls=[_call("Utility", "as_derivative", index=0, call=_call("Sudo", "sudo", call=SET_CODE))]),
+         {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
+    ],
+)
+def test_a_root_gated_call_an_ordinary_origin_cannot_dispatch_goes_to_the_digest(call, events):
+    [finding] = _classify_extrinsics([{"address": ALICE, "call": call}], events=events)
+    assert finding.severity == rules.INFO
+    assert "cannot take effect from this origin" in finding.render()
+    [unverified] = _classify_extrinsics([{"address": ALICE, "call": call}], events=None)
+    assert unverified.severity == rules.CRITICAL
+
+
+def test_a_live_call_beside_an_inert_one_still_pages():
+    call = _call("Utility", "force_batch", calls=[
+        _call("Balances", "force_transfer", source=ALICE, dest=BOB, value=1),
+        _call("Recovery", "create_recovery", friends=[BOB], threshold=1, delay_period=0)])
+    [finding] = _classify_extrinsics([{"address": ALICE, "call": call}], events=SUCCEEDED)
+    assert finding.severity == rules.ALERT
+    assert "Recovery.create_recovery" in finding.render()
+
+
+def test_an_extrinsic_with_no_events_of_its_own_is_unverified_not_failed():
+    ext = _signed(ALICE, "Utility", "batch", calls=[_call("Sudo", "sudo", call=SET_CODE)])
+    [finding] = _classify_extrinsics([ext], events={1: ["System.ExtrinsicSuccess"]})
+    assert finding.severity == rules.CRITICAL
+    assert "events unavailable" in finding.render()
+
+
+def test_a_key_change_by_an_earlier_sudo_key_still_pages_critical(decoder):
+    # Sudo.Key is read at the finalized head; the multisig that set it is the key it replaced.
+    block = _block("block_1587358.json")
+    extrinsics = decoder.extrinsics(block["extrinsics"])
+    [index] = [i for i, e in enumerate(extrinsics) if e.get("address")]
+    events = {index: ["Multisig.MultisigExecuted(result=Ok)", "Sudo.KeyChanged", "System.ExtrinsicSuccess"]}
+    [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
+                                              events=events, sudo_key=rules.account_bytes(SUDO_KEY))
+    assert finding.severity == rules.CRITICAL
+    assert "Sudo.set_key" in finding.render()
+
+
+def test_the_sudo_keys_failed_call_still_pages_critical():
+    [finding] = _classify_extrinsics([_signed(SUDO_KEY, "Sudo", "sudo", call=SET_CODE)], events=FAILED)
+    assert finding.severity == rules.CRITICAL
+
+
+def test_the_sudo_multisigs_failed_call_still_pages_critical(decoder):
+    block = _block("block_1829226.json")
+    extrinsics = decoder.extrinsics(block["extrinsics"])
+    events = {2: ["Multisig.MultisigExecuted(result=Err:{\"Module\": {}})", "System.ExtrinsicSuccess"]}
+    [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
+                                              events=events, sudo_key=rules.account_bytes(SUDO_KEY))
+    assert finding.severity == rules.CRITICAL
+
+
+def test_a_sudo_event_proves_the_signer_held_the_key_at_that_block():
+    events = {0: ["Sudo.Sudid(sudo_result=Ok)", "System.ExtrinsicSuccess"]}
+    [finding] = _classify_extrinsics([_signed(ALICE, "Sudo", "sudo", call=SET_CODE)], events=events)
+    assert finding.severity == rules.CRITICAL
+
+
+def test_acting_as_a_recovered_sudo_key_is_critical():
+    ext = _signed(ALICE, "Recovery", "as_recovered", account=SUDO_KEY, call=_call("Sudo", "sudo", call=SET_CODE))
+    [finding] = _classify_extrinsics([ext], events=SUCCEEDED)
+    assert finding.severity == rules.CRITICAL
+    assert "System.set_code" in finding.render()
+
+
+def test_an_ordinary_account_creating_its_own_recovery_is_an_alert():
+    ext = _signed(ALICE, "Recovery", "create_recovery", friends=[BOB], threshold=1, delay_period=0)
+    for events in (None, SUCCEEDED):
+        [finding] = _classify_extrinsics([ext], events=events)
+        assert finding.severity == rules.ALERT
+
+
+@pytest.mark.parametrize(
+    "ext, authorities",
+    [
+        (_signed(ALICE, "Recovery", "initiate_recovery", account=SUDO_KEY), frozenset()),
+        (_signed(ALICE, "Recovery", "create_recovery", friends=[BOB], threshold=1, delay_period=0),
+         frozenset({BOB})),
+        (_signed(BOB, "Recovery", "vouch_recovery", lost=ALICE, rescuer=BOB), frozenset({BOB})),
+    ],
+)
+def test_recovery_that_touches_an_authority_account_is_critical(ext, authorities):
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [ext], events=SUCCEEDED,
+                                              sudo_key=rules.account_bytes(SUDO_KEY),
+                                              authorities=frozenset(map(rules.account_bytes, authorities)))
+    assert finding.severity == rules.CRITICAL
+
+
+def test_an_ordinary_signers_findings_share_a_group_and_an_authoritys_page_alone(decoder):
+    [ordinary] = _classify_extrinsics([_signed(ALICE, "Recovery", "create_recovery", friends=[BOB],
+                                               threshold=1, delay_period=0)])
+    assert ordinary.group == f"materios-preprod signer {ALICE}"
+    [authority] = _findings(decoder, "block_1829210.json")
+    assert authority.group is None
+
+
+def test_authority_accounts_are_read_from_the_config():
+    doc = json.loads((FIX / "config.json").read_text())
+    doc["materios"]["authority_accounts"] = [BOB]
+    assert rules.parse_config(doc).materios.authority_accounts == (BOB,)
+
+
 # --- Cardano ------------------------------------------------------------------
 
 
@@ -509,6 +646,29 @@ def test_value_arriving_at_a_custody_address_alone_is_an_alert(networks):
 def test_an_unrelated_transaction_is_not_a_finding(networks):
     tx = _tx("spo_registration")
     assert rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"]) is None
+
+
+def _payment(network, address: str, lovelace: int = 1_000_000) -> dict:
+    tx = {"hash": "bb" * 32, "block_height": 1, "block_time": 1_790_000_000, "valid_contract": True}
+    payer = "addr_test1vz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzerspjrlsz"
+    utxos = {"inputs": [{"address": payer, "amount": [{"unit": "lovelace", "quantity": str(3 * lovelace)}]}],
+             "outputs": [{"address": address, "amount": [{"unit": "lovelace", "quantity": str(lovelace)}]}]}
+    return rules.classify_cardano_tx(network, tx, utxos, [])
+
+
+def test_paying_into_a_contract_anyone_may_pay_is_an_alert_grouped_by_address(networks):
+    network = networks["cardano-preprod-partner-chain"]
+    ics = next(a for a in network.addresses if a.label == "IlliquidCirculationSupplyValidator")
+    assert ics.severity == rules.CRITICAL
+    finding = _payment(network, ics.address)
+    assert finding.severity == rules.ALERT
+    assert finding.group == "cardano-preprod-partner-chain IlliquidCirculationSupplyValidator"
+
+
+def test_custody_and_pool_findings_are_never_grouped(networks):
+    assert _classify(networks, "cardano-mainnet", "custody_outflow").group is None
+    assert _classify(networks, "cardano-mainnet", "surrender_agent").group is None
+    assert _classify(networks, "cardano-mainnet", "mint_v2").group is None
 
 
 def test_a_pool_redeemer_whose_constructor_is_not_a_number_is_critical(networks):

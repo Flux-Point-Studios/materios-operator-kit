@@ -9,12 +9,15 @@ from daemon import discord
 
 class _Hook(http.server.BaseHTTPRequestHandler):
     status = 204
+    headers_out: dict = {}
     seen: list = []
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         type(self).seen.append((self.headers.get("User-Agent"), json.loads(body)))
         self.send_response(type(self).status)
+        for name, value in type(self).headers_out.items():
+            self.send_header(name, value)
         self.end_headers()
 
     def log_message(self, *args):
@@ -24,6 +27,7 @@ class _Hook(http.server.BaseHTTPRequestHandler):
 @pytest.fixture
 def webhook():
     _Hook.seen = []
+    _Hook.headers_out = {}
     server = http.server.HTTPServer(("127.0.0.1", 0), _Hook)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -46,6 +50,17 @@ def test_a_rejected_post_raises_without_leaking_the_webhook_token(webhook):
     assert "403" in str(err.value)
     assert "SECRET-TOKEN" not in str(err.value)
     assert err.value.__cause__ is None and err.value.__suppress_context__
+
+
+def test_a_rejection_carries_its_status_and_discords_retry_after(webhook):
+    _Hook.status, _Hook.headers_out = 429, {"Retry-After": "2.5"}
+    with pytest.raises(discord.DiscordError) as limited:
+        discord.post_json(webhook, {"content": "x"})
+    assert (limited.value.status, limited.value.retry_after) == (429, 2.5)
+    _Hook.status, _Hook.headers_out = 400, {}
+    with pytest.raises(discord.DiscordError) as refused:
+        discord.post_json(webhook, {"content": "x"})
+    assert (refused.value.status, refused.value.retry_after) == (400, None)
 
 
 def test_an_unreachable_webhook_raises_without_leaking_the_token():

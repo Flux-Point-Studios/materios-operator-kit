@@ -7,14 +7,38 @@ custody and authority move it can see. It holds no signing key and submits nothi
 
 | Source | CRITICAL (immediate, `@here`) | ALERT (immediate) | INFO (daily digest) |
 |---|---|---|---|
-| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Recovery`, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, `Sudo.Key` changing, a new genesis (chain reset) | session key changes, equivocation reports, native token transfers, committee membership changes, an extrinsic the runtime metadata cannot decode | committee rotations with unchanged membership |
+| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, a new genesis (chain reset), an extrinsic the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, an extrinsic the runtime metadata cannot decode | committee rotations with unchanged membership; an attempt that could not take effect (below) |
 | Cardano custody addresses | any outflow | any inflow | reads as a reference input |
-| Cardano contract addresses | per address, as configured | per address, as configured | |
+| Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
 | Cardano policies | mint or burn, as configured | as configured | |
 | Surrender pool | a spend that is not exactly a surrender: another redeemer, cMATRA to a non-claimant, an overpayment, non-cMATRA value moved, a continuing output without its datum, a custody wallet as claimant | an underpayment, an asset outside the rate table, value arriving outside a pool spend | a surrender paid exactly its rate-table entitlement |
 
 Each Materios page carries the decoded call tree, the signer, the derived multisig
 account and, while the node still holds the block's state, the dispatch result.
+
+Root comes only from `Sudo`, and `Sudo` dispatches only for `Sudo.Key`, so a root-gated
+call reached from any other account cannot take effect. Once the block's events are
+read, such an attempt from an account that is neither `Sudo.Key` nor a configured
+authority, and any extrinsic from such an account that failed outright, goes to the
+digest rather than paging. An event from the `Sudo` pallet proves its caller held the
+key at that block, so the call pages whatever key the watcher last read. While the
+events cannot be read, every attempt pages as though it took effect.
+
+## Paging
+
+Pages go out most severe first, and within a severity a finding that pages alone goes
+before a group. Findings that anyone can cause cheaply are grouped: Materios findings
+by signer (unless an authority is involved) and Cardano payments into, or contract
+spends from, one address. Every pending finding of a group goes out as one message.
+Custody outflows, surrender-pool spends and watched-policy mints always page alone.
+
+A rate-limited webhook is left alone for its `Retry-After`; an unreachable webhook or a
+server error leaves every page pending, in order, for the next cycle. A page the webhook
+refuses outright is skipped so it cannot hold back the rest, and after three refusals
+goes out as its headline alone. The digest counts the pages still waiting. Pages go
+out, and the systemd watchdog is pinged, after each source is polled, and a Cardano poll
+classifies at most 200 transactions, so a flood at one address delays neither the other
+sources nor their pages.
 
 ## Configuration
 
@@ -42,9 +66,11 @@ The configuration lives on the host that runs the watcher, never in this reposit
 }
 ```
 
-`role` is `custody` (outflow CRITICAL, inflow ALERT) or `contract` (every transaction at
-the address's own `severity`). A relative `project_id_file` is read from the config
-file's directory. The webhook comes from `DISCORD_WEBHOOK_URL` in the environment; `run`
+`role` is `custody` (outflow CRITICAL, inflow ALERT) or `contract` (a spend at the
+address's own `severity`, a payment in as an ALERT). `materios.authority_accounts` lists
+the SS58 accounts besides `Sudo.Key` whose moves are authority moves, such as the sudo
+multisig's signatories. A relative `project_id_file` is read from the config file's
+directory. The webhook comes from `DISCORD_WEBHOOK_URL` in the environment; `run`
 refuses to start without it.
 
 ## Running it

@@ -24,7 +24,7 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,6 +54,8 @@ class Finding:
     details: tuple[str, ...] = ()
     kind: str = "event"
     amount: int = 0
+    # Pending findings that share a group are paged as one message; None pages alone.
+    group: str | None = None
 
     def render(self) -> str:
         return "\n".join([f"[{self.severity.name}] {self.headline}", *(f"  {d}" for d in self.details)])
@@ -117,6 +119,9 @@ class MateriosConfig:
     poll_seconds: int
     state_pruning_blocks: int
     start_block: int | None
+    # Accounts besides Sudo.Key whose moves are authority moves: the sudo multisig's
+    # signatories, committee operators.
+    authority_accounts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +150,7 @@ def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
             poll_seconds=int(materios.get("poll_seconds", 6)),
             state_pruning_blocks=int(materios.get("state_pruning_blocks", 256)),
             start_block=materios.get("start_block"),
+            authority_accounts=tuple(materios.get("authority_accounts", ())),
         ) if materios else None,
         cardano=tuple(_parse_network(n, base_dir) for n in doc.get("cardano", [])),
     )
@@ -247,42 +253,52 @@ def _result_text(value) -> str:
 EVENT_NOISE = ("Motra.", "TransactionPayment.", "Balances.Withdraw", "Balances.Deposit")
 
 _ANY = "*"
-_CALL_SEVERITY: dict[tuple[str, str], Severity] = {
-    ("Sudo", _ANY): CRITICAL,
-    ("Recovery", _ANY): CRITICAL,
-    **{("System", f): CRITICAL for f in (
+# Gated by ensure_root or an EnsureRoot origin in the spec-238 runtime and its pallets:
+# these take effect only under Root, and only Sudo gives Root.
+_ROOT_GATED = frozenset({
+    *(("System", f) for f in (
         "set_heap_pages", "set_code", "set_code_without_checks", "set_storage", "kill_storage",
-        "kill_prefix", "authorize_upgrade", "authorize_upgrade_without_checks", "apply_authorized_upgrade")},
-    **{("Balances", f): CRITICAL for f in (
-        "force_transfer", "force_unreserve", "force_set_balance", "force_adjust_total_issuance")},
-    **{("Treasury", f): CRITICAL for f in ("spend_local", "remove_approval", "spend", "payout", "void_spend")},
-    **{("Vesting", f): CRITICAL for f in ("force_vested_transfer", "force_remove_vesting_schedule")},
-    ("Grandpa", "note_stalled"): CRITICAL,
-    ("Grandpa", "report_equivocation"): ALERT,
-    ("Grandpa", "report_equivocation_unsigned"): ALERT,
-    ("NativeTokenManagement", "transfer_tokens"): ALERT,
-    ("SessionCommitteeManagement", "set_main_chain_scripts"): CRITICAL,
-    ("NativeTokenManagement", "set_main_chain_scripts"): CRITICAL,
-    ("PalletSession", "set_keys"): ALERT,
-    ("PalletSession", "purge_keys"): ALERT,
-    **{("OrinqReceipts", f): CRITICAL for f in (
+        "kill_prefix", "authorize_upgrade", "authorize_upgrade_without_checks")),
+    *(("Balances", f) for f in (
+        "force_transfer", "force_unreserve", "force_set_balance", "force_adjust_total_issuance")),
+    *(("Treasury", f) for f in ("spend_local", "remove_approval", "spend", "void_spend")),
+    *(("Vesting", f) for f in ("force_vested_transfer", "force_remove_vesting_schedule")),
+    ("Grandpa", "note_stalled"),
+    ("Recovery", "set_recovered"),
+    ("Utility", "dispatch_as"),
+    ("Utility", "with_weight"),
+    ("SessionCommitteeManagement", "set_main_chain_scripts"),
+    ("NativeTokenManagement", "set_main_chain_scripts"),
+    *(("OrinqReceipts", f) for f in (
         "set_availability_cert", "set_committee", "join_committee", "leave_committee",
         "set_attestation_reward_per_signer", "set_era_cap_base", "set_era_cap_baseline_attestor_count",
         "slash_attestor", "set_bond_requirement", "set_receipt_submission_fee",
         "set_receipt_submission_fee_floor", "set_receipt_expiry_blocks", "set_bad_attest_slash_threshold",
         "reset_candidate_liveness", "set_core_eviction_enabled", "set_contribution_window_enabled",
         "set_break_glass_floor_enabled", "set_slack_invariant_enabled", "set_break_glass_aura_keys",
-        "set_pinned_committee", "clear_pinned_committee")},
-    ("Motra", "set_params"): CRITICAL,
-    ("TeeAttestation", "set_disabled"): CRITICAL,
-    ("Billing", "governance_set_endpoint_price"): CRITICAL,
-    ("Billing", "governance_set_debits_enabled"): CRITICAL,
-    ("PerpEngine", "governance_set_market"): CRITICAL,
-    ("Oracle", "register_attestor"): CRITICAL,
-    ("IntentSettlement", "set_pool_utilization"): CRITICAL,
-    ("IntentSettlement", "set_min_signer_threshold"): CRITICAL,
-    ("Utility", "dispatch_as"): CRITICAL,
-    ("Utility", "with_weight"): CRITICAL,
+        "set_pinned_committee", "clear_pinned_committee")),
+    ("Motra", "set_params"),
+    ("TeeAttestation", "set_disabled"),
+    ("Billing", "governance_set_endpoint_price"),
+    ("Billing", "governance_set_debits_enabled"),
+    ("PerpEngine", "governance_set_market"),
+    ("Oracle", "register_attestor"),
+    ("IntentSettlement", "set_pool_utilization"),
+    ("IntentSettlement", "set_min_signer_threshold"),
+})
+_CALL_SEVERITY: dict[tuple[str, str], Severity] = {
+    **dict.fromkeys(_ROOT_GATED, CRITICAL),
+    ("Sudo", _ANY): CRITICAL,
+    ("System", "apply_authorized_upgrade"): CRITICAL,
+    ("Treasury", "payout"): CRITICAL,
+    # Any account may start, vouch for or claim a recovery; the walk raises one that
+    # names an authority account to CRITICAL.
+    ("Recovery", _ANY): ALERT,
+    ("Grandpa", "report_equivocation"): ALERT,
+    ("Grandpa", "report_equivocation_unsigned"): ALERT,
+    ("NativeTokenManagement", "transfer_tokens"): ALERT,
+    ("PalletSession", "set_keys"): ALERT,
+    ("PalletSession", "purge_keys"): ALERT,
 }
 _MULTISIG_CALLS = {"as_multi", "as_multi_threshold_1", "approve_as_multi", "cancel_as_multi"}
 _BATCH_CALLS = {"batch", "batch_all", "force_batch"}
@@ -353,50 +369,114 @@ def _render_value(value) -> str:
     return text if len(text) <= 400 else text[:400] + "\u2026"
 
 
-def _multisig_origin(function: str, args: dict, origin: bytes | None) -> bytes | None:
+def _holds_calls(value) -> bool:
+    return _is_call(value) or (isinstance(value, list) and bool(value) and all(_is_call(x) for x in value))
+
+
+# An origin during a walk is an account (bytes), _ROOT, or None for one the walk cannot name.
+_ROOT = "Root"
+
+
+@dataclass(frozen=True)
+class _Site:
+    """A privileged call in an extrinsic's call tree; ``inert`` when its origin cannot
+    dispatch it."""
+    path: str
+    severity: Severity
+    inert: bool
+
+
+@dataclass
+class _Tree:
+    """What walking one extrinsic's call tree found."""
+    sudo_key: bytes | None
+    authority: frozenset[bytes]
+    lines: list[str] = field(default_factory=list)
+    sites: list[_Site] = field(default_factory=list)
+    involved: bool = False
+
+
+def _multisig_origin(function: str, args: dict, origin) -> bytes | None:
     """The multisig account a Multisig call dispatches as, or None when its signatories
     or threshold do not name one."""
     threshold = 1 if function == "as_multi_threshold_1" else args.get("threshold")
     others = args.get("other_signatories")
-    if origin is None or not isinstance(threshold, int) or not 0 <= threshold < 1 << 16 or not isinstance(others, list):
+    if (not isinstance(origin, bytes) or not isinstance(threshold, int) or not 0 <= threshold < 1 << 16
+            or not isinstance(others, list)):
         return None
     signatories = [origin, *(_account(s) for s in others)]
     return None if None in signatories else multisig_account(signatories, threshold)
 
 
-def _walk(call: dict, origin: bytes | None, sudo_key: bytes | None, depth: int, lines: list[str]) -> Severity | None:
+def _dispatched_origin(value):
+    """The origin ``Utility.dispatch_as`` names: Root, a signed account, or None."""
+    system = value.get("system") if isinstance(value, dict) else None
+    if system == "Root":
+        return _ROOT
+    return _account(system.get("Signed")) if isinstance(system, dict) else None
+
+
+def _inner_origin(module: str, function: str, args: dict, origin, tree: _Tree, depth: int):
+    """The origin the calls wrapped by this one dispatch with."""
+    if module == "Utility" and (function in _BATCH_CALLS or function == "with_weight"):
+        return origin
+    if (module, function) == ("Utility", "as_derivative"):
+        index = args.get("index")
+        if not isinstance(origin, bytes) or not isinstance(index, int) or not 0 <= index < 1 << 16:
+            return None
+        # pallet_utility::derivative_account_id
+        return hashlib.blake2b(b"modlpy/utilisuba" + origin + index.to_bytes(2, "little"), digest_size=32).digest()
+    if (module, function) == ("Utility", "dispatch_as"):
+        return _dispatched_origin(args.get("as_origin"))
+    if module == "Sudo" and function in ("sudo", "sudo_unchecked_weight"):
+        return _ROOT if origin == _ROOT or (isinstance(origin, bytes) and origin == tree.sudo_key) else None
+    if (module, function) == ("Sudo", "sudo_as"):
+        return _account(args.get("who"))
+    if (module, function) == ("Recovery", "as_recovered"):
+        return _account(args.get("account"))
+    if module == "Multisig" and function in _MULTISIG_CALLS:
+        account = _multisig_origin(function, args, origin)
+        if account is not None:
+            label = "is Sudo.Key " if account == tree.sudo_key else ""
+            tree.lines.append(f"{'  ' * depth}  multisig account {label}{render_account(account)}")
+        return account
+    return None
+
+
+def _severity(module: str, function: str, args: dict, origin, inner, tree: _Tree) -> Severity | None:
+    if module == "Multisig" and inner is not None and inner == tree.sudo_key:
+        return CRITICAL
+    severity = _CALL_SEVERITY.get((module, function), _CALL_SEVERITY.get((module, _ANY)))
+    if module == "Recovery" and severity == ALERT:
+        named = [origin, *(_account(args.get(n)) for n in ("account", "lost", "rescuer"))]
+        friends = args.get("friends")
+        named += [_account(f) for f in friends] if isinstance(friends, list) else []
+        if any(isinstance(a, bytes) and a in tree.authority for a in named):
+            return CRITICAL
+    return severity
+
+
+def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...], inert: bool) -> None:
+    """Record ``call`` and every call it wraps. A subtree is inert when its origin is an
+    account that cannot dispatch it: a Sudo call from any account but Sudo.Key, or a
+    root-gated call from any account at all."""
     module, function = call["call_module"], call["call_function"]
     args = _args(call)
-    rendered = ", ".join(f"{k}={_render_value(v)}" for k, v in args.items()
-                         if not _is_call(v) and not (isinstance(v, list) and v and all(_is_call(x) for x in v)))
-    lines.append(f"{'  ' * depth}{module}.{function}({rendered})")
-    severity = _CALL_SEVERITY.get((module, function), _CALL_SEVERITY.get((module, _ANY)))
-
-    # The origin an inner call dispatches with; None stands for Root or an account
-    # this walk cannot name, where a multisig account cannot be derived.
-    inner_origin = None
-    if module == "Utility" and function in _BATCH_CALLS:
-        inner_origin = origin
-    elif module == "Sudo" and function == "sudo_as":
-        inner_origin = _account(args.get("who"))
-    elif module == "Recovery" and function == "as_recovered":
-        inner_origin = _account(args.get("account"))
-    elif module == "Multisig" and function in _MULTISIG_CALLS:
-        inner_origin = _multisig_origin(function, args, origin)
-        if inner_origin is not None and inner_origin == sudo_key:
-            severity = CRITICAL
-            lines.append(f"{'  ' * depth}  multisig account is Sudo.Key {render_account(sudo_key)}")
-        elif inner_origin is not None:
-            lines.append(f"{'  ' * depth}  multisig account {render_account(inner_origin)}")
-
+    path = (*parents, f"{module}.{function}")
+    rendered = ", ".join(f"{k}={_render_value(v)}" for k, v in args.items() if not _holds_calls(v))
+    tree.lines.append(f"{'  ' * depth}{module}.{function}({rendered})")
+    if isinstance(origin, bytes):
+        inert = inert or (module == "Sudo" and origin != tree.sudo_key) or (module, function) in _ROOT_GATED
+    inner = _inner_origin(module, function, args, origin, tree, depth)
+    if any(isinstance(o, bytes) and o in tree.authority for o in (origin, inner)):
+        tree.involved = True
+    severity = _severity(module, function, args, origin, inner, tree)
+    if severity is not None:
+        tree.sites.append(_Site(" > ".join(path), severity, inert))
     for value in args.values():
-        children = [value] if _is_call(value) else (value if isinstance(value, list) else [])
-        for child in children:
+        for child in ([value] if _is_call(value) else value if isinstance(value, list) else []):
             if _is_call(child):
-                inner = _walk(child, inner_origin, sudo_key, depth + 1, lines)
-                if inner is not None and (severity is None or inner > severity):
-                    severity = inner
-    return severity
+                _walk(child, inner, tree, depth + 1, path, inert)
 
 
 RUNTIME_ENVIRONMENT_UPDATED = "0x08"
@@ -415,7 +495,11 @@ def unclassifiable(key: str, what: str, error: Exception, *details: str) -> Find
 
 
 def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
-                            events: dict[int, list[str]] | None, sudo_key: bytes | None) -> list[Finding]:
+                            events: dict[int, list[str]] | None, sudo_key: bytes | None,
+                            authorities: frozenset[bytes] = frozenset()) -> list[Finding]:
+    """Findings for a block's extrinsics. ``events`` is the block's events by extrinsic,
+    or None when they could not be read: an attempt is then paged as though it took
+    effect, since nothing shows it failed."""
     findings = []
     for index, ext in enumerate(extrinsics):
         key = f"{chain}:{number}:{index}"
@@ -430,7 +514,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
             ))
             continue
         try:
-            finding = _classify_extrinsic(chain, number, index, ext, events, sudo_key)
+            finding = _classify_extrinsic(chain, number, index, ext, events, sudo_key, authorities)
         except Exception as e:  # argument values are the signer's choice; none may stall the block
             finding = unclassifiable(key, f"{chain} #{number} extrinsic {index}", e,
                                      f"extrinsic hash {ext.get('extrinsic_hash')}")
@@ -439,34 +523,53 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     return findings
 
 
-def _classify_extrinsic(chain: str, number: int, index: int, ext: dict,
-                        events: dict[int, list[str]] | None, sudo_key: bytes | None) -> Finding | None:
+def _classify_extrinsic(chain: str, number: int, index: int, ext: dict, events: dict[int, list[str]] | None,
+                        sudo_key: bytes | None, authorities: frozenset[bytes]) -> Finding | None:
     address = ext.get("address")
     signer = _account(address)
-    lines: list[str] = []
-    severity = _walk(ext["call"], signer, sudo_key, 0, lines)
+    tree = _Tree(sudo_key, authorities | ({sudo_key} if sudo_key else frozenset()))
+    _walk(ext["call"], signer, tree, 0, (), False)
+    # Every applied extrinsic has events, so one with none is as unverified as a block
+    # whose events could not be read.
+    own = None if events is None else events.get(index)
+    # pallet-sudo emits events only for a caller that passed its key check, whatever
+    # key this watcher last read.
+    if own is not None and any(e.startswith("Sudo.") for e in own):
+        tree.involved = True
+    by_sudo = signer is not None and signer == sudo_key
+    if not tree.sites and not by_sudo:
+        return None
+
     if address is None:
         notes = ["unsigned"]
     elif signer is None:
         notes = [f"signer {_render_value(address)} names no account"]
     else:
         notes = [f"signer {render_account(signer)}"]
-    if signer is not None and signer == sudo_key:
-        severity = CRITICAL
+    if by_sudo:
         notes.append("signed by Sudo.Key")
-    if severity is None:
-        return None
-    if events is None:
+    counted = tree.sites
+    if own is None:
         notes.append("events unavailable (state pruned or undecodable): dispatch result not verified")
     else:
-        shown = [e for e in events.get(index, []) if not e.startswith(EVENT_NOISE)]
+        shown = [e for e in own if not e.startswith(EVENT_NOISE)]
         notes.append("result: " + (", ".join(shown) if shown else "no events"))
+        # An authority's attempts page whatever their outcome; anyone else's page only
+        # when they could have taken effect.
+        if not tree.involved and any(e.startswith("System.ExtrinsicFailed") for e in own):
+            counted = []
+            notes.append("dispatch failed: nothing took effect")
+        elif not tree.involved and any(s.inert for s in tree.sites):
+            counted = [s for s in tree.sites if not s.inert]
+            notes.append("cannot take effect from this origin: " + ", ".join(s.path for s in tree.sites if s.inert))
+    severity = CRITICAL if by_sudo else max((s.severity for s in counted), default=INFO)
     call = ext["call"]
     return Finding(
         severity=severity,
         key=f"{chain}:{number}:{index}",
         headline=f"{chain} #{number} extrinsic {index}: {call['call_module']}.{call['call_function']}",
-        details=tuple(notes + lines),
+        details=tuple(notes + tree.lines),
+        group=None if tree.involved or signer is None else f"{chain} signer {render_account(signer)}",
     )
 
 
@@ -654,6 +757,10 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
     names = _Names(network)
     lines: list[tuple[Severity, str]] = []
     kind, amount = "event", 0
+    # Anyone may pay into an address, so a transaction that only pays in, or only spends
+    # from a contract, is grouped with the others at that address; one that moves custody
+    # or pool value or mints under a watched policy always pages alone.
+    alone, label = False, None
 
     if not valid:
         lines.append((ALERT, "phase-2 script failure: only collateral moved"))
@@ -666,9 +773,11 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
             lines.append((CRITICAL if custody else watched.severity,
                           f"{'outflow from' if custody else 'spent from'} {watched.label}: "
                           f"net {names.value(_delta(into, out))}"))
+            alone = alone or custody
+            label = label or watched.label
         elif into:
-            lines.append((ALERT if custody else watched.severity,
-                          f"{'inflow to' if custody else 'paid to'} {watched.label}: {names.value(into)}"))
+            lines.append((ALERT, f"{'inflow to' if custody else 'paid to'} {watched.label}: {names.value(into)}"))
+            label = label or watched.label
         elif any(u["address"] == watched.address for u in referenced):
             lines.append((INFO, f"{watched.label} read as a reference input"))
 
@@ -679,16 +788,19 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
             if unit.startswith(policy.policy_id):
                 verb = "minted" if quantity > 0 else "burned"
                 lines.append((policy.severity, f"{verb} {names.quantity(unit, abs(quantity))} under {policy.label}"))
+                alone = True
 
     pool = network.pool
     if pool and any(u["address"] == pool.address for u in spent):
         severity, pool_lines, paid = _classify_pool(network, spent, produced, redeemers, names)
         lines.extend((severity, t) for t in pool_lines)
+        alone = True
         if severity == INFO:
             kind, amount = "surrender", paid
     elif pool and any(u["address"] == pool.address for u in produced):
         received = _value([u for u in produced if u["address"] == pool.address])
         lines.append((ALERT, f"{pool.label} received value outside a pool spend: {names.value(received)}"))
+        label = label or pool.label
 
     if not lines:
         return None
@@ -700,4 +812,5 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
         details=tuple(t for _, t in lines),
         kind=kind,
         amount=amount,
+        group=None if alone or label is None else f"{network.name} {label}",
     )

@@ -48,15 +48,16 @@ def _finding(key="k", severity=rules.CRITICAL, kind="event", amount=0, details=(
 class Posts:
     """Records Discord payloads; fails the posts listed in ``fail`` (1-based)."""
 
-    def __init__(self, fail=()):
+    def __init__(self, fail=(), error=None):
         self.payloads = []
         self.attempts = 0
         self.fail = set(fail)
+        self.error = error or discord.DiscordError("webhook unreachable: URLError")
 
     def __call__(self, payload):
         self.attempts += 1
         if self.attempts in self.fail:
-            raise discord.DiscordError("webhook answered HTTP 502")
+            raise self.error
         self.payloads.append(payload)
 
     def text(self):
@@ -93,6 +94,74 @@ def test_a_rejected_page_stays_pending_and_is_retried_in_order(tmp_path):
     assert [p["content"].split("headline ")[1][0] for p in posts.payloads] == ["a", "b", "c"]
 
 
+def _headlines(posts):
+    return [p["content"].split("\n")[1] for p in posts.payloads]
+
+
+def test_pages_go_out_most_severe_first_and_ungrouped_before_grouped(tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    store.add(_finding("alert", severity=rules.ALERT), now=1.0)
+    store.add(rules.Finding(rules.CRITICAL, "flood", "headline flood", group="preprod signer X"), now=2.0)
+    store.add(_finding("custody"), now=3.0)
+    posts = Posts()
+    assert cw.Pager(posts).flush(store, now=4.0) == 3
+    assert _headlines(posts) == ["**headline custody**", "**headline flood**", "**headline alert**"]
+
+
+def test_pending_findings_of_one_group_go_out_as_one_page(tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    for i in range(40):
+        store.add(rules.Finding(rules.ALERT, f"flood-{i}", f"flood {i}", group="preprod ReserveValidator"), now=1.0)
+    store.add(rules.Finding(rules.CRITICAL, "flood-top", "flood top", group="preprod ReserveValidator"), now=2.0)
+    store.add(_finding("custody"), now=3.0)
+    posts = Posts()
+    assert cw.Pager(posts).flush(store, now=4.0) == 42
+    custody, aggregate = posts.payloads
+    assert aggregate["content"].startswith("\U0001f6a8 **CRITICAL** @here")
+    assert "**41 findings from preprod ReserveValidator**" in aggregate["content"]
+    assert aggregate["content"].index("flood top") < aggregate["content"].index("flood 0")
+    assert len(aggregate["content"]) <= 2000
+    assert "headline custody" in custody["content"]
+    assert cw.Pager(posts).flush(store, now=5.0) == 0
+
+
+def test_a_rate_limited_webhook_is_left_alone_until_its_retry_after(tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    store.add(_finding("a"), now=1.0)
+    posts = Posts(fail={1}, error=discord.DiscordError("webhook answered HTTP 429", status=429, retry_after=30))
+    pager = cw.Pager(posts)
+    assert pager.flush(store, now=10.0) == 0
+    assert pager.flush(store, now=39.0) == 0
+    assert posts.attempts == 1
+    assert pager.flush(store, now=40.0) == 1
+
+
+def test_a_page_the_webhook_refuses_does_not_hold_back_the_rest_and_goes_out_as_its_headline(tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    store.add(_finding("refused", details=("x",)), now=1.0)
+    store.add(_finding("next", severity=rules.ALERT), now=2.0)
+    posts = Posts(fail={1, 3, 4}, error=discord.DiscordError("webhook answered HTTP 400", status=400))
+    pager = cw.Pager(posts)
+    assert pager.flush(store, now=3.0) == 1
+    assert _headlines(posts) == ["**headline next**"]
+    pager.flush(store, now=4.0)
+    pager.flush(store, now=5.0)
+    assert pager.flush(store, now=6.0) == 1
+    fallback = posts.payloads[-1]["content"]
+    assert "headline refused" in fallback and "rejected" in fallback and "```" not in fallback
+    assert store.unsent_pages() == []
+
+
+def test_the_digest_counts_pages_still_waiting_for_delivery(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    posts = Posts(fail={1}, error=discord.DiscordError("webhook answered HTTP 429", status=429, retry_after=600))
+    clock = [_at("2026-09-27T13:00:00")]
+    store.add(_finding("waiting"), now=clock[0])
+    _watch(config, store, [StubSource("cardano-mainnet")], posts, clock).cycle()
+    digest = next(p["content"] for p in posts.payloads if "daily digest" in p["content"])
+    assert "pages waiting for delivery: 1" in digest
+
+
 def test_routine_findings_wait_for_the_digest(tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     store.add(_finding("s", severity=rules.INFO, kind="surrender", amount=5), now=1.0)
@@ -102,8 +171,8 @@ def test_routine_findings_wait_for_the_digest(tmp_path):
 
 
 def test_a_critical_page_mentions_here_and_fits_one_discord_message():
-    critical = cw.page_message(_finding(details=tuple("x" * 300 for _ in range(40))))
-    alert = cw.page_message(_finding(severity=rules.ALERT))
+    critical = cw.page_message([_finding(details=tuple("x" * 300 for _ in range(40)))])
+    alert = cw.page_message([_finding(severity=rules.ALERT)])
     assert critical["content"].startswith("\U0001f6a8 **CRITICAL** @here")
     assert len(critical["content"]) <= 2000
     assert "@here" not in alert["content"]
@@ -249,6 +318,30 @@ def test_a_restart_after_downtime_gives_sources_a_chance_before_calling_them_sta
     posts = Posts()
     _watch(config, cw.Store(db), [StubSource("materios-preprod")], posts, clock).cycle()
     assert posts.payloads == []
+
+
+class FindingSource(StubSource):
+    """Stores a CRITICAL finding when polled, and records how many pages were out by then."""
+
+    def __init__(self, name, store, posts):
+        super().__init__(name)
+        self.store, self.posts, self.pages_before = store, posts, None
+
+    def poll(self, now):
+        self.pages_before = len(self.posts.payloads)
+        self.store.add(_finding(f"{self.name}:found"), now)
+        return super().poll(now)
+
+
+def test_pages_go_out_and_the_watchdog_is_pinged_after_each_source(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    posts = Posts()
+    notified = []
+    first, second = FindingSource("cardano-mainnet", store, posts), FindingSource("materios-preprod", store, posts)
+    clock = [_at("2026-09-27T01:00:00")]
+    cw.Watch(config, store, [first, second], posts, clock=lambda: clock[0], notify=notified.append).cycle()
+    assert second.pages_before == 1
+    assert notified.count("WATCHDOG=1") >= 2
 
 
 def test_sources_are_polled_on_their_own_cadence(config, tmp_path):
@@ -611,6 +704,9 @@ class FakeBlockfrost:
         if path.endswith("/transactions") and value is not None:
             start = int(params.get("from", 0))
             value = [row for row in value if row["block_height"] >= start]
+        if isinstance(value, list) and "page" in params:
+            first = (params["page"] - 1) * params["count"]
+            value = value[first:first + params["count"]]
         return copy.deepcopy(value)
 
 
@@ -720,6 +816,19 @@ def test_a_backtest_reports_only_the_mints_inside_its_window(config, tmp_path):
     report = cw.backtest([source], store, now=_at("2026-09-27T01:01:00"))
     assert [f.key for f in report] == [f"cardano-mainnet:{inside}"]
     assert report[0].severity == rules.CRITICAL
+
+
+def test_a_flood_of_transactions_is_classified_in_bounded_polls(config, tmp_path):
+    store, network, api, source = _baselined(config, tmp_path)
+    for i in range(cw.MAX_TX_PER_POLL + 50):
+        api.add_tx("surrender_agent", address=network.pool.address, height=13_500_001, tx_hash=f"{i:064x}")
+    api.routes["/blocks/latest"]["height"] = 13_500_002
+    assert not source.poll(_at("2026-09-27T01:01:00"))
+    assert len(store.findings()) == cw.MAX_TX_PER_POLL
+    assert store.get(f"cursor:cardano-mainnet:address:{network.pool.address}") == "13500000"
+    assert source.poll(_at("2026-09-27T01:01:10"))
+    assert len(store.findings()) == cw.MAX_TX_PER_POLL + 50
+    assert store.get(f"cursor:cardano-mainnet:address:{network.pool.address}") == "13500002"
 
 
 def test_a_transaction_the_classifier_cannot_read_pages_critical_once(config, tmp_path, monkeypatch):

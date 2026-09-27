@@ -56,6 +56,7 @@ class SourceError(Exception):
 class StoredFinding(rules.Finding):
     found_at: float = 0.0
     sent_at: float | None = None
+    failures: int = 0
 
     @property
     def text(self) -> str:
@@ -72,8 +73,10 @@ CREATE TABLE IF NOT EXISTS finding (
     amount TEXT NOT NULL,
     headline TEXT NOT NULL,
     details TEXT NOT NULL,
+    grp TEXT,
     found_at REAL NOT NULL,
-    sent_at REAL
+    sent_at REAL,
+    failures INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS processed (key TEXT PRIMARY KEY, at REAL NOT NULL);
 """
@@ -127,10 +130,10 @@ class Store:
     def add(self, finding: rules.Finding, now: float) -> bool:
         """Store a finding unless one with its key exists; True when it is new."""
         cursor = self._db.execute(
-            "INSERT OR IGNORE INTO finding (key, severity, kind, amount, headline, details, found_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO finding (key, severity, kind, amount, headline, details, grp, found_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (finding.key, int(finding.severity), finding.kind, str(finding.amount), finding.headline,
-             json.dumps(finding.details), now))
+             json.dumps(finding.details), finding.group, now))
         return cursor.rowcount == 1
 
     def retire(self, prefix: str, suffix: str) -> None:
@@ -145,19 +148,21 @@ class Store:
     def mark_processed(self, key: str, now: float) -> None:
         self._db.execute("INSERT OR IGNORE INTO processed (key, at) VALUES (?, ?)", (key, now))
 
-    def _rows(self, where: str, params: tuple = ()) -> list[StoredFinding]:
+    def _rows(self, where: str, params: tuple = (), order: str = "seq") -> list[StoredFinding]:
         rows = self._db.execute(
-            "SELECT key, severity, kind, amount, headline, details, found_at, sent_at FROM finding "
-            f"WHERE {where} ORDER BY seq", params).fetchall()
+            "SELECT key, severity, kind, amount, headline, details, grp, found_at, sent_at, failures FROM finding "
+            f"WHERE {where} ORDER BY {order}", params).fetchall()
         return [StoredFinding(severity=rules.Severity(s), key=k, headline=h, details=tuple(json.loads(d)),
-                              kind=kind, amount=int(a), found_at=f, sent_at=sent)
-                for k, s, kind, a, h, d, f, sent in rows]
+                              kind=kind, amount=int(a), group=g, found_at=f, sent_at=sent, failures=n)
+                for k, s, kind, a, h, d, g, f, sent, n in rows]
 
     def findings(self) -> list[StoredFinding]:
         return self._rows("1")
 
     def unsent_pages(self) -> list[StoredFinding]:
-        return self._rows("sent_at IS NULL AND severity >= ?", (int(rules.ALERT),))
+        """Most severe first; within a severity, findings that page alone come first."""
+        return self._rows("sent_at IS NULL AND severity >= ?", (int(rules.ALERT),),
+                          order="severity DESC, grp IS NOT NULL, seq")
 
     def unsent_routine(self) -> list[StoredFinding]:
         return self._rows("sent_at IS NULL AND severity < ?", (int(rules.ALERT),))
@@ -167,6 +172,9 @@ class Store:
 
     def mark_sent(self, keys: list[str], now: float) -> None:
         self._db.executemany("UPDATE finding SET sent_at = ? WHERE key = ?", [(now, k) for k in keys])
+
+    def reject(self, keys: list[str]) -> None:
+        self._db.executemany("UPDATE finding SET failures = failures + 1 WHERE key = ?", [(k,) for k in keys])
 
 
 # --- Discord ----------------------------------------------------------------------
@@ -184,33 +192,77 @@ def _fenced(text: str, room: int) -> str:
     return f"```\n{text}\n```"
 
 
-def page_message(finding: rules.Finding) -> dict:
-    """One Discord message per finding. Only CRITICAL may ping, so text taken from the
-    chain can never mention anyone on an ALERT."""
-    head = f"{_BADGE[finding.severity]} custody-watch\n**{finding.headline}**\n"
-    return {
-        "content": head + _fenced("\n".join(finding.details), DISCORD_LIMIT - len(head) - 8),
-        "allowed_mentions": {"parse": ["everyone"] if finding.severity == rules.CRITICAL else []},
-    }
+def page_message(findings: list[rules.Finding], headline_only: bool = False) -> dict:
+    """One Discord message for one finding, or for every pending finding of a group,
+    most severe first. Only CRITICAL may ping, so text taken from the chain can never
+    mention anyone on an ALERT."""
+    severity = max(f.severity for f in findings)
+    if len(findings) == 1:
+        title, body = findings[0].headline, "\n".join(findings[0].details)
+    else:
+        title = f"{len(findings)} findings from {findings[0].group}"
+        body = "\n".join(f"[{f.severity.name}] {f.headline}" for f in findings)
+    head = f"{_BADGE[severity]} custody-watch\n**{title}**\n"
+    if headline_only:
+        content = head + f"(the full page was rejected by the webhook {FALLBACK_AFTER} times; " \
+                         "its details are in the watcher's state database)"
+    else:
+        content = head + _fenced(body, DISCORD_LIMIT - len(head) - 8)
+    return {"content": content, "allowed_mentions": {"parse": ["everyone"] if severity == rules.CRITICAL else []}}
+
+
+FALLBACK_AFTER = 3
+MAX_RETRY_AFTER = 600.0
+
+
+def _messages(pending: list[StoredFinding]) -> list[list[StoredFinding]]:
+    """Pending pages as messages, in order: a finding alone, or its whole group at the
+    place of the group's first finding."""
+    messages: list[list[StoredFinding]] = []
+    groups: dict[str, list[StoredFinding]] = {}
+    for finding in pending:
+        if finding.group is None:
+            messages.append([finding])
+        elif finding.group in groups:
+            groups[finding.group].append(finding)
+        else:
+            groups[finding.group] = [finding]
+            messages.append(groups[finding.group])
+    return messages
 
 
 class Pager:
     def __init__(self, post: Callable[[dict], None]):
         self._post = post
+        self._resume_at = 0.0
 
     def flush(self, store: Store, now: float) -> int:
-        """Page every unsent ALERT and CRITICAL in order; stop at the first rejection so
-        the rest are retried, in order, on the next flush."""
-        sent = 0
-        for finding in store.unsent_pages():
+        """Page every unsent ALERT and CRITICAL; returns how many findings went out.
+
+        A rate limit holds all paging until Discord's Retry-After has passed, and an
+        unreachable webhook or a server error ends the flush; either way the rest are
+        retried, in order, on a later flush. A message the webhook refuses outright is
+        skipped so it cannot hold back the rest, and after FALLBACK_AFTER refusals goes
+        out as its headline alone."""
+        if now < self._resume_at:
+            return 0
+        delivered = 0
+        for message in _messages(store.unsent_pages()):
+            keys = [f.key for f in message]
             try:
-                self._post(page_message(finding))
+                self._post(page_message(message, headline_only=max(f.failures for f in message) >= FALLBACK_AFTER))
             except discord.DiscordError as e:
-                logger.warning("page for %s not delivered, retrying next cycle: %s", finding.key, e)
-                break
-            store.mark_sent([finding.key], now)
-            sent += 1
-        return sent
+                if e.status == 429:
+                    self._resume_at = now + min(e.retry_after or 1.0, MAX_RETRY_AFTER)
+                if e.status is None or e.status == 429 or e.status >= 500:
+                    logger.warning("pages not delivered, retrying later: %s", e)
+                    return delivered
+                logger.warning("page for %s refused: %s", keys[0], e)
+                store.reject(keys)
+                continue
+            store.mark_sent(keys, now)
+            delivered += len(keys)
+        return delivered
 
 
 # --- the watch loop ------------------------------------------------------------------
@@ -226,34 +278,43 @@ def _plural(n: int, word: str) -> str:
 
 class Watch:
     def __init__(self, config: rules.WatchConfig, store: Store, sources: list, post: Callable[[dict], None],
-                 clock: Callable[[], float] = time.time):
+                 clock: Callable[[], float] = time.time, notify: Callable[[str], None] = lambda message: None):
         self._config = config
         self._store = store
         self._sources = sources
         self._post = post
         self._pager = Pager(post)
         self._clock = clock
+        self._notify = notify
         self._started = clock()
         self._due = {s.name: 0.0 for s in sources}
         self._decimals = {n.name: n.pool.cmatra_decimals for n in config.cardano if n.pool}
 
     def cycle(self) -> None:
-        now = self._clock()
+        """Poll each source that is due, paging what it found and pinging the systemd
+        watchdog before the next, so one slow source never holds back another's pages."""
         for source in self._sources:
+            now = self._clock()
             if now < self._due[source.name]:
                 continue
-            try:
-                caught_up = source.poll(now)
-            except Exception as e:  # one unreadable source must not blind the others; staleness pages it
-                logger.exception("%s: poll failed", source.name)
-                self._store.put(f"health:{source.name}:error", f"{type(e).__name__}: {e}"[:300])
-                self._due[source.name] = now + source.poll_seconds
-                continue
-            self._due[source.name] = now if not caught_up else now + source.poll_seconds
-            self._healthy(source, now)
+            self._poll(source, now)
+            self._pager.flush(self._store, self._clock())
+            self._notify("WATCHDOG=1")
+        now = self._clock()
         self._check_stale(now)
         self._pager.flush(self._store, now)
         self._digest(now)
+
+    def _poll(self, source, now: float) -> None:
+        try:
+            caught_up = source.poll(now)
+        except Exception as e:  # one unreadable source must not blind the others; staleness pages it
+            logger.exception("%s: poll failed", source.name)
+            self._store.put(f"health:{source.name}:error", f"{type(e).__name__}: {e}"[:300])
+            self._due[source.name] = now + source.poll_seconds
+            return
+        self._due[source.name] = now if not caught_up else now + source.poll_seconds
+        self._healthy(source, now)
 
     def _healthy(self, source, now: float) -> None:
         store, name = self._store, source.name
@@ -316,6 +377,7 @@ class Watch:
         paged = store.paged_since(now - DAY)
         critical = sum(1 for f in paged if f.severity == rules.CRITICAL)
         lines.append(f"paged in the last 24h: {len(paged)} ({critical} critical)")
+        lines.append(f"pages waiting for delivery: {len(store.unsent_pages())}")
 
         surrenders: dict[str, list[int]] = defaultdict(list)
         committees: dict[str, int] = defaultdict(int)
@@ -375,6 +437,7 @@ class MateriosSource:
         self._client = client
         self._store = store
         self._cursor_key = f"cursor:{self.name}"
+        self._authorities = frozenset(rules.account_bytes(a) for a in config.authority_accounts)
         self._decoders: dict[int, rules.RuntimeDecoder] = {}
         self._decoder: rules.RuntimeDecoder | None = None
 
@@ -476,14 +539,16 @@ class MateriosSource:
         return self._decoders[version]
 
     def _events(self, block_hash: str, decoder: rules.RuntimeDecoder) -> dict[int, list[str]] | None:
-        """The block's events by extrinsic, or None when the node has pruned them or they
-        do not decode; the finding then says its dispatch result is unverified."""
+        """The block's events by extrinsic, or None when the node has pruned them, serves
+        none, or they do not decode; the finding then says its dispatch result is
+        unverified. Every block has events, so an empty read is never taken to mean
+        that nothing happened."""
         try:
             raw = self._rpc("state_getStorage", [SYSTEM_EVENTS_STORAGE, block_hash])
         except SubstrateRequestException:
             return None
         if not raw:
-            return {}
+            return None
         try:
             return decoder.events(raw)
         except Exception as e:  # scalecodec raises any type on bytes it cannot place
@@ -497,11 +562,12 @@ class MateriosSource:
             self._decoder = self._load_decoder(header["parentHash"])
         decoder = self._decoder
         extrinsics = decoder.extrinsics(block["extrinsics"])
-        findings = rules.classify_materios_block(self.name, number, extrinsics, events=None, sudo_key=sudo_key)
+        findings = rules.classify_materios_block(self.name, number, extrinsics, None, sudo_key, self._authorities)
         if findings:
             events = self._events(block_hash, decoder)
             if events is not None:
-                findings = rules.classify_materios_block(self.name, number, extrinsics, events, sudo_key)
+                findings = rules.classify_materios_block(self.name, number, extrinsics, events, sudo_key,
+                                                         self._authorities)
 
         try:
             committee = rules.committee_of(extrinsics)
@@ -558,6 +624,7 @@ class Blockfrost:
 
 
 PAGE = 100
+MAX_TX_PER_POLL = 200
 
 
 class CardanoSource:
@@ -611,6 +678,9 @@ class CardanoSource:
             page += 1
 
     def poll(self, now: float) -> bool:
+        """Classify up to ``MAX_TX_PER_POLL`` new transactions; True once none are left and
+        the cursors have moved to the tip. A larger backlog is worked off over successive
+        polls, so pages and the systemd watchdog run between them."""
         tip = self._api.get("/blocks/latest")
         if tip is None:
             raise SourceError(f"{self.name}: blockfrost served no chain tip")
@@ -653,9 +723,11 @@ class CardanoSource:
                         pending.setdefault(entry["tx_hash"], floor)
                 cursors[key] = str(count)
 
-        for tx_hash, floor in pending.items():
-            if not self._store.processed(f"{self.name}:{tx_hash}"):
-                self._classify(tx_hash, now, floor)
+        todo = [(h, floor) for h, floor in pending.items() if not self._store.processed(f"{self.name}:{h}")]
+        for tx_hash, floor in todo[:MAX_TX_PER_POLL]:
+            self._classify(tx_hash, now, floor)
+        if len(todo) > MAX_TX_PER_POLL:
+            return False
         with self._store.transaction():
             for key, value in cursors.items():
                 self._store.put(key, value)
@@ -720,7 +792,7 @@ def build_sources(config: rules.WatchConfig, store: Store, materios_rpc: str | N
 def _run(config: rules.WatchConfig, webhook: str) -> int:
     store = Store(config.state_db)
     watch = Watch(config, store, build_sources(config, store),
-                  functools.partial(discord.post_json, webhook))
+                  functools.partial(discord.post_json, webhook), notify=sd_notify)
     sd_notify("READY=1")
     logger.info("watching %d sources", len(config.cardano) + (1 if config.materios else 0))
     while True:
