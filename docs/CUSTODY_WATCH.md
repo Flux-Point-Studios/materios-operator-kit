@@ -25,9 +25,11 @@ page's code block or format itself outside it.
 
 Root comes only from `Sudo`, and `Sudo` dispatches only for `Sudo.Key`, so a root-gated
 call reached from any other account cannot take effect. Once the block's events are
-read, such an attempt from an account that is neither `Sudo.Key` nor a configured
-authority, and any extrinsic from such an account that failed outright, goes to the
-digest rather than paging. An event from the `Sudo` pallet proves its caller held the
+read, such an attempt, and any extrinsic that failed outright, goes to the digest
+rather than paging unless its signer, or a multisig or derivative account of its
+signer, is `Sudo.Key` or a configured authority. Naming an authority as the target of
+`sudo_as`, `as_recovered` or `dispatch_as` proves nothing about who signed, so it does
+not count. An event from the `Sudo` pallet proves its caller held the
 key at that block, so the call pages whatever key the watcher last read. While the
 events cannot be read, every attempt pages as though it took effect.
 

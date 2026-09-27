@@ -507,10 +507,18 @@ def _severity(module: str, function: str, args: dict, origin, inner, tree: _Tree
     return severity
 
 
-def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...], inert: bool) -> None:
+# Wrappers whose inner origin follows from the outer one alone. Any other wrapper
+# dispatches as an account its caller names, which proves nothing about who signed.
+_DERIVED = frozenset({*(("Utility", f) for f in (*_BATCH_CALLS, "with_weight", "as_derivative")),
+                      *(("Multisig", f) for f in _MULTISIG_CALLS)})
+
+
+def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...], inert: bool,
+          proven: bool) -> None:
     """Record ``call`` and every call it wraps. A subtree is inert when its origin is an
     account that cannot dispatch it: a Sudo call from any account but Sudo.Key, or a
-    root-gated call from any account at all."""
+    root-gated call from any account at all. ``proven`` holds while the origin follows
+    from the signer alone; only such an origin can make an authority's attempt."""
     module, function = call["call_module"], call["call_function"]
     args = _args(call)
     path = (*parents, f"{module}.{function}")
@@ -519,7 +527,8 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     if isinstance(origin, bytes):
         inert = inert or (module == "Sudo" and origin != tree.sudo_key) or (module, function) in _ROOT_GATED
     inner = _inner_origin(module, function, args, origin, tree, depth)
-    if any(isinstance(o, bytes) and o in tree.authority for o in (origin, inner)):
+    inner_proven = proven and (module, function) in _DERIVED
+    if any(p and isinstance(o, bytes) and o in tree.authority for o, p in ((origin, proven), (inner, inner_proven))):
         tree.involved = True
     severity = _severity(module, function, args, origin, inner, tree)
     unlisted = severity is None and (module, function) not in _ROUTINE
@@ -530,7 +539,7 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     for value in args.values():
         for child in ([value] if _is_call(value) else value if isinstance(value, list) else []):
             if _is_call(child):
-                _walk(child, inner, tree, depth + 1, path, inert)
+                _walk(child, inner, tree, depth + 1, path, inert, inner_proven)
 
 
 MAX_SITE_LINES = 20
@@ -584,7 +593,7 @@ def _classify_extrinsic(chain: str, number: int, index: int, ext: dict, events: 
     address = ext.get("address")
     signer = _account(address)
     tree = _Tree(sudo_key, authorities | ({sudo_key} if sudo_key else frozenset()))
-    _walk(ext["call"], signer, tree, 0, (), False)
+    _walk(ext["call"], signer, tree, 0, (), False, True)
     # Every applied extrinsic has events, so one with none is as unverified as a block
     # whose events could not be read.
     own = None if events is None else events.get(index)

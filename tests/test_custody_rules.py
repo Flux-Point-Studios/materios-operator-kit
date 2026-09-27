@@ -442,6 +442,22 @@ def test_acting_as_a_recovered_sudo_key_is_critical():
     assert "System.set_code" in finding.render()
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        _call("Sudo", "sudo_as", who=SUDO_KEY, call=SET_CODE),
+        _call("Recovery", "as_recovered", account=SUDO_KEY, call=_call("System", "remark", remark="0x00")),
+        _call("Utility", "dispatch_as", as_origin={"system": {"Signed": SUDO_KEY}}, call=SET_CODE),
+    ],
+)
+def test_naming_the_sudo_key_as_a_target_does_not_make_an_attempt_the_keys(call):
+    # Anyone may name any account; only the signer, and accounts derived from it,
+    # are proven. A failed attempt from an ordinary signer is not an authority's.
+    [finding] = _classify_extrinsics([{"address": ALICE, "call": call}], events=FAILED)
+    assert finding.severity == rules.INFO
+    assert finding.group == f"materios-preprod signer {ALICE}"
+
+
 def test_an_ordinary_account_creating_its_own_recovery_is_an_alert():
     ext = _signed(ALICE, "Recovery", "create_recovery", friends=[BOB], threshold=1, delay_period=0)
     for events in (None, SUCCEEDED):
