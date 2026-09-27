@@ -778,6 +778,7 @@ def test_a_mint_under_a_watched_policy_pages_critical(config, tmp_path):
     assert store.findings() == []
 
     mint_hash = api.add_tx("mint_v2")
+    api.routes[f"/assets/policy/{policy}"] = [{"asset": unit, "quantity": "2"}]
     api.routes[f"/assets/{unit}"] = {"mint_or_burn_count": 2}
     api.routes[f"/assets/{unit}/history"] = [{"tx_hash": "0" * 64, "action": "minted", "amount": "1"},
                                              {"tx_hash": mint_hash, "action": "minted", "amount": "1"}]
@@ -785,6 +786,71 @@ def test_a_mint_under_a_watched_policy_pages_critical(config, tmp_path):
     [finding] = store.findings()
     assert finding.severity == rules.CRITICAL and "minted" in finding.text
     assert store.get(f"cursor:cardano-mainnet:asset:{unit}") == "2"
+
+
+def _large_policy_watch(config, tmp_path):
+    """A watched policy with more assets than are worth reading one by one every poll."""
+    store = cw.Store(str(tmp_path / "state.db"))
+    network = _mainnet(config)
+    api = FakeBlockfrost(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
+    source = cw.CardanoSource(network, api, store, stale_seconds=900)
+    policy = network.policies[0].policy_id
+    units = [network.pool.cmatra_unit] + [policy + f"{i:04x}" for i in range(cw.EXACT_POLICY_ASSETS)]
+    api.routes[f"/assets/policy/{policy}"] = [{"asset": u, "quantity": "5"} for u in units]
+    for u in units:
+        api.routes[f"/assets/{u}"] = {"mint_or_burn_count": 1}
+    source.poll(_at("2026-09-27T01:00:30"))
+    return store, api, source, units[0]
+
+
+def test_a_large_policy_whose_supply_is_unchanged_costs_only_its_listing(config, tmp_path):
+    store, api, source, unit = _large_policy_watch(config, tmp_path)
+    api.calls.clear()
+    source.poll(_at("2026-09-27T01:01:30"))
+    assert [c for c in api.calls if c[0].startswith("/assets/") and "/policy/" not in c[0]] == []
+
+
+def test_a_mint_and_burn_that_cancel_out_under_a_large_policy_are_found_at_the_hourly_reconcile(config, tmp_path):
+    store, api, source, unit = _large_policy_watch(config, tmp_path)
+    mint_hash = api.add_tx("mint_v2", height=13_500_001)
+    api.routes[f"/assets/{unit}"] = {"mint_or_burn_count": 2}
+    api.routes[f"/assets/{unit}/history"] = [{"tx_hash": "0" * 64, "action": "minted", "amount": "5"},
+                                             {"tx_hash": mint_hash, "action": "minted", "amount": "1"}]
+    source.poll(_at("2026-09-27T01:01:30"))
+    assert store.findings() == []
+    api.routes["/blocks/latest"]["time"] = int(_at("2026-09-27T02:00:40"))
+    source.poll(_at("2026-09-27T02:00:40"))
+    [finding] = store.findings()
+    assert finding.severity == rules.CRITICAL and "minted" in finding.text
+
+
+def test_a_small_policy_has_every_mint_count_read_each_poll(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    network = _mainnet(config)
+    api = FakeBlockfrost(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
+    source = cw.CardanoSource(network, api, store, stale_seconds=900)
+    unit, policy = network.pool.cmatra_unit, network.policies[0].policy_id
+    api.routes[f"/assets/policy/{policy}"] = [{"asset": unit, "quantity": "5"}]
+    api.routes[f"/assets/{unit}"] = {"mint_or_burn_count": 1}
+    source.poll(_at("2026-09-27T01:00:30"))
+    mint_hash = api.add_tx("mint_v2", height=13_500_001)
+    api.routes[f"/assets/{unit}"] = {"mint_or_burn_count": 2}
+    api.routes[f"/assets/{unit}/history"] = [{"tx_hash": "0" * 64, "action": "minted", "amount": "5"},
+                                             {"tx_hash": mint_hash, "action": "minted", "amount": "1"}]
+    source.poll(_at("2026-09-27T01:01:30"))
+    [finding] = store.findings()
+    assert finding.severity == rules.CRITICAL
+
+
+def test_surrenders_beyond_the_rate_table_supply_are_paged_once_per_new_count(config, tmp_path):
+    store, network, api, source = _baselined(config, tmp_path)
+    t2 = next(r for r in network.pool.redemptions if r.key == "T2_ADAM_PASS")
+    held = [{"unit": t2.policy_id + name, "quantity": "1"} for name in sorted(t2.asset_names)[:96]]
+    api.routes[f"/addresses/{network.pool.quarantine_address}"] = {"amount": held}
+    source.poll(_at("2026-09-27T01:01:00"))
+    source.poll(_at("2026-09-27T01:02:00"))
+    [finding] = store.findings()
+    assert finding.severity == rules.ALERT and "96 T2_ADAM_PASS surrendered" in finding.text
 
 
 def test_a_new_asset_under_a_watched_policy_is_read_from_its_first_mint(config, tmp_path):

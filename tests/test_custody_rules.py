@@ -648,6 +648,70 @@ def test_an_unrelated_transaction_is_not_a_finding(networks):
     assert rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"]) is None
 
 
+# A drain dressed as surrenders of passes that did not exist before: minted in the
+# surrender itself, or under a fresh name, while the collection policy can still mint.
+
+
+def _t2_surrender():
+    tx = copy.deepcopy(_tx("surrender_t2_pass"))
+    t2 = "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b9"
+    [unit] = {a["unit"] for o in tx["utxos"]["outputs"] for a in o["amount"] if a["unit"].startswith(t2)}
+    return tx, t2, unit
+
+
+def test_a_surrender_whose_pass_is_minted_in_the_same_transaction_is_critical(networks):
+    tx, t2, unit = _t2_surrender()
+    for spent in tx["utxos"]["inputs"]:
+        spent["amount"] = [a for a in spent["amount"] if a["unit"] != unit]
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL and finding.kind != "surrender"
+    assert f"mints or burns under policy {t2}" in finding.render()
+
+
+def test_a_surrender_of_a_pass_outside_the_pinned_names_is_critical(networks):
+    tx, t2, unit = _t2_surrender()
+    fresh = t2 + b"AdamPass9999".hex()
+    tx = json.loads(json.dumps(tx).replace(unit, fresh))
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL and finding.kind != "surrender"
+    assert "outside the pinned redeemable names" in finding.render()
+
+
+def test_a_redemption_by_policy_must_pin_its_redeemable_names():
+    doc = json.loads((FIX / "config.json").read_text())
+    del doc["cardano"][0]["surrender_pool"]["redemptions"][2]["asset_names"]
+    with pytest.raises(ValueError, match="FLUX_PASS"):
+        rules.parse_config(doc)
+
+
+def test_a_surrender_paying_more_than_the_ceiling_is_an_alert(networks):
+    network = networks["cardano-mainnet"]
+    pool = rules.SurrenderPool(**{**network.pool.__dict__, "max_payout": 100_000_000_000})
+    network = rules.CardanoNetwork(**{**network.__dict__, "pool": pool})
+    tx = _tx("surrender_t2_pass")
+    finding = rules.classify_cardano_tx(network, tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.ALERT
+    assert "above the per-surrender ceiling of 100,000.000000 cMATRA" in finding.render()
+
+
+def test_the_ceiling_is_read_from_the_config():
+    doc = json.loads((FIX / "config.json").read_text())
+    doc["cardano"][0]["surrender_pool"]["max_payout"] = 25_000_000_000_000
+    assert rules.parse_config(doc).cardano[0].pool.max_payout == 25_000_000_000_000
+
+
+def test_surrenders_beyond_the_rate_table_supply_alert(networks):
+    network = networks["cardano-mainnet"]
+    t2 = "06a64965c0ac1144a72a6ddfcb23aa9d4d7742a5b20ddd5cfb1164b9"
+    names = sorted(next(r for r in network.pool.redemptions if r.key == "T2_ADAM_PASS").asset_names)
+    at_supply = {t2 + name: 1 for name in names[:95]}
+    assert rules.redemption_overruns(network, {"lovelace": 5_000_000, **at_supply}) == []
+    [finding] = rules.redemption_overruns(network, {**at_supply, t2 + names[95]: 1})
+    assert finding.severity == rules.ALERT
+    assert finding.key == "cardano-mainnet:redeemed:T2_ADAM_PASS:96"
+    assert "96 T2_ADAM_PASS surrendered against a rate-table supply of 95" in finding.headline
+
+
 def _payment(network, address: str, lovelace: int = 1_000_000) -> dict:
     tx = {"hash": "bb" * 32, "block_height": 1, "block_time": 1_790_000_000, "valid_contract": True}
     payer = "addr_test1vz2fxv2umyhttkxyxp8x0dlpdt3k6cwng5pxj3jhsydzerspjrlsz"

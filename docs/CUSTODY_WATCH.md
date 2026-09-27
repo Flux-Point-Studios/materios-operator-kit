@@ -11,7 +11,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 | Cardano custody addresses | any outflow | any inflow | reads as a reference input |
 | Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
 | Cardano policies | mint or burn, as configured | as configured | |
-| Surrender pool | a spend that is not exactly a surrender: another redeemer, cMATRA to a non-claimant, an overpayment, non-cMATRA value moved, a continuing output without its datum, a custody wallet as claimant | an underpayment, an asset outside the rate table, value arriving outside a pool spend | a surrender paid exactly its rate-table entitlement |
+| Surrender pool | a spend that is not exactly a surrender: another redeemer, cMATRA to a non-claimant, an overpayment, non-cMATRA value moved, a continuing output without its datum, a custody wallet as claimant, any mint or burn in the spend, a surrendered unit outside its redemption's pinned asset names | an underpayment, an asset outside the rate table, a payout above `max_payout`, value arriving outside a pool spend, the quarantine address holding more of a redemption than its rate-table supply | a surrender paid exactly its rate-table entitlement |
 
 Each Materios page carries the decoded call tree, the signer, the derived multisig
 account and, while the node still holds the block's state, the dispatch result.
@@ -65,6 +65,12 @@ The configuration lives on the host that runs the watcher, never in this reposit
   ]
 }
 ```
+
+A redemption by `policy_id` must list the `asset_names` (hex) it redeems, pinned from
+the supply its rate was set for, so a collection policy that can still mint cannot make a
+fresh name redeemable; `max_payout` (cMATRA base units) is the per-surrender payout above
+which a surrender pages. A watched policy of more than ten assets has each asset's mint
+count read only when that asset's supply moves, and every count once an hour.
 
 `role` is `custody` (outflow CRITICAL, inflow ALERT) or `contract` (a spend at the
 address's own `severity`, a payment in as an ALERT). `materios.authority_accounts` lists

@@ -42,6 +42,7 @@ from daemon.substrate_client import SubstrateClient
 logger = logging.getLogger("custody_watch")
 
 DISCORD_LIMIT = 2000
+HOUR = 3600
 DAY = 86400
 
 
@@ -343,7 +344,7 @@ class Watch:
             error = store.get(f"health:{name}:error") or "no poll has completed"
             with store.transaction():
                 store.add(rules.Finding(
-                    rules.CRITICAL, f"custody-watch:{name}:stale:{int(last_ok)}:{int(overdue // 3600)}",
+                    rules.CRITICAL, f"custody-watch:{name}:stale:{int(last_ok)}:{int(overdue // HOUR)}",
                     f"custody-watch: {name} stale for {int(now - last_ok) // 60} min; "
                     f"moves on it are not being watched",
                     details=(f"last successful poll {_utc(last_ok)}", f"last error: {error}"), kind="watcher"), now)
@@ -625,6 +626,7 @@ class Blockfrost:
 
 PAGE = 100
 MAX_TX_PER_POLL = 200
+EXACT_POLICY_ASSETS = 10
 
 
 class CardanoSource:
@@ -709,8 +711,20 @@ class CardanoSource:
             baselined = marker is not None
             floor = int(marker) if baselined and marker.isdigit() else None
             cursors[self._policy_key(policy.policy_id)] = "baselined"
-            for asset in self._pages(f"/assets/policy/{policy.policy_id}"):
+            assets = list(self._pages(f"/assets/policy/{policy.policy_id}"))
+            # A mint count is one read per asset, so a large policy has its counts read
+            # only for an asset whose supply moved, and every asset's once an hour for a
+            # mint and burn that cancel out.
+            reconciled = f"cursor:{self.name}:reconciled:{policy.policy_id}"
+            every = len(assets) <= EXACT_POLICY_ASSETS or now - float(self._store.get(reconciled) or 0) >= HOUR
+            if every:
+                cursors[reconciled] = repr(now)
+            for asset in assets:
                 unit = asset["asset"]
+                supply = f"cursor:{self.name}:supply:{unit}"
+                cursors[supply] = asset["quantity"]
+                if not every and self._store.get(supply) == asset["quantity"]:
+                    continue
                 count = int(self._api.get(f"/assets/{unit}")["mint_or_burn_count"])
                 key = f"cursor:{self.name}:asset:{unit}"
                 seen = self._store.get(key)
@@ -728,10 +742,21 @@ class CardanoSource:
             self._classify(tx_hash, now, floor)
         if len(todo) > MAX_TX_PER_POLL:
             return False
+        overruns = self._redemption_overruns()
         with self._store.transaction():
             for key, value in cursors.items():
                 self._store.put(key, value)
+            for finding in overruns:
+                self._store.add(finding, now)
         return True
+
+    def _redemption_overruns(self) -> list[rules.Finding]:
+        pool = self._network.pool
+        if pool is None or pool.quarantine_address is None:
+            return []
+        holding = self._api.get(f"/addresses/{pool.quarantine_address}")
+        amounts = {a["unit"]: int(a["quantity"]) for a in holding["amount"]} if holding else {}
+        return rules.redemption_overruns(self._network, amounts)
 
     def _classify(self, tx_hash: str, now: float, floor: int | None) -> None:
         tx = self._api.get(f"/txs/{tx_hash}")

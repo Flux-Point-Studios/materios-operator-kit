@@ -86,6 +86,9 @@ class Redemption:
     denominator: int
     unit: str | None = None
     policy_id: str | None = None
+    # For a redemption by policy, the asset names (hex) it redeems: a collection policy
+    # that can still mint must not make a fresh name redeemable.
+    asset_names: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,7 @@ class SurrenderPool:
     redeemers: dict
     surrender_redeemer: str
     redemptions: tuple[Redemption, ...]
+    max_payout: int | None = None
 
 
 @dataclass(frozen=True)
@@ -181,11 +185,18 @@ def _parse_network(doc: dict, base_dir: Path | None) -> CardanoNetwork:
             quarantine_address=pool.get("quarantine_address"),
             redeemers={int(k): v for k, v in pool["redeemers"].items()},
             surrender_redeemer=pool["surrender_redeemer"],
-            redemptions=tuple(Redemption(r["key"], int(r["numerator"]), int(r["denominator"]),
-                                         r.get("unit"), r.get("policy_id"))
-                              for r in pool.get("redemptions", [])),
+            redemptions=tuple(_parse_redemption(doc["name"], r) for r in pool.get("redemptions", [])),
+            max_payout=pool.get("max_payout"),
         ) if pool else None,
     )
+
+
+def _parse_redemption(network: str, doc: dict) -> Redemption:
+    names = frozenset(doc.get("asset_names", ()))
+    if doc.get("policy_id") and not names:
+        raise ValueError(f"{network}: redemption {doc['key']} is by policy but pins no asset_names")
+    return Redemption(doc["key"], int(doc["numerator"]), int(doc["denominator"]),
+                      doc.get("unit"), doc.get("policy_id"), names)
 
 
 # --- Materios --------------------------------------------------------------------
@@ -659,23 +670,45 @@ class _Names:
         return ", ".join(parts) if parts else "nothing"
 
 
-def _entitlement(deposited: dict[str, int], redemptions: tuple[Redemption, ...]) -> tuple[int, dict[str, int], dict[str, int]]:
-    """(entitlement, count per redemption key, unrecognized units) for a quarantine deposit."""
+def _redemption_of(unit: str, redemptions: tuple[Redemption, ...]) -> Redemption | None:
+    return next((r for r in redemptions if unit == r.unit or (r.policy_id and unit[:56] == r.policy_id)), None)
+
+
+def _entitlement(deposited: dict[str, int], redemptions: tuple[Redemption, ...]
+                 ) -> tuple[int, dict[str, int], dict[str, int], dict[str, int]]:
+    """(entitlement, count per redemption key, units no redemption covers, units under a
+    redeemable policy but outside its pinned names) for a quarantine deposit."""
     counts: dict[str, int] = defaultdict(int)
     unknown: dict[str, int] = {}
-    by_unit = {r.unit: r for r in redemptions if r.unit}
-    by_policy = {r.policy_id: r for r in redemptions if r.policy_id}
+    unpinned: dict[str, int] = {}
     for unit, quantity in deposited.items():
         if unit == "lovelace" or quantity <= 0:
             continue
-        rule = by_unit.get(unit) or by_policy.get(unit[:56])
+        rule = _redemption_of(unit, redemptions)
         if rule is None:
             unknown[unit] = quantity
+        elif rule.policy_id and unit[56:] not in rule.asset_names:
+            unpinned[unit] = quantity
         else:
             counts[rule.key] += quantity
     rates = {r.key: r for r in redemptions}
     total = sum(counts[k] * rates[k].numerator // rates[k].denominator for k in counts)
-    return total, dict(counts), unknown
+    return total, dict(counts), unknown, unpinned
+
+
+def redemption_overruns(network: CardanoNetwork, holding: dict[str, int]) -> list[Finding]:
+    """An ALERT for each redemption of which the quarantine address, where every
+    surrendered unit stays, holds more than the supply its rate was set for."""
+    held: dict[str, int] = defaultdict(int)
+    for unit, quantity in holding.items():
+        rule = _redemption_of(unit, network.pool.redemptions)
+        if rule is not None:
+            held[rule.key] += quantity
+    return [Finding(ALERT, f"{network.name}:redeemed:{r.key}:{held[r.key]}",
+                    f"{network.name}: {held[r.key]:,} {r.key} surrendered against a rate-table supply of "
+                    f"{r.denominator:,}",
+                    details=("each surrender past that supply is paid from the other holders' share of the pool",))
+            for r in network.pool.redemptions if held[r.key] > r.denominator]
 
 
 def _redeemer_name(pool: SurrenderPool, json_value) -> str:
@@ -685,10 +718,15 @@ def _redeemer_name(pool: SurrenderPool, json_value) -> str:
     return f"unrecognized redeemer {json.dumps(json_value, default=str)[:80]}"
 
 
-def _classify_pool(network: CardanoNetwork, spent: list[dict], produced: list[dict],
-                   redeemers: list[dict], names: _Names) -> tuple[Severity, list[str], int]:
+def _classify_pool(network: CardanoNetwork, spent: list[dict], produced: list[dict], redeemers: list[dict],
+                   minted: dict[str, int], names: _Names) -> tuple[Severity, list[str], int]:
     pool = network.pool
     lines: list[tuple[Severity, str]] = []
+    by_policy: dict[str, dict[str, int]] = defaultdict(dict)
+    for unit, quantity in minted.items():
+        by_policy[unit[:56]][unit] = quantity
+    for policy_id, value in sorted(by_policy.items()):
+        lines.append((CRITICAL, f"{pool.label} spend mints or burns under policy {policy_id}: {names.value(value)}"))
     pool_in = [u for u in spent if u["address"] == pool.address]
     pool_out = [u for u in produced if u["address"] == pool.address]
 
@@ -733,9 +771,14 @@ def _classify_pool(network: CardanoNetwork, spent: list[dict], produced: list[di
     if pool.quarantine_address:
         deposited = _delta(_value([u for u in produced if u["address"] == pool.quarantine_address]),
                            _value([u for u in spent if u["address"] == pool.quarantine_address]))
-    entitlement, counts, unknown = _entitlement(deposited, pool.redemptions)
+    entitlement, counts, unknown, unpinned = _entitlement(deposited, pool.redemptions)
     if unknown:
         lines.append((ALERT, f"unrecognized asset surrendered: {names.value(unknown)}"))
+    if unpinned:
+        lines.append((CRITICAL, f"surrendered units outside the pinned redeemable names: {names.value(unpinned)}"))
+    if pool.max_payout is not None and paid > pool.max_payout:
+        lines.append((ALERT, f"payout {names.quantity(pool.cmatra_unit, paid)} is above the per-surrender ceiling "
+                             f"of {names.quantity(pool.cmatra_unit, pool.max_payout)}"))
     if paid <= 0 and not counts:
         lines.append((CRITICAL, f"{pool.label} spent without a surrender (cMATRA out {names.quantity(pool.cmatra_unit, paid)})"))
     elif paid > entitlement:
@@ -792,7 +835,7 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
 
     pool = network.pool
     if pool and any(u["address"] == pool.address for u in spent):
-        severity, pool_lines, paid = _classify_pool(network, spent, produced, redeemers, names)
+        severity, pool_lines, paid = _classify_pool(network, spent, produced, redeemers, minted, names)
         lines.extend((severity, t) for t in pool_lines)
         alone = True
         if severity == INFO:
