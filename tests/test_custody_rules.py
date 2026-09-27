@@ -292,6 +292,7 @@ def test_an_extrinsic_the_classifier_cannot_read_pages_critical_and_the_rest_are
     assert first.severity == rules.CRITICAL
     assert first.headline == "materios-preprod #9 extrinsic 0 could not be classified"
     assert "0x" + "ab" * 32 in first.render()
+    assert first.group == "materios-preprod unclassifiable"
     assert second.key == "materios-preprod:9:1" and second.severity == rules.CRITICAL
 
 

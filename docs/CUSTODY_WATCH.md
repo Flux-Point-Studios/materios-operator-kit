@@ -37,8 +37,8 @@ events cannot be read, every attempt pages as though it took effect.
 
 Pages go out most severe first, and within a severity a finding that pages alone goes
 before a group. Findings that anyone can cause cheaply are grouped: Materios findings
-by signer (unless an authority is involved) and Cardano payments into, or contract
-spends from, one address. Every pending finding of a group goes out as one message.
+by signer (unless an authority is involved), Cardano payments into, or contract
+spends from, one address, and anything unclassifiable, per source. Every pending finding of a group goes out as one message.
 Custody outflows, surrender-pool spends and watched-policy mints always page alone.
 
 A rate-limited webhook is left alone for its `Retry-After`; an unreachable webhook or a

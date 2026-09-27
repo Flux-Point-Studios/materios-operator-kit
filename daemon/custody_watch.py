@@ -792,7 +792,8 @@ class CardanoSource:
         try:
             finding = rules.classify_cardano_tx(self._network, tx, utxos, redeemers)
         except Exception as e:  # a transaction's contents are its builder's; none may stall the cursor
-            finding = rules.unclassifiable(f"{self.name}:{tx_hash}", f"{self.name} tx {tx_hash}", e)
+            finding = rules.unclassifiable(f"{self.name}:{tx_hash}", f"{self.name} tx {tx_hash}", e,
+                                           group=f"{self.name} unclassifiable")
         with self._store.transaction():
             self._store.mark_processed(f"{self.name}:{tx_hash}", now)
             if finding is not None:

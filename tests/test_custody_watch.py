@@ -951,6 +951,7 @@ def test_a_transaction_the_classifier_cannot_read_pages_critical_once(config, tm
     assert finding.severity == rules.CRITICAL
     assert finding.key == f"cardano-mainnet:{tx_hash}"
     assert "could not be classified" in finding.text and "TypeError" in finding.text
+    assert finding.group == "cardano-mainnet unclassifiable"
 
 
 def test_an_address_blockfrost_has_never_seen_has_no_transactions(config, tmp_path):

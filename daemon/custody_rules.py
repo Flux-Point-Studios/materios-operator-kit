@@ -565,11 +565,11 @@ def runtime_upgraded(header: dict) -> bool:
     return RUNTIME_ENVIRONMENT_UPDATED in header["digest"]["logs"]
 
 
-def unclassifiable(key: str, what: str, error: Exception, *details: str) -> Finding:
+def unclassifiable(key: str, what: str, error: Exception, *details: str, group: str | None = None) -> Finding:
     """The CRITICAL raised in place of a classification that failed, so the item is
     still paged and its cursor still moves."""
     return Finding(CRITICAL, key, f"{what} could not be classified",
-                   details=(*details, f"{type(error).__name__}: {error}"[:200]))
+                   details=(*details, f"{type(error).__name__}: {error}"[:200]), group=group)
 
 
 def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
@@ -595,7 +595,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
             finding = _classify_extrinsic(chain, number, index, ext, events, sudo_key, authorities)
         except Exception as e:  # argument values are the signer's choice; none may stall the block
             finding = unclassifiable(key, f"{chain} #{number} extrinsic {index}", e,
-                                     f"extrinsic hash {ext.get('extrinsic_hash')}")
+                                     f"extrinsic hash {ext.get('extrinsic_hash')}", group=f"{chain} unclassifiable")
         if finding is not None:
             findings.append(finding)
     return findings
