@@ -68,7 +68,7 @@ LoadCredential=config.json:/etc/custody-watch/config.json
 LoadCredential=blockfrost-mainnet.key:/etc/custody-watch/blockfrost-mainnet.key
 Environment=PYTHONDONTWRITEBYTECODE=1
 WorkingDirectory=/opt/custody-watch/src
-ExecStart=/opt/custody-watch/venv/bin/python -m daemon.custody_watch --config %d/config.json run
+ExecStart=/opt/custody-watch/venv/bin/python -m daemon.custody_watch run --config %d/config.json
 Restart=always
 RestartSec=30
 Nice=10
@@ -86,10 +86,11 @@ WantedBy=multi-user.target
 
 `LoadCredential` hands the service its config and keys in a directory only it can
 read (`%d`), where the config's relative `project_id_file` finds them.
-`custody-watch-failed.service` is a oneshot with the same `EnvironmentFile` and config
-credential running `python -m daemon.custody_watch --config %d/config.json page-failure
---unit custody-watch.service`, so a unit that exhausts its restarts pages too.
-`test-page` sends one message through the webhook to prove delivery end to end.
+`custody-watch-failed.service` is a oneshot with the same `EnvironmentFile` running
+`python -m daemon.custody_watch page-failure --unit custody-watch.service`, so a unit
+that exhausts its restarts pages too. It reads no config, so a config that keeps the
+watcher from starting cannot also keep that page from going out. `test-page` sends one
+message through the webhook to prove delivery end to end.
 
 ## Guarantees
 
@@ -110,8 +111,8 @@ credential running `python -m daemon.custody_watch --config %d/config.json page-
 ## Replaying history
 
 ```sh
-python -m daemon.custody_watch --config /etc/custody-watch/config.json \
-    backtest --days 30 --state /tmp/custody-backtest.db [--materios-rpc ws://<other node>:9944]
+python -m daemon.custody_watch backtest --config /etc/custody-watch/config.json \
+    --days 30 --state /tmp/custody-backtest.db [--materios-rpc ws://<other node>:9944]
 ```
 
 prints every finding the watcher would have raised over the window, one JSON object per

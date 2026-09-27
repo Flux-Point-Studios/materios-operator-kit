@@ -8,7 +8,7 @@ accepts them; INFO findings wait for the daily digest, whose arrival is also the
 proof that the watcher is alive. A source that cannot be read for longer than
 ``source_stale_seconds`` is itself paged.
 
-    python -m daemon.custody_watch --config /etc/custody-watch/config.json run
+    python -m daemon.custody_watch run --config /etc/custody-watch/config.json
 """
 
 from __future__ import annotations
@@ -720,25 +720,31 @@ def _backtest(config: rules.WatchConfig, days: int, state: str, materios_rpc: st
     return 0
 
 
+def _load_config(path: str) -> rules.WatchConfig:
+    config_path = Path(path)
+    return rules.parse_config(json.loads(config_path.read_text()), base_dir=config_path.parent)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="custody_watch", description=__doc__.splitlines()[0])
-    parser.add_argument("--config", required=True)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("run", help="watch and page until stopped")
+    watch = commands.add_parser("run", help="watch and page until stopped")
     replay = commands.add_parser("backtest", help="replay recent history, print findings, page nothing")
+    for command in (watch, replay):
+        command.add_argument("--config", required=True)
     replay.add_argument("--days", type=int, default=30)
     replay.add_argument("--state", required=True, help="a fresh SQLite file, never the live state")
     replay.add_argument("--materios-rpc", help="read Materios from this node instead of the configured one")
     commands.add_parser("test-page", help="send one test message through the webhook")
+    # Neither page reads the config, so a config that stops the watcher cannot also
+    # silence the page saying it stopped.
     failed = commands.add_parser("page-failure", help="page that a systemd unit failed (OnFailure hook)")
     failed.add_argument("--unit", required=True)
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    config_path = Path(args.config)
-    config = rules.parse_config(json.loads(config_path.read_text()), base_dir=config_path.parent)
     if args.command == "backtest":
-        return _backtest(config, args.days, args.state, args.materios_rpc)
+        return _backtest(_load_config(args.config), args.days, args.state, args.materios_rpc)
 
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
     if not webhook:
@@ -746,7 +752,7 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
     if args.command == "run":
-        return _run(config, webhook)
+        return _run(_load_config(args.config), webhook)
     if args.command == "test-page":
         message = {"content": f"\u2139\ufe0f custody-watch test page from {socket.gethostname()}",
                    "allowed_mentions": {"parse": []}}

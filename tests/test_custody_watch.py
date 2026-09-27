@@ -696,8 +696,43 @@ def test_run_refuses_to_start_without_a_webhook(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
     path = tmp_path / "config.json"
     path.write_text((FIX / "config.json").read_text())
-    assert cw.main(["--config", str(path), "run"]) == 2
+    assert cw.main(["run", "--config", str(path)]) == 2
     assert "DISCORD_WEBHOOK_URL" in capsys.readouterr().err
+
+
+def test_a_failed_unit_is_paged_without_reading_the_config_that_may_have_failed_it(monkeypatch):
+    posted = []
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.test/api/webhooks/1/token")
+    monkeypatch.setattr(cw.discord, "post_json", lambda url, payload: posted.append(payload))
+    assert cw.main(["page-failure", "--unit", "custody-watch.service"]) == 0
+    assert "custody-watch.service failed" in posted[0]["content"]
+    assert "NOT being watched" in posted[0]["content"]
+    assert posted[0]["allowed_mentions"] == {"parse": ["everyone"]}
+
+
+def test_a_test_page_needs_only_the_webhook(monkeypatch):
+    posted = []
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.test/api/webhooks/1/token")
+    monkeypatch.setattr(cw.discord, "post_json", lambda url, payload: posted.append(payload))
+    assert cw.main(["test-page"]) == 0
+    assert "custody-watch test page" in posted[0]["content"]
+    assert posted[0]["allowed_mentions"] == {"parse": []}
+
+
+def test_a_page_the_webhook_rejects_exits_nonzero(monkeypatch, capsys):
+    def reject(url, payload):
+        raise discord.DiscordError("webhook answered HTTP 403")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://discord.test/api/webhooks/1/token")
+    monkeypatch.setattr(cw.discord, "post_json", reject)
+    assert cw.main(["page-failure", "--unit", "custody-watch.service"]) == 1
+    assert "HTTP 403" in capsys.readouterr().err
+
+
+def test_watching_and_replaying_require_a_config():
+    for command in (["run"], ["backtest", "--state", "x.db"]):
+        with pytest.raises(SystemExit) as exit_:
+            cw.main(command)
+        assert exit_.value.code == 2
 
 
 def test_the_systemd_watchdog_is_pinged_through_the_notify_socket(tmp_path, monkeypatch):
