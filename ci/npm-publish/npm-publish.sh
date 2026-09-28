@@ -36,46 +36,74 @@ esac
 
 run() { "$BB" env -i PATH=/usr/local/bin:/usr/bin:/bin HOME="$work" "$@"; }
 
-work=$("$BB" mktemp -d)
+# Named in full: mktemp would otherwise create it under the step's TMPDIR, and npm reads the
+# .npmrc of the nearest directory above it that holds a package.json.
+work=$("$BB" mktemp -d /tmp/npm-publish.XXXXXX)
 trap '"$BB" rm -rf "$work"' EXIT
 cd "$work"
 (umask 077 && printf '//registry.npmjs.org/:_authToken=%s\n' "$PLUGIN_TOKEN" >"$work/npmrc")
 
-# Every tarball is checked before any is published.
+# npm reads a tarball's manifest with pacote, from whichever top directory holds it, and applies
+# every publishConfig key it knows as configuration: a scoped registry there wins over
+# --registry, and proxy or TLS keys reroute the request. The manifest is read here the same way,
+# and only access "public" and registry keys naming REGISTRY are admitted.
+MANIFEST='
+const pacote = require("/usr/local/lib/node_modules/npm/node_modules/pacote");
+const [tgz, registry] = process.argv.slice(1);
+const admitted = ([key, value]) =>
+  key === "access"
+    ? value === "public"
+    : /(^|:)registry$/.test(key) && (value === registry || value === registry.slice(0, -1));
+pacote
+  .manifest(tgz, { fullMetadata: true, fullReadJson: true })
+  .then((p) => {
+    const refused = Object.entries(p.publishConfig ?? {}).filter((entry) => !admitted(entry));
+    if (refused.length > 0) {
+      const listed = refused.map(([key, value]) => `${JSON.stringify(key)}: ${JSON.stringify(value)}`);
+      throw new Error(`publishConfig ${listed.join(", ")} is not admitted`);
+    }
+    console.log(p.name, p.version);
+  })
+  .catch((e) => {
+    console.error(`npm-publish: ${e.message}`);
+    process.exitCode = 1;
+  });
+'
+
+# Every tarball is checked before any is published. Other steps share $DIR and can run beside
+# this one, so each tarball is copied where only this container reaches, and the copy is what is
+# checked and published.
 checked=
+n=0
 for tgz in "$DIR"/*.tgz; do
   [ -e "$tgz" ] || continue
-  [ -f "$tgz" ] && [ ! -L "$tgz" ] || die "$tgz is not a regular file"
+  n=$((n + 1))
+  copy="$work/$n.tgz"
+  [ -f "$tgz" ] && [ ! -L "$tgz" ] && "$BB" cp -P "$tgz" "$copy" && [ -f "$copy" ] && [ ! -L "$copy" ] \
+    || die "$tgz is not a regular file"
+  fields=$(run node -e "$MANIFEST" "$copy" "$REGISTRY") || die "$tgz is refused"
   # One word per field: a value holding whitespace yields extra words and is refused.
-  fields=$("$BB" tar -xzOf "$tgz" package/package.json | run node -e '
-    let s = "";
-    process.stdin.on("data", (d) => (s += d)).on("end", () => {
-      const p = JSON.parse(s);
-      const r = (p.publishConfig || {}).registry;
-      console.log([p.name, p.version, r === undefined ? "-" : r].join(" "));
-    });') || die "$tgz does not hold a readable package/package.json"
   set -f
   set -- $fields
   set +f
-  [ "$#" = 3 ] || die "$tgz: name, version and publishConfig.registry must not contain whitespace"
-  name=$1 version=$2 registry=$3
+  [ "$#" = 2 ] || die "$tgz: name and version must not contain whitespace"
+  name=$1 version=$2
   scope=${name%%/*} base=${name#*/}
   case " $SCOPES " in *" $scope "*) ;; *) die "$tgz: $name is outside $SCOPES" ;; esac
   case "$base" in "" | *[!a-z0-9._-]*) die "$tgz: $name is not a package name" ;; esac
-  # A prerelease would need a dist-tag other than latest; none is published from here.
-  case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) die "$tgz: $version is not a release version" ;; esac
+  # pacote admits only a valid semver version. A prerelease would need a dist-tag other than
+  # latest; none is published from here.
   case "$version" in *[!0-9.]*) die "$tgz: $version is not a release version" ;; esac
-  case "$registry" in - | "${REGISTRY%/}" | "$REGISTRY") ;; *) die "$tgz: publishConfig.registry is $registry" ;; esac
-  checked="$checked$tgz $name@$version
+  checked="$checked$copy $name@$version
 "
 done
 [ -n "$checked" ] || { echo "npm-publish: nothing to publish in $DIR"; exit 0; }
 
-echo "$checked" | while read -r tgz package; do
-  [ -n "$tgz" ] || continue
+echo "$checked" | while read -r copy package; do
+  [ -n "$copy" ] || continue
   # Packing ran any package scripts already; publishing a tarball runs none, and
   # --ignore-scripts keeps it that way.
-  run npm publish "$tgz" --ignore-scripts --access public --registry "$REGISTRY" --userconfig "$work/npmrc" </dev/null \
+  run npm publish "$copy" --ignore-scripts --access public --registry "$REGISTRY" --userconfig "$work/npmrc" </dev/null \
     || die "npm did not publish $package"
   echo "npm-publish: published $package"
 done

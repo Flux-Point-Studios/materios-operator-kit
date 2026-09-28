@@ -29,7 +29,14 @@ mkdir -p /static
 cat >/static/busybox <<'EOF'
 #!/bin/sh
 echo "$*" >>/tmp/programs.log
-exec /bin/busybox "$@"
+case "$*" in
+  "env -i "*" node "*) [ -e /tmp/swap.tgz ] || exec /bin/busybox "$@" ;;
+  *) exec /bin/busybox "$@" ;;
+esac
+/bin/busybox "$@"
+status=$?
+for f in /tmp/pack/*.tgz; do cp /tmp/swap.tgz "$f"; done
+exit $status
 EOF
 chmod +x /static/busybox
 
@@ -40,7 +47,7 @@ pkg() {
   tar -C /tmp/pkg -czf "$DIR/$1" package
 }
 fresh() {
-  rm -rf "$DIR" /tmp/npm.log /tmp/programs.log /tmp/npm-fails /tmp/ran-* && mkdir -p "$DIR"
+  rm -rf "$DIR" /tmp/npm.log /tmp/programs.log /tmp/npm-fails /tmp/ran-* /tmp/swap.tgz /tmp/shared && mkdir -p "$DIR"
   : >/tmp/npm.log
   : >/tmp/programs.log
 }
@@ -54,6 +61,11 @@ ok() { echo "PASS $1"; }
 bad() { echo "FAIL $1"; sed 's/^/    /' /tmp/plugin.out; fails=$((fails + 1)); }
 says() { grep -q -- "$1" /tmp/plugin.out; }
 calls() { grep -c '^args ' /tmp/npm.log || true; }
+# What npm itself reported for its dry runs: the registries it published to, and the packages.
+registries() { sed -n 's/.*Publishing to \([^ ]*\) .*/\1/p' /tmp/plugin.out | sort -u | tr '\n' ' '; }
+names() { sed -n 's/^npm notice name: *//p' /tmp/plugin.out | sort | tr '\n' ' '; }
+# to_npmjs: npm published only to registry.npmjs.org, and found the token for it there.
+to_npmjs() { [ "$(registries)" = "https://registry.npmjs.org/ " ] && ! says "requires you to be logged in"; }
 # refuses NAME PATTERN [VAR=VALUE ...]: the run must fail naming PATTERN, without calling npm.
 refuses() {
   name=$1 pattern=$2
@@ -87,8 +99,11 @@ rc=$(grep '^rc ' /tmp/npm.log | sort -u)
 workdir=$(sed -n 's/^cwd //p' /tmp/npm.log | sort -u)
 [ "$rc" = "rc //registry.npmjs.org/:_authToken=$TOKEN" ] && ok "the token is bound to registry.npmjs.org and nothing else is configured" \
   || bad "the userconfig held: $rc"
-[ "$(grep '^args ' /tmp/npm.log | sort)" = "$(printf 'args publish %s --ignore-scripts --access public --registry https://registry.npmjs.org/ --userconfig %s/npmrc\n' "$DIR/a.tgz" "$workdir" "$DIR/b.tgz" "$workdir" | sort)" ] \
-  && ok "npm publishes each tarball without scripts, public, to registry.npmjs.org" || bad "npm was called otherwise: $(grep '^args ' /tmp/npm.log)"
+[ "$(grep '^args ' /tmp/npm.log | sort)" = "$(printf 'args publish %s --ignore-scripts --access public --registry https://registry.npmjs.org/ --userconfig %s/npmrc\n' "$workdir/1.tgz" "$workdir" "$workdir/2.tgz" "$workdir" | sort)" ] \
+  && ok "npm publishes a private copy of each tarball without scripts, public, to registry.npmjs.org" || bad "npm was called otherwise: $(grep '^args ' /tmp/npm.log)"
+to_npmjs && [ "$(names)" = "@fluxpointstudios/orynq-sdk-core @orynq/observe " ] \
+  && ok "npm reports publishing both packages to registry.npmjs.org with the token" || bad "npm reported $(names)to $(registries)"
+case "$workdir" in /tmp/npm-publish.*) ok "the work directory is the plugin's own" ;; *) bad "the work directory is $workdir" ;; esac
 [ "$(grep '^env ' /tmp/npm.log | cut -d= -f1 | sort -u | tr '\n' ' ')" = "env HOME env PATH env PWD env SHLVL " ] \
   && ok "npm runs with only the environment the plugin sets" || bad "npm saw: $(grep '^env ' /tmp/npm.log | cut -d= -f1 | sort -u | tr '\n' ' ')"
 [ ! -e "$workdir" ] && ok "the userconfig is removed" || bad "$workdir is left behind"
@@ -122,15 +137,111 @@ rejected() {
 rejected "a package outside the scopes is refused" "outside" '{"name":"@evil/observe","version":"1.0.0"}'
 rejected "an unscoped package is refused" "outside" '{"name":"observe","version":"1.0.0"}'
 rejected "a scope that only starts like an allowed one is refused" "outside" '{"name":"@orynqx/observe","version":"1.0.0"}'
-rejected "a name with a path in it is refused" "not a package name" '{"name":"@orynq/../observe","version":"1.0.0"}'
-rejected "a version that is not one is refused" "not a release version" '{"name":"@orynq/observe","version":"latest"}'
-rejected "a version with a shell character is refused" "not a release version" '{"name":"@orynq/observe","version":"1.0.0;x"}'
+rejected "a name with a path in it is refused" "Invalid name" '{"name":"@orynq/../observe","version":"1.0.0"}'
+rejected "a name with a capital is refused" "not a package name" '{"name":"@orynq/Observe","version":"1.0.0"}'
+rejected "a version that is not one is refused" "Invalid version" '{"name":"@orynq/observe","version":"latest"}'
+rejected "a version with a shell character is refused" "Invalid version" '{"name":"@orynq/observe","version":"1.0.0;x"}'
 rejected "a prerelease is refused" "not a release version" '{"name":"@orynq/observe","version":"1.0.0-rc.1"}'
-rejected "a field holding whitespace is refused" "whitespace" '{"name":"@orynq/observe","version":"1.0.0 2.0.0"}'
-rejected "a field holding a newline is refused" "whitespace" '{"name":"@orynq/observe\nx","version":"1.0.0"}'
-rejected "another publishConfig.registry is refused" "publishConfig.registry" \
-  '{"name":"@orynq/observe","version":"1.0.0","publishConfig":{"registry":"https://evil.example/"}}'
-rejected "a tarball without a package.json is refused" "readable package" 'not json'
+rejected "a version holding whitespace is refused" "Invalid version" '{"name":"@orynq/observe","version":"1.0.0 2.0.0"}'
+rejected "a name holding a newline is refused" "Invalid name" '{"name":"@orynq/observe\nx","version":"1.0.0"}'
+rejected "a package.json that is not JSON is refused" "Invalid package.json" 'not json'
+
+fresh
+pkg a.tgz '{"name":"@orynq/observe","version":"v1.0.0+build.1"}'
+if plugin && [ "$(calls)" = 1 ] && says "npm notice version: 1.0.0$" && says "published @orynq/observe@1.0.0$"; then
+  ok "the version is checked and reported as npm publishes it"
+else
+  bad "the version checked is not the one npm publishes"
+fi
+
+# npm applies every publishConfig key it knows as configuration, and a scoped registry there wins
+# over --registry: only access "public" and registry keys naming registry.npmjs.org over https
+# are admitted.
+for config in \
+  '"@orynq:registry":"http://127.0.0.1:9/"' \
+  '"@orynq:registry":"http://registry.npmjs.org/"' \
+  '"@fluxpointstudios:registry":"https://evil.example/"' \
+  '"@evil:registry":"http://127.0.0.1:9/"' \
+  '"registry":"https://evil.example/"' \
+  '"registry":"http://registry.npmjs.org/"' \
+  '"registry":"https://registry.npmjs.org.evil.example/"' \
+  '"scope":"@evil"' \
+  '"proxy":"http://127.0.0.1:9/"' \
+  '"https-proxy":"http://127.0.0.1:9/"' \
+  '"noproxy":"*"' \
+  '"strict-ssl":false' \
+  '"ca":"-----BEGIN CERTIFICATE-----"' \
+  '"cafile":"/tmp/ca.pem"' \
+  '"cert":"-----BEGIN CERTIFICATE-----"' \
+  '"key":"-----BEGIN PRIVATE KEY-----"' \
+  '"local-address":"127.0.0.1"' \
+  '"replace-registry-host":"never"' \
+  '"//registry.npmjs.org/:_authToken":"npm_other"' \
+  '"_auth":"eDp5"' \
+  '"tag":"next"' \
+  '"access":"restricted"'; do
+  rejected "publishConfig {$config} is refused" "${config%%\":*}\"" \
+    "{\"name\":\"@orynq/observe\",\"version\":\"1.0.0\",\"publishConfig\":{\"access\":\"public\",$config}}"
+done
+rejected "a publishConfig that is not an object is refused" "publishConfig" \
+  '{"name":"@orynq/observe","version":"1.0.0","publishConfig":"https://evil.example/"}'
+
+fresh
+pkg a.tgz '{"name":"@orynq/observe","version":"1.0.0","publishConfig":{"access":"public","registry":"https://registry.npmjs.org/","@orynq:registry":"https://registry.npmjs.org/","@fluxpointstudios:registry":"https://registry.npmjs.org"}}'
+if plugin && [ "$(calls)" = 1 ] && to_npmjs; then ok "registry keys naming registry.npmjs.org are admitted"
+else bad "registry keys naming registry.npmjs.org were not published there: $(registries)"; fi
+
+# npm reads the manifest of whichever top directory the tarball holds last, not only package/.
+# multi NAME JSON JSON: a tarball in $DIR whose package/ holds the first and zz/ the second.
+multi() {
+  rm -rf /tmp/pkg && mkdir -p /tmp/pkg/package /tmp/pkg/zz
+  printf '%s\n' "$2" >/tmp/pkg/package/package.json
+  printf '%s\n' "$3" >/tmp/pkg/zz/package.json
+  tar -C /tmp/pkg -czf "$DIR/$1" package zz
+}
+fresh
+multi x.tgz "$A" '{"name":"@orynq/other","version":"9.9.2","publishConfig":{"@orynq:registry":"http://127.0.0.1:9/"}}'
+refuses "a second top directory's publishConfig is checked as npm reads it" '"@orynq:registry"'
+fresh
+multi x.tgz "$A" '{"name":"@evil/observe","version":"9.9.2"}'
+refuses "a second top directory's package name is checked as npm reads it" "outside"
+
+# Other steps share the packed directory and may run beside this one.
+fresh
+pkg a.tgz "$A"
+pkg evil.tgz '{"name":"@orynq/other","version":"9.9.2","publishConfig":{"@orynq:registry":"http://127.0.0.1:9/"}}'
+mv "$DIR/evil.tgz" /tmp/swap.tgz
+if plugin && [ "$(calls)" = 1 ] && to_npmjs && [ "$(names)" = "@orynq/observe " ]; then
+  ok "a tarball replaced after its check is not what npm publishes"
+else
+  bad "after the swap npm published $(names)to $(registries)"
+fi
+
+# An .npmrc that would send npm elsewhere wherever npm read it.
+NPMRC='registry=http://127.0.0.1:9/
+@orynq:registry=http://127.0.0.1:9/
+proxy=http://127.0.0.1:9/'
+
+# npm reads the .npmrc of the nearest directory above it that holds a package.json.
+fresh
+mkdir -p /tmp/shared
+echo '{"name":"shared"}' >/tmp/shared/package.json
+printf '%s\n' "$NPMRC" >/tmp/shared/.npmrc
+pkg a.tgz "$A"
+if plugin TMPDIR=/tmp/shared && to_npmjs && ! grep -q '^cwd /tmp/shared' /tmp/npm.log; then
+  ok "TMPDIR does not choose where npm runs"
+else
+  bad "with TMPDIR set, npm ran in $(sed -n 's/^cwd //p' /tmp/npm.log) and published to $(registries)"
+fi
+
+# npm publishes a tarball without unpacking it where it reads configuration.
+fresh
+rm -rf /tmp/pkg && mkdir -p /tmp/pkg/package
+printf '%s\n' "$A" >/tmp/pkg/package/package.json
+printf '%s\n' "$NPMRC" >/tmp/pkg/package/.npmrc
+tar -C /tmp/pkg -czf "$DIR/a.tgz" package
+if plugin && [ "$(calls)" = 1 ] && to_npmjs; then ok "an .npmrc inside the tarball is not read"
+else bad "an .npmrc inside the tarball sent npm to $(registries)"; fi
 
 fresh
 pkg a.tgz "$A"

@@ -151,7 +151,7 @@
     {
       "id": "npm-publish-plugin",
       "name": "npm publish plugin",
-      "desc": "Woodpecker plugin that publishes npm tarballs an earlier step packed without the token, so no install, build or package script runs beside the npm token. With the token it runs only on the first run of a push pipeline of the default branch and refuses manual runs and restarts before any program starts, in a statically linked busybox that LD_PRELOAD cannot load code into. It checks every tarball before publishing any (scope @orynq or @fluxpointstudios, a release version, no other publishConfig.registry), then runs npm with an environment it sets, --ignore-scripts, and the token bound to registry.npmjs.org. Publishes orynq-sdk.",
+      "desc": "Woodpecker plugin that publishes npm tarballs an earlier step packed without the token, so no install, build or package script runs beside the npm token. With the token it runs only on the first run of a push pipeline of the default branch and refuses manual runs and restarts before any program starts, in a statically linked busybox that LD_PRELOAD cannot load code into. It copies every tarball where only its own container reaches and checks each copy before publishing any, reading the manifest with npm's own pacote as npm publish does: scope @orynq or @fluxpointstudios, a release version, and a publishConfig holding only access public and registry keys that name https://registry.npmjs.org. It then runs npm from a directory of its own under /tmp, with an environment it sets, --ignore-scripts, and the token bound to registry.npmjs.org. Publishes orynq-sdk.",
       "kind": "toolkit",
       "paths": [
         "ci/npm-publish"
