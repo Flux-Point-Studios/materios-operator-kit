@@ -5,7 +5,8 @@ decoded with the live runtime's metadata. Cardano fixtures are Blockfrost
 responses for real transactions; wallet (key-hash) credentials and transaction
 ids are pseudonymized, while contract addresses, policies, amounts, datums and
 redeemers are as they are on chain. The two custody-wallet fixtures also carry a
-synthetic block position, and the outflow synthetic amounts.
+synthetic block position, and the outflow synthetic amounts. The failed-script
+fixture is a preprod transaction exactly as Blockfrost serves it.
 """
 
 import copy
@@ -960,6 +961,76 @@ def test_value_arriving_at_a_custody_address_alone_is_an_alert(networks):
 def test_an_unrelated_transaction_is_not_a_finding(networks):
     tx = _tx("spo_registration")
     assert rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"]) is None
+
+
+# A transaction whose script fails phase 2 consumes its collateral instead of its inputs,
+# and produces its collateral return instead of its outputs. A custody key can sign one
+# on purpose, with the reserve as collateral and the collateral return paying it away.
+
+
+def _with_custody(network, address: str, label: str = "collateral-wallet"):
+    watched = rules.WatchedAddress(label=label, address=address, role="custody")
+    return rules.CardanoNetwork(**{**network.__dict__, "addresses": network.addresses + (watched,)})
+
+
+def _failed_script(mutate=lambda utxos: None):
+    """The real preprod transaction b9ebe459, whose script failed: db-sync stores the
+    collateral it consumed and the collateral return it produced as its inputs and outputs,
+    so Blockfrost lists them unflagged, and lists no redeemer."""
+    tx = copy.deepcopy(_tx("phase2_invalid_collateral"))
+    assert tx["tx"]["valid_contract"] is False and tx["redeemers"] == []
+    mutate(tx["utxos"])
+    return tx
+
+
+def _classify_failed(networks, tx):
+    network = _with_custody(networks["cardano-mainnet"], tx["utxos"]["inputs"][0]["address"])
+    return rules.classify_cardano_tx(network, tx["tx"], tx["utxos"], tx["redeemers"])
+
+
+def test_a_custody_utxo_a_failed_script_consumed_as_collateral_is_a_critical_outflow(networks):
+    tx = _failed_script()
+    assert not any(u["collateral"] for u in tx["utxos"]["inputs"] + tx["utxos"]["outputs"])
+    finding = _classify_failed(networks, tx)
+    assert finding.severity == rules.CRITICAL and finding.group is None
+    assert finding.details[0] == "outflow from collateral-wallet: net -10.000000 ADA"
+    assert finding.details[-1].startswith("phase-2 script failure")
+
+
+CMATRA_UNIT = "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241"
+
+
+def _reserve_as_collateral(utxos):
+    [collateral], [collateral_return] = utxos["inputs"], utxos["outputs"]
+    for row in (collateral, collateral_return):
+        row["amount"].append({"unit": CMATRA_UNIT, "quantity": "277500000000000"})
+
+
+def test_the_reserve_paid_away_through_a_collateral_return_is_named_in_the_outflow(networks):
+    finding = _classify_failed(networks, _failed_script(_reserve_as_collateral))
+    assert finding.severity == rules.CRITICAL and finding.group is None
+    assert finding.details[0] == "outflow from collateral-wallet: net -10.000000 ADA, -277,500,000.000000 cMATRA"
+
+
+def test_a_failed_scripts_collateral_listed_twice_counts_once_with_its_tokens(networks):
+    # Blockfrost documents ``collateral`` as marking the collateral a failed script
+    # consumed; its collateral listing carries lovelace alone. However a source lists the
+    # consumed collateral, flagged, unflagged or both, it is one outflow with every unit.
+    def listed_twice(utxos):
+        _reserve_as_collateral(utxos)
+        flagged = copy.deepcopy(utxos["inputs"][0])
+        flagged.update(collateral=True, amount=[a for a in flagged["amount"] if a["unit"] == "lovelace"])
+        utxos["inputs"].append(flagged)
+
+    finding = _classify_failed(networks, _failed_script(listed_twice))
+    assert finding.details[0] == "outflow from collateral-wallet: net -10.000000 ADA, -277,500,000.000000 cMATRA"
+
+
+def test_a_failed_script_never_counts_as_a_surrender(networks):
+    tx = copy.deepcopy(_tx("surrender_agent"))
+    tx["tx"]["valid_contract"] = False
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.kind != "surrender" and finding.amount == 0
 
 
 # A drain dressed as surrenders of passes that did not exist before: minted in the

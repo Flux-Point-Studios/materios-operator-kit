@@ -1002,11 +1002,32 @@ def _classify_pool(network: CardanoNetwork, spent: list[dict], produced: list[di
     return max(s for s, _ in lines), [t for _, t in lines], paid
 
 
+def _moved(rows: list[dict], valid: bool) -> list[dict]:
+    """The input or output rows of a transaction that the ledger consumed or produced.
+
+    A valid transaction's collateral is flagged ``collateral`` and stays unspent. A
+    transaction whose script failed moves only its collateral and collateral return;
+    db-sync stores those as its inputs and outputs, so Blockfrost lists them unflagged,
+    where its documentation has them flagged. Every row of such a transaction counts,
+    once per UTxO, as the row that lists the most units, since the flagged listing
+    carries lovelace alone."""
+    if valid:
+        return [u for u in rows if not u.get("reference") and not u.get("collateral")]
+    kept: dict[tuple, dict] = {}
+    for u in rows:
+        if u.get("reference"):
+            continue
+        at = (u.get("tx_hash"), u["output_index"])
+        if at not in kept or len(u["amount"]) > len(kept[at]["amount"]):
+            kept[at] = u
+    return list(kept.values())
+
+
 def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemers: list[dict]) -> Finding | None:
     valid = tx.get("valid_contract", True)
-    spent = [u for u in utxos["inputs"] if not u.get("reference") and bool(u.get("collateral")) != valid]
+    spent = _moved(utxos["inputs"], valid)
     referenced = [u for u in utxos["inputs"] if u.get("reference")]
-    produced = [u for u in utxos["outputs"] if bool(u.get("collateral")) != valid]
+    produced = _moved(utxos["outputs"], valid)
     names = _Names(network)
     lines: list[tuple[Severity, str]] = []
     kind, amount = "event", 0
@@ -1014,9 +1035,6 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
     # from a contract, is grouped with the others at that address; one that moves custody
     # or pool value or mints under a watched policy always pages alone.
     alone, label = False, None
-
-    if not valid:
-        lines.append((ALERT, "phase-2 script failure: only collateral moved"))
 
     for watched in network.addresses:
         out = _value([u for u in spent if u["address"] == watched.address])
@@ -1048,13 +1066,15 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
         severity, pool_lines, paid = _classify_pool(network, spent, produced, redeemers, minted, names)
         lines.extend((severity, t) for t in pool_lines)
         alone = True
-        if severity == INFO:
+        if severity == INFO and valid:
             kind, amount = "surrender", paid
     elif pool and any(u["address"] == pool.address for u in produced):
         received = _value([u for u in produced if u["address"] == pool.address])
         lines.append((ALERT, f"{pool.label} received value outside a pool spend: {names.value(received)}"))
         label = label or pool.label
 
+    if not valid:
+        lines.append((INFO, "phase-2 script failure: the ledger consumed the collateral in place of the inputs"))
     if not lines:
         return None
     when = datetime.fromtimestamp(tx["block_time"], timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")

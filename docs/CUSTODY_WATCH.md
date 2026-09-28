@@ -8,7 +8,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 | Source | CRITICAL (immediate, `@here`) | ALERT (immediate) | INFO (daily digest) |
 |---|---|---|---|
 | Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, a new genesis (chain reset), an extrinsic the runtime metadata cannot decode, the block's decode budget does not reach, or the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below) |
-| Cardano custody addresses | any outflow | any inflow | reads as a reference input |
+| Cardano custody addresses | any outflow, collateral a failed script consumed included | any inflow | reads as a reference input |
 | Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
 | Cardano policies | mint or burn, as configured | as configured | |
 | Surrender pool | a spend that is not exactly a surrender: another redeemer, cMATRA to a non-claimant, an overpayment, non-cMATRA value moved, a continuing output without its datum, a custody wallet as claimant, any mint or burn in the spend, a surrendered unit outside its redemption's pinned asset names | an underpayment, an asset outside the rate table, a payout above `max_payout`, value arriving outside a pool spend, the quarantine address holding more of a redemption than its rate-table supply | a surrender paid exactly its rate-table entitlement |
@@ -26,6 +26,14 @@ pinned runtime is in the severity table or the routine list, and a test holds it
 a call a runtime upgrade adds pages as an ALERT until it is classified. Text from the
 chain is rendered as JSON with every backtick replaced, so it can never close the
 page's code block or format itself outside it.
+
+A Cardano transaction whose script fails phase 2 consumes its collateral in place of its
+inputs and produces its collateral return in place of its outputs, so a custody key can
+move the reserve through one on purpose. db-sync stores that collateral and return as the
+transaction's inputs and outputs, and Blockfrost lists them without the `collateral`
+flag its documentation describes; for such a transaction the watcher counts every input
+and output row it is given, once per UTxO, so the outflow pages CRITICAL with what left
+whichever way the rows are flagged. It never counts as a surrender.
 
 Root comes only from `Sudo`, and `Sudo` dispatches only for `Sudo.Key`, so a root-gated
 call reached from any other account cannot take effect. Once the block's events are
