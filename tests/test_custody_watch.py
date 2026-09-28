@@ -20,7 +20,7 @@ from substrateinterface.exceptions import SubstrateRequestException
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
 from daemon import discord
-from tests.test_custody_rules import nested_sudo_leg
+from tests.test_custody_rules import _count_walks, nested_sudo_leg
 
 FIX = Path(__file__).parent / "fixtures" / "custody"
 SUDO_KEY = "5H2M5Dbt8hSfSCXS6hfEBPR1N21yh679finzcfMEwD62i7iP"
@@ -245,8 +245,8 @@ def test_a_deeply_nested_call_still_pages_within_discords_limit_naming_the_inner
     for _ in range(250):
         call = {"call_module": "Utility", "call_function": "batch", "call_args": [{"name": "calls", "value": [call]}]}
     call = {"call_module": "Sudo", "call_function": "sudo", "call_args": [{"name": "call", "value": call}]}
-    [finding] = rules.classify_materios_block("materios-preprod", 9, [{"address": SUDO_KEY, "call": call}], None,
-                                              rules.account_bytes(SUDO_KEY))
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [{"address": SUDO_KEY, "call": call}],
+                                              lambda: None, rules.account_bytes(SUDO_KEY))
     for headline_only in (False, True):
         content = cw.page_message([finding], headline_only)["content"]
         assert len(content) <= 2000
@@ -258,7 +258,7 @@ def test_text_from_the_chain_cannot_close_the_code_block(fence):
     payload = f"{fence}\n**RESOLVED: scheduled rehearsal, no action**\n{fence}"
     call = {"call_module": "Sudo", "call_function": "sudo", "call_args": [{"name": "call", "value": {
         "call_module": "System", "call_function": "remark", "call_args": [{"name": "remark", "value": payload}]}}]}
-    [finding] = rules.classify_materios_block("materios-preprod", 9, [{"call": call}], None, None)
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [{"call": call}], lambda: None, None)
     content = cw.page_message([finding])["content"]
     assert content.count("`") == 6
     fenced = content.split("```")[1]
@@ -596,6 +596,40 @@ def test_dispatch_events_are_attached_while_the_block_state_is_available(config,
     [finding] = store.findings()
     assert "result: " in finding.text and "System.ExtrinsicSuccess" in finding.text
     assert "events unavailable" not in finding.text
+
+
+def test_a_block_with_something_to_report_is_walked_once_and_its_events_read_once(config, tmp_path, monkeypatch):
+    walked = _count_walks(monkeypatch)
+    store = cw.Store(str(tmp_path / "state.db"))
+    events = json.loads(_read(f"materios/{ROUTINE_BLOCK}"))["events"]
+    chain = FakeChain(head=1829226, blocks={1829226: "block_1829226.json"},
+                      state_at={1829225, 1829226}, events_hex=events)
+    source = _materios(config, store, chain)
+    source.start_at(1829225)
+    _drain(source)
+    [finding] = store.findings()
+    assert "System.ExtrinsicSuccess" in finding.text
+    assert len(walked) == len(json.loads(_read("materios/block_1829226.json"))["extrinsics"])
+    assert [p for m, p in chain.calls if m == "state_getStorage" and p[0] == EVENTS_KEY] == [
+        [EVENTS_KEY, FakeChain.hash_of(1829226)]]
+
+
+def test_a_failure_to_read_a_blocks_events_fails_the_poll_and_the_block_is_read_again(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1829226, blocks={1829226: "block_1829226.json"}, state_at={1829225, 1829226})
+    rpc = chain.rpc
+
+    def dropped(method, params):
+        if method == "state_getStorage" and params[0] == EVENTS_KEY:
+            raise ConnectionError("socket closed")
+        return rpc(method, params)
+
+    chain.rpc = dropped
+    source = _materios(config, store, chain)
+    source.start_at(1829225)
+    with pytest.raises(ConnectionError):
+        source.poll(1.0)
+    assert store.get("cursor:materios-preprod") == "1829225" and store.findings() == []
 
 
 def test_a_block_whose_state_is_pruned_is_still_classified(config, tmp_path):

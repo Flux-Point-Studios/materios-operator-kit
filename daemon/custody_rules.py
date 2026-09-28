@@ -28,6 +28,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 from scalecodec.base import RuntimeConfigurationObject, ScaleBytes
 from scalecodec.type_registry import load_type_registry_preset
@@ -617,15 +618,17 @@ def unclassifiable(key: str, what: str, error: Exception, *details: str, group: 
 
 
 def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
-                            events: dict[int, list[str]] | None, sudo_key: bytes | None,
+                            read_events: Callable[[], dict[int, list[str]] | None], sudo_key: bytes | None,
                             authorities: frozenset[bytes] = frozenset()) -> list[Finding]:
-    """Findings for a block's extrinsics. ``events`` is the block's events by extrinsic,
-    or None when they could not be read: an attempt is then paged as though it took
-    effect, since nothing shows it failed."""
+    """Findings for a block's extrinsics, each call tree walked once. ``read_events``
+    returns the block's events by extrinsic, or None when they could not be read, and is
+    called once, only when an extrinsic has something to report. Without events an
+    attempt is paged as though it took effect, since nothing shows it failed."""
     findings = []
     # What cannot be read may hide any call, so it pages CRITICAL; grouped, because
     # anyone can send it.
     unreadable = f"{chain} unclassifiable"
+    reported = []
     for index, ext in enumerate(extrinsics):
         key = f"{chain}:{number}:{index}"
         if "undecodable" in ext:
@@ -637,22 +640,24 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
                 group=unreadable,
             ))
             continue
+        signer = _account(ext.get("address"))
+        tree = _Tree(sudo_key, authorities | ({sudo_key} if sudo_key else frozenset()))
         try:
-            finding = _classify_extrinsic(chain, number, index, ext, events, sudo_key, authorities)
+            _walk(ext["call"], signer, tree, 0, (), False, True)
         except Exception as e:  # argument values are the signer's choice; none may stall the block
-            finding = unclassifiable(key, f"{chain} #{number} extrinsic {index}", e,
-                                     f"extrinsic hash {ext.get('extrinsic_hash')}", group=unreadable)
-        if finding is not None:
-            findings.append(finding)
+            findings.append(unclassifiable(key, f"{chain} #{number} extrinsic {index}", e,
+                                           f"extrinsic hash {ext.get('extrinsic_hash')}", group=unreadable))
+            continue
+        if tree.sites or (signer is not None and signer == sudo_key):
+            reported.append((index, ext, signer, tree))
+    events = read_events() if reported else None
+    findings.extend(_report(chain, number, index, ext, signer, tree, events) for index, ext, signer, tree in reported)
     return findings
 
 
-def _classify_extrinsic(chain: str, number: int, index: int, ext: dict, events: dict[int, list[str]] | None,
-                        sudo_key: bytes | None, authorities: frozenset[bytes]) -> Finding | None:
+def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None, tree: _Tree,
+            events: dict[int, list[str]] | None) -> Finding:
     address = ext.get("address")
-    signer = _account(address)
-    tree = _Tree(sudo_key, authorities | ({sudo_key} if sudo_key else frozenset()))
-    _walk(ext["call"], signer, tree, 0, (), False, True)
     # Every applied extrinsic has events, so one with none is as unverified as a block
     # whose events could not be read.
     own = None if events is None else events.get(index)
@@ -660,9 +665,7 @@ def _classify_extrinsic(chain: str, number: int, index: int, ext: dict, events: 
     # key this watcher last read.
     if own is not None and any(e.startswith("Sudo.") for e in own):
         tree.involved = True
-    by_sudo = signer is not None and signer == sudo_key
-    if not tree.sites and not by_sudo:
-        return None
+    by_sudo = signer is not None and signer == tree.sudo_key
 
     if address is None:
         notes = ["unsigned"]

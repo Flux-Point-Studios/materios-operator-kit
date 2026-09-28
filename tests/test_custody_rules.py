@@ -44,7 +44,7 @@ def _findings(decoder, name: str, sudo_key: str | None = SUDO_KEY):
     extrinsics = decoder.extrinsics(block["extrinsics"])
     return rules.classify_materios_block(
         "materios-preprod", block["number"], extrinsics,
-        events=None, sudo_key=rules.account_bytes(sudo_key) if sudo_key else None,
+        read_events=lambda: None, sudo_key=rules.account_bytes(sudo_key) if sudo_key else None,
     )
 
 
@@ -129,7 +129,7 @@ def test_an_extrinsic_the_runtime_metadata_cannot_decode_pages_critical_grouped_
     garbage = "0x" + (bytes([12, 4, 0xFE, 0x01]) + bytes(2)).hex()
     extrinsics = decoder.extrinsics(block["extrinsics"] + [garbage])
     [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
-                                              events=None, sudo_key=None)
+                                              read_events=lambda: None, sudo_key=None)
     assert finding.severity == rules.CRITICAL
     assert finding.group == "materios-preprod unclassifiable"
     assert finding.key == f"materios-preprod:{block['number']}:{len(block['extrinsics'])}"
@@ -162,7 +162,8 @@ def test_a_sudo_leg_nested_as_deep_as_a_runtime_decodes_is_read_and_named(decode
         assert leg == _block("block_1829210.json")["extrinsics"][2]
     [ext] = decoder.extrinsics([leg])
     assert "undecodable" not in ext
-    [finding] = rules.classify_materios_block("materios-preprod", 9, [ext], None, rules.account_bytes(SUDO_KEY))
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [ext], lambda: None,
+                                              rules.account_bytes(SUDO_KEY))
     text = finding.render()
     assert finding.severity == rules.CRITICAL and finding.group is None
     assert finding.headline.endswith("System.authorize_upgrade")
@@ -191,15 +192,51 @@ def test_dispatch_results_are_attached_to_the_alert(decoder):
     extrinsics = decoder.extrinsics(block["extrinsics"])
     events = {2: ["Multisig.MultisigExecuted(result=Ok)", "Sudo.Sudid(sudo_result=Ok)", "System.UpgradeAuthorized"]}
     [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
-                                              events=events, sudo_key=rules.account_bytes(SUDO_KEY))
+                                              read_events=lambda: events, sudo_key=rules.account_bytes(SUDO_KEY))
     assert "Sudo.Sudid(sudo_result=Ok)" in finding.render()
+
+
+def _count_walks(monkeypatch) -> list[str]:
+    """The calls ``_walk`` is entered with at the top of an extrinsic's tree, as they come."""
+    walked = []
+    walk = rules._walk
+
+    def counting(call, origin, tree, depth, *rest):
+        if depth == 0:
+            walked.append(f"{call['call_module']}.{call['call_function']}")
+        return walk(call, origin, tree, depth, *rest)
+
+    monkeypatch.setattr(rules, "_walk", counting)
+    return walked
+
+
+def test_events_are_read_once_and_only_for_a_block_with_something_to_report(decoder, monkeypatch):
+    walked = _count_walks(monkeypatch)
+    reads = []
+
+    def read_events():
+        reads.append(True)
+        return {2: ["Multisig.MultisigExecuted(result=Ok)", "Sudo.Sudid(sudo_result=Ok)", "System.ExtrinsicSuccess"]}
+
+    block = _block("block_1829226.json")
+    extrinsics = decoder.extrinsics(block["extrinsics"])
+    [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics, read_events,
+                                              rules.account_bytes(SUDO_KEY))
+    assert "Sudo.Sudid(sudo_result=Ok)" in finding.render()
+    assert len(reads) == 1 and len(walked) == len(extrinsics)
+
+    reads.clear()
+    routine = decoder.extrinsics(_block("block_2029707.json")["extrinsics"])
+    assert rules.classify_materios_block("materios-preprod", 2029707, routine, read_events,
+                                         rules.account_bytes(SUDO_KEY)) == []
+    assert reads == []
 
 
 def test_a_block_whose_state_is_pruned_says_so(decoder):
     block = _block("block_1829226.json")
     extrinsics = decoder.extrinsics(block["extrinsics"])
     [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
-                                              events=None, sudo_key=None)
+                                              read_events=lambda: None, sudo_key=None)
     assert "events unavailable" in finding.render()
 
 
@@ -234,13 +271,13 @@ ALICE = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 )
 def test_privileged_calls_without_history_are_classified(call, severity):
     [finding] = rules.classify_materios_block("materios-preprod", 1, [{"address": ALICE, "call": call}],
-                                              events=None, sudo_key=None)
+                                              read_events=lambda: None, sudo_key=None)
     assert finding.severity == severity
 
 
 def test_anything_signed_by_the_sudo_key_is_critical():
     ext = _signed(SUDO_KEY, "Balances", "transfer_keep_alive", dest=ALICE, value=1)
-    [finding] = rules.classify_materios_block("materios-preprod", 1, [ext], events=None,
+    [finding] = rules.classify_materios_block("materios-preprod", 1, [ext], read_events=lambda: None,
                                               sudo_key=rules.account_bytes(SUDO_KEY))
     assert finding.severity == rules.CRITICAL
     assert "signed by Sudo.Key" in finding.render()
@@ -249,7 +286,7 @@ def test_anything_signed_by_the_sudo_key_is_critical():
 def test_a_multisig_that_is_not_sudo_and_wraps_nothing_privileged_is_ignored():
     ext = _signed(ALICE, "Multisig", "as_multi_threshold_1", other_signatories=[SUDO_KEY],
                   call=_call("Balances", "transfer_keep_alive", dest=ALICE, value=1))
-    assert rules.classify_materios_block("materios-preprod", 1, [ext], events=None,
+    assert rules.classify_materios_block("materios-preprod", 1, [ext], read_events=lambda: None,
                                          sudo_key=rules.account_bytes(SUDO_KEY)) == []
 
 
@@ -271,7 +308,7 @@ TEXT_THAT_LOOKS_LIKE_HEX = "0x" + "a" * 199 + "z"
 
 
 def _classify_extrinsics(extrinsics, events=None, sudo_key=SUDO_KEY):
-    return rules.classify_materios_block("materios-preprod", 9, extrinsics, events=events,
+    return rules.classify_materios_block("materios-preprod", 9, extrinsics, read_events=lambda: events,
                                          sudo_key=rules.account_bytes(sudo_key) if sudo_key else None)
 
 
@@ -470,7 +507,7 @@ def test_a_key_change_by_an_earlier_sudo_key_still_pages_critical(decoder):
     [index] = [i for i, e in enumerate(extrinsics) if e.get("address")]
     events = {index: ["Multisig.MultisigExecuted(result=Ok)", "Sudo.KeyChanged", "System.ExtrinsicSuccess"]}
     [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
-                                              events=events, sudo_key=rules.account_bytes(SUDO_KEY))
+                                              read_events=lambda: events, sudo_key=rules.account_bytes(SUDO_KEY))
     assert finding.severity == rules.CRITICAL
     assert "Sudo.set_key" in finding.render()
 
@@ -485,7 +522,7 @@ def test_the_sudo_multisigs_failed_call_still_pages_critical(decoder):
     extrinsics = decoder.extrinsics(block["extrinsics"])
     events = {2: ["Multisig.MultisigExecuted(result=Err:{\"Module\": {}})", "System.ExtrinsicSuccess"]}
     [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
-                                              events=events, sudo_key=rules.account_bytes(SUDO_KEY))
+                                              read_events=lambda: events, sudo_key=rules.account_bytes(SUDO_KEY))
     assert finding.severity == rules.CRITICAL
 
 
@@ -535,7 +572,7 @@ def test_an_ordinary_account_creating_its_own_recovery_is_an_alert():
     ],
 )
 def test_recovery_that_touches_an_authority_account_is_critical(ext, authorities):
-    [finding] = rules.classify_materios_block("materios-preprod", 9, [ext], events=SUCCEEDED,
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [ext], read_events=lambda: SUCCEEDED,
                                               sudo_key=rules.account_bytes(SUDO_KEY),
                                               authorities=frozenset(map(rules.account_bytes, authorities)))
     assert finding.severity == rules.CRITICAL

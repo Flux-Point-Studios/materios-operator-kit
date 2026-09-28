@@ -629,13 +629,9 @@ class MateriosSource:
             self._decoder = self._load_decoder(header["parentHash"])
         decoder = self._decoder
         extrinsics = decoder.extrinsics(block["extrinsics"])
-        findings = rules.classify_materios_block(self.name, number, extrinsics, None, sudo_key, self._authorities)
-        if findings:
-            events = self._events(block_hash, decoder)
-            if events is not None:
-                findings = rules.classify_materios_block(self.name, number, extrinsics, events, sudo_key,
-                                                         self._authorities)
-
+        findings = rules.classify_materios_block(self.name, number, extrinsics,
+                                                 lambda: self._events(block_hash, decoder), sudo_key,
+                                                 self._authorities)
         try:
             committee = rules.committee_of(extrinsics)
         except Exception as e:  # the inherent's shape is the block author's; it must not stall the cursor
