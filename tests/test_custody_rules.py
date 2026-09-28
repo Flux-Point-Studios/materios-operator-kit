@@ -10,11 +10,13 @@ synthetic block position, and the outflow synthetic amounts.
 
 import copy
 import gzip
+import hashlib
 import json
 import tracemalloc
 from pathlib import Path
 
 import pytest
+import scalecodec.types
 
 from daemon import custody_rules as rules
 
@@ -132,8 +134,11 @@ def test_an_extrinsic_the_runtime_metadata_cannot_decode_pages_critical_grouped_
                                               read_events=lambda: None, sudo_key=None)
     assert finding.severity == rules.CRITICAL
     assert finding.group == "materios-preprod unclassifiable"
-    assert finding.key == f"materios-preprod:{block['number']}:{len(block['extrinsics'])}"
-    assert "could not be decoded" in finding.render()
+    assert finding.key == f"materios-preprod:{block['number']}:undecoded"
+    assert finding.headline == f"materios-preprod #{block['number']}: 1 extrinsic could not be decoded"
+    assert finding.details == (f"extrinsic {len(block['extrinsics'])}: 6 bytes blake2_256 "
+                               f"0x{hashlib.blake2b(bytes.fromhex(garbage[2:]), digest_size=32).hexdigest()}: "
+                               f"{extrinsics[-1]['error']}",)
 
 
 UTILITY_BATCH = bytes([8, 0])
@@ -172,6 +177,131 @@ def test_a_sudo_leg_nested_as_deep_as_a_runtime_decodes_is_read_and_named(decode
     # the finding stays small.
     assert SPEC_238_CODE_HASH in "\n".join(finding.details[:5])
     assert len(text) < 20_000
+
+
+LEG_BLOCK = "block_1829210.json"
+# Where the propose leg's call begins: after its compact length, version byte,
+# MultiAddress::Id tag, signer, signature and signed extensions.
+LEG_CALL_AT = 103
+SUDO_SUDO, SUDO_UNCHECKED_WEIGHT = bytes([6, 0]), bytes([6, 1])
+SYSTEM_REMARK, SYSTEM_SET_CODE, SYSTEM_KILL_STORAGE = bytes([0, 0]), bytes([0, 2]), bytes([0, 5])
+STRANGER = bytes(range(32))
+
+
+def signed_extrinsic(call: bytes, signer: bytes) -> str:
+    """``call`` behind the propose leg's version byte, signature and signed extensions, with
+    ``signer`` as its signer. The watcher reads a signature but never checks it."""
+    raw = bytes.fromhex(_block(LEG_BLOCK)["extrinsics"][2][2:])
+    body = raw[2:4] + signer + raw[36:LEG_CALL_AT] + call
+    return "0x" + (rules._compact(len(body)) + body).hex()
+
+
+def filler_call(shape: str, size: int) -> bytes:
+    """A call of about ``size`` bytes that any funded account can have finalized: an inert
+    Sudo.sudo_unchecked_weight(System.kill_storage) of empty keys, which costs no weight;
+    a Utility.batch of empty remarks; or a Sudo.sudo(System.set_code) of code-sized bytes."""
+    if shape == "keys":
+        return SUDO_UNCHECKED_WEIGHT + SYSTEM_KILL_STORAGE + rules._compact(size) + bytes(size) + bytes(2)
+    if shape == "remarks":
+        return UTILITY_BATCH + rules._compact(size // 3) + (SYSTEM_REMARK + rules._compact(0)) * (size // 3)
+    return SUDO_SUDO + SYSTEM_SET_CODE + rules._compact(size) + b"\xff" * size
+
+
+def test_a_signed_extrinsic_is_rebuilt_byte_for_byte_from_its_call_and_signer():
+    leg = _block(LEG_BLOCK)["extrinsics"][2]
+    raw = bytes.fromhex(leg[2:])
+    assert signed_extrinsic(raw[LEG_CALL_AT:], raw[4:36]) == leg
+
+
+@pytest.mark.parametrize("shape", ["keys", "remarks", "code"])
+def test_a_block_filled_to_its_length_limit_is_read_within_the_decode_budget(decoder, shape):
+    block = _block(LEG_BLOCK)
+    size = NORMAL_BLOCK_LENGTH - 1024
+    hexes = [*block["extrinsics"][:2], signed_extrinsic(filler_call(shape, size), STRANGER),
+             *block["extrinsics"][2:]]
+    before = decoder.values
+
+    def classify():
+        return rules.classify_materios_block("materios-preprod", block["number"], decoder.extrinsics(hexes),
+                                             lambda: None, rules.account_bytes(SUDO_KEY))
+
+    findings, peak = _peak_memory(classify)
+    found = {f.key.rsplit(":", 1)[1]: f for f in findings}
+    assert found["3"].severity == rules.CRITICAL and found["3"].headline.endswith("System.authorize_upgrade")
+    if shape == "code":
+        assert found["2"].headline.endswith("Sudo.sudo > System.set_code")
+        assert f"<{size} bytes blake2_256" in found["2"].render()
+    else:
+        assert found["undecoded"].severity == rules.CRITICAL
+        assert found["undecoded"].details[0].startswith("extrinsic 2: ")
+        assert "DecodeBudgetExceeded" in found["undecoded"].details[0]
+    assert peak < 64 * 1024 * 1024
+    assert decoder.values - before <= rules.DECODE_BUDGET
+
+
+def test_decoding_a_batch_hashes_each_call_once_not_every_byte_after_it(decoder, monkeypatch):
+    # scalecodec hashes every call it decodes; left alone it hashes from the call's start
+    # to the end of the extrinsic, so a batch's decode grows with its length squared.
+    hashed = []
+
+    def counting(data, digest_size):
+        hashed.append(len(data))
+        return hashlib.blake2b(b"", digest_size=digest_size)
+
+    monkeypatch.setattr(scalecodec.types, "blake2b", counting)
+    extrinsic = signed_extrinsic(filler_call("remarks", 9_000), STRANGER)
+    [ext] = decoder.extrinsics([extrinsic])
+    assert "undecodable" not in ext and len(rules._args(ext["call"])["calls"]) == 3_000
+    # Each byte once in its own call, once in the extrinsic's call and once in the extrinsic.
+    assert sum(hashed) <= 3 * (len(extrinsic) - 2) // 2
+
+
+def test_decoding_stops_where_the_blocks_budget_runs_out(decoder, monkeypatch):
+    monkeypatch.setattr(rules, "DECODE_BUDGET", 200)
+    leg = _block(LEG_BLOCK)["extrinsics"][2]
+    filler = signed_extrinsic(filler_call("keys", 1000), STRANGER)
+    before = decoder.values
+    decoded_filler, decoded_leg = decoder.extrinsics([filler, leg])
+    assert decoded_filler["undecodable"] == filler
+    assert decoded_filler["error"] == "DecodeBudgetExceeded: stopped at the budget of 200 decoded values per block"
+    assert decoded_leg["call"]["call_module"] == "Multisig"
+    assert decoder.values - before == 200
+
+
+def test_a_blocks_inherents_are_decoded_before_any_signed_extrinsic_however_small(decoder, monkeypatch):
+    # The timestamp, committee rotation and block beneficiary inherents decode into 74 values.
+    monkeypatch.setattr(rules, "DECODE_BUDGET", 80)
+    remark = signed_extrinsic(SYSTEM_REMARK + rules._compact(0), STRANGER)
+    extrinsics = decoder.extrinsics(_block("block_2029707.json")["extrinsics"] + [remark] * 10)
+    assert rules.committee_of(extrinsics) is not None
+    assert sum("undecodable" in e for e in extrinsics) == 10
+
+
+def test_what_the_budget_did_not_reach_pages_as_one_critical_finding_per_block(decoder, monkeypatch):
+    monkeypatch.setattr(rules, "DECODE_BUDGET", 100)
+    fillers = [signed_extrinsic(filler_call("keys", 1000 + i), STRANGER) for i in range(30)]
+    extrinsics = decoder.extrinsics(_block("block_2029707.json")["extrinsics"] + fillers)
+    [finding] = rules.classify_materios_block("materios-preprod", 2029707, extrinsics, lambda: None, None)
+    assert finding.key == "materios-preprod:2029707:undecoded"
+    assert finding.severity == rules.CRITICAL and finding.group == "materios-preprod unclassifiable"
+    assert finding.headline == "materios-preprod #2029707: 30 extrinsics could not be decoded"
+    assert finding.details[0].startswith("extrinsic 3: ") and "DecodeBudgetExceeded" in finding.details[0]
+    assert len(finding.details) == rules.MAX_UNDECODED_LINES + 1 and finding.details[-1] == "... 10 more"
+
+
+def test_events_that_would_pass_the_budget_are_not_decoded(decoder, monkeypatch):
+    events = _block("block_2034370_with_events.json")["events"]
+    monkeypatch.setattr(rules, "DECODE_BUDGET", 50)
+    with pytest.raises(rules.DecodeBudgetExceeded):
+        decoder.events(events)
+
+
+def test_a_budget_reached_inside_a_wrapper_that_catches_every_error_still_stops_the_decode(decoder):
+    # scalecodec's OpaqueCall decodes its bytes as a call inside a bare ``except`` and keeps
+    # the bytes when that fails. No spec-238 type uses it; a runtime could.
+    call = filler_call("keys", 300)
+    with pytest.raises(rules.DecodeBudgetExceeded):
+        decoder._decode("OpaqueCall", "0x" + (rules._compact(len(call)) + call).hex(), 20)
 
 
 def test_a_runtime_upgrade_is_read_from_the_block_digest():

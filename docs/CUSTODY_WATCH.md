@@ -7,7 +7,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 
 | Source | CRITICAL (immediate, `@here`) | ALERT (immediate) | INFO (daily digest) |
 |---|---|---|---|
-| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, a new genesis (chain reset), an extrinsic the runtime metadata cannot decode or the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below) |
+| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, a new genesis (chain reset), an extrinsic the runtime metadata cannot decode, the block's decode budget does not reach, or the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below) |
 | Cardano custody addresses | any outflow | any inflow | reads as a reference input |
 | Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
 | Cardano policies | mint or burn, as configured | as configured | |
@@ -20,7 +20,8 @@ System.set_code`), and every privileged call is listed with its own arguments, m
 severe first, ahead of the tree, so a page cut to Discord's length still shows what
 matters. Calls nested as deep as a runtime decodes them (`MAX_EXTRINSIC_DEPTH`, 256)
 are decoded and named; an extrinsic that still cannot be decoded may hide any call, so
-it pages CRITICAL. Every call of the
+it pages CRITICAL, in one finding per block that lists each such extrinsic's size and
+hash. Every call of the
 pinned runtime is in the severity table or the routine list, and a test holds it there;
 a call a runtime upgrade adds pages as an ALERT until it is classified. Text from the
 chain is rendered as JSON with every backtick replaced, so it can never close the
@@ -158,6 +159,18 @@ message through the webhook to prove delivery end to end.
   whoever builds the transaction, so classification never trusts their shape. An
   extrinsic, committee inherent or Cardano transaction the classifier still cannot
   read is paged CRITICAL as unclassifiable, and the cursor moves past it.
+- **Bounded work per block.** Any funded account can fill a block to its length limit
+  with one-byte elements, and scalecodec builds a Python object for each one it reads.
+  A block's extrinsics, and separately its events, are decoded within a budget of
+  50,000 values (`DECODE_BUDGET`), about a second of CPU and a few megabytes at most.
+  Unsigned extrinsics, the inherents among them, are decoded first and signed ones
+  smallest first, so filler cannot spend the budget a small privileged leg needs. What
+  the budget does not reach pages CRITICAL and the cursor moves on. Events past the
+  budget are left unread, so the block's attempts page as though they took effect. A
+  Materios poll ends after the block that brings it to the budget, so the Cardano
+  sources are read between expensive blocks. Every call tree is walked once, holds at
+  most the 200 lines a page can show, and long arguments are rendered from a hash or
+  their first characters, so rendering never copies a block-sized value.
 - **Its own death is visible.** The daily digest is also the liveness signal, and it
   names every stale source instead of reporting the watcher alive. A source that
   cannot be read for `source_stale_seconds` is paged CRITICAL, again every hour it

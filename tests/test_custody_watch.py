@@ -20,7 +20,8 @@ from substrateinterface.exceptions import SubstrateRequestException
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
 from daemon import discord
-from tests.test_custody_rules import _count_walks, nested_sudo_leg
+from tests.test_custody_rules import (NORMAL_BLOCK_LENGTH, STRANGER, _count_walks, filler_call,
+                                      nested_sudo_leg, signed_extrinsic)
 
 FIX = Path(__file__).parent / "fixtures" / "custody"
 SUDO_KEY = "5H2M5Dbt8hSfSCXS6hfEBPR1N21yh679finzcfMEwD62i7iP"
@@ -786,6 +787,50 @@ def test_a_sudo_leg_nested_deep_in_batches_pages_critical_naming_its_calls(confi
     assert page["content"].startswith("\U0001f6a8 **CRITICAL** @here")
     assert page["allowed_mentions"] == {"parse": ["everyone"]}
     assert "System.authorize_upgrade**" in page["content"] and "Sudo.sudo" in page["content"]
+
+
+def _custody_outflow_pending(config, tmp_path):
+    store, network, api, cardano = _baselined(config, tmp_path)
+    custody = next(a for a in network.addresses if a.label == "custody-a")
+    api.add_tx("custody_outflow", address=custody.address, height=13_500_001)
+    return store, cardano
+
+
+def test_a_block_filled_to_its_length_limit_is_paged_and_passed_and_cardano_is_still_read(config, tmp_path):
+    store, cardano = _custody_outflow_pending(config, tmp_path)
+    filler = signed_extrinsic(filler_call("keys", NORMAL_BLOCK_LENGTH - 1024), STRANGER)
+    chain = FakeChain(head=1001, blocks={1001: "block_1829210.json"}, state_at={1000, 1001},
+                      extra={1001: [filler]})
+    materios = _materios(config, store, chain)
+    materios.start_at(1000)
+    posts = Posts()
+    _watch(config, store, [materios, cardano], posts, [_at("2026-09-27T01:01:00")]).cycle()
+    assert store.get("cursor:materios-preprod") == "1001"
+    text = posts.text()
+    assert "System.authorize_upgrade" in text
+    assert "materios-preprod #1001: 1 extrinsic could not be decoded" in text
+    assert "outflow from custody-a" in text
+
+
+def test_blocks_that_spend_the_decode_budget_end_the_poll_so_cardano_is_read_between_them(config, tmp_path,
+                                                                                          monkeypatch):
+    monkeypatch.setattr(rules, "DECODE_BUDGET", 300)
+    store, cardano = _custody_outflow_pending(config, tmp_path)
+    filler = signed_extrinsic(filler_call("keys", 2000), STRANGER)
+    chain = FakeChain(head=1005, blocks={}, state_at=set(range(1000, 1006)),
+                      extra={n: [filler] for n in range(1001, 1006)})
+    materios = _materios(config, store, chain)
+    materios.start_at(1000)
+    posts = Posts()
+    clock = [_at("2026-09-27T01:01:00")]
+    watch = _watch(config, store, [materios, cardano], posts, clock)
+    watch.cycle()
+    assert store.get("cursor:materios-preprod") == "1001"
+    assert "outflow from custody-a" in posts.text()
+    for _ in range(4):
+        clock[0] += 1.0
+        watch.cycle()
+    assert store.get("cursor:materios-preprod") == "1005"
 
 
 def test_a_committee_inherent_that_cannot_be_read_pages_and_the_cursor_moves_on(config, tmp_path, monkeypatch):

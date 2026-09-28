@@ -320,10 +320,6 @@ def _utc(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
-def _plural(n: int, word: str) -> str:
-    return f"{n} {word}" + ("" if n == 1 else "s")
-
-
 class Watch:
     def __init__(self, config: rules.WatchConfig, store: Store, sources: list, post: Callable[[dict], None],
                  clock: Callable[[], float] = time.time, notify: Callable[[str], None] = lambda message: None):
@@ -446,12 +442,12 @@ class Watch:
         for network, amounts in surrenders.items():
             decimals = self._decimals.get(network, 6)
             whole, frac = divmod(sum(amounts), 10 ** decimals)
-            lines.append(f"  {network}: {_plural(len(amounts), 'surrender')} paying "
+            lines.append(f"  {network}: {rules.plural(len(amounts), 'surrender')} paying "
                          f"{whole:,}.{frac:0{decimals}d} cMATRA")
         for network, count in committees.items():
-            lines.append(f"  {network}: {_plural(count, 'committee rotation')}, membership unchanged")
+            lines.append(f"  {network}: {rules.plural(count, 'committee rotation')}, membership unchanged")
         if other:
-            lines.append(f"  {_plural(len(other), 'other routine finding')}:")
+            lines.append(f"  {rules.plural(len(other), 'other routine finding')}:")
             lines.extend(f"    {f.headline}" for f in other[:10])
         content = "\n".join(lines)
         if len(content) > MESSAGE_LIMIT:
@@ -520,7 +516,10 @@ class MateriosSource:
         self.start_at(self._head()[1] - seconds // BLOCK_SECONDS)
 
     def poll(self, now: float) -> bool:
-        """Process up to ``MAX_BLOCKS_PER_POLL`` blocks; True once at the finalized head."""
+        """Process blocks towards the finalized head; True once there. A poll ends after
+        ``MAX_BLOCKS_PER_POLL`` blocks, or after the block that brings what it decoded
+        to ``DECODE_BUDGET`` values, so blocks built to be expensive to read cannot hold
+        back the other sources."""
         head_hash, head = self._head()
         if self._moved is None or self._moved[0] != head:
             self._moved = (head, now)
@@ -543,8 +542,11 @@ class MateriosSource:
             return True
         last = min(head, first + MAX_BLOCKS_PER_POLL - 1)
         hashes = self._rpc("chain_getBlockHash", [list(range(first, last + 1))])
+        decoded = 0
         for number, block_hash in zip(range(first, last + 1), hashes):
-            self._block(number, block_hash, sudo_key, now)
+            decoded += self._block(number, block_hash, sudo_key, now)
+            if decoded >= rules.DECODE_BUDGET:
+                return number == head
         return last == head
 
     def _reset(self, head: int, now: float) -> bool:
@@ -622,12 +624,15 @@ class MateriosSource:
             logger.warning("%s: events at %s do not decode: %s: %s", self.name, block_hash, type(e).__name__, e)
             return None
 
-    def _block(self, number: int, block_hash: str, sudo_key: bytes | None, now: float) -> None:
+    def _block(self, number: int, block_hash: str, sudo_key: bytes | None, now: float) -> int:
+        """Classify one block and commit its findings with the cursor; returns the values
+        its extrinsics and events decoded into."""
         block = self._rpc("chain_getBlock", [block_hash])["block"]
         header = block["header"]
         if self._decoder is None:
             self._decoder = self._load_decoder(header["parentHash"])
         decoder = self._decoder
+        before = decoder.values
         extrinsics = decoder.extrinsics(block["extrinsics"])
         findings = rules.classify_materios_block(self.name, number, extrinsics,
                                                  lambda: self._events(block_hash, decoder), sudo_key,
@@ -651,6 +656,7 @@ class MateriosSource:
             self._store.put(self._cursor_key, str(number))
         if rules.runtime_upgraded(header):
             self._decoder = None
+        return decoder.values - before
 
 
 # --- Cardano ------------------------------------------------------------------------------

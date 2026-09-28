@@ -32,6 +32,7 @@ from typing import Callable
 
 from scalecodec.base import RuntimeConfigurationObject, ScaleBytes
 from scalecodec.type_registry import load_type_registry_preset
+from scalecodec.types import GenericCall
 from substrateinterface.utils.ss58 import ss58_decode, ss58_encode
 
 from daemon.cardano_address import decode_cardano_address
@@ -208,6 +209,53 @@ def _parse_redemption(network: str, doc: dict) -> Redemption:
 # and scalecodec recurses about 13 frames per nested call, so Python's default limit of
 # 1000 would stop at about 75 and leave a deeper call unread.
 DECODE_RECURSION_LIMIT = 10_000
+# The values a block's extrinsics, and separately its events, may decode into.
+# scalecodec builds a Python object of a few hundred bytes, in about 15 microseconds,
+# for every element it reads, and an element can be a single byte: a block filled to
+# its length limit would take gigabytes and minutes. At this budget a block costs at
+# most about a second and a few megabytes. A routine block needs under a hundred values,
+# and an extrinsic the budget does not reach pages CRITICAL as undecoded.
+DECODE_BUDGET = 50_000
+
+
+class DecodeBudgetExceeded(Exception):
+    """A decode stopped at the values its block's budget had left."""
+
+    def __str__(self) -> str:
+        return f"stopped at the budget of {DECODE_BUDGET:,} decoded values per block"
+
+
+class _MeteredConfig(RuntimeConfigurationObject):
+    """Counts every value scalecodec builds, since it builds each one through
+    ``create_scale_object``, and stops a decode that would build more than ``stop_at``."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.values = 0
+        self.stop_at: int | None = None
+        self.stopped = False
+
+    def create_scale_object(self, type_string, data=None, **kwargs):
+        if self.stop_at is not None and self.values >= self.stop_at:
+            self.stopped = True
+            raise DecodeBudgetExceeded()
+        self.values += 1
+        return super().create_scale_object(type_string, data, **kwargs)
+
+
+def _bytes_read(scale_object) -> bytearray:
+    """The bytes ``scale_object`` has read so far, which are all of its own once its decode is done."""
+    end = scale_object.data.offset if scale_object.data_end_offset is None else scale_object.data_end_offset
+    return scale_object.data.data[scale_object.data_start_offset:end]
+
+
+def _signed(extrinsic_hex: str) -> bool:
+    """Whether an extrinsic carries a signature: the top bit of the version byte that
+    follows its compact length prefix."""
+    first = int(extrinsic_hex[2:4], 16)
+    prefix = 1 << (first & 3) if first & 3 < 3 else (first >> 2) + 5
+    version = extrinsic_hex[2 + 2 * prefix:4 + 2 * prefix]
+    return not version or int(version, 16) & 0x80 != 0
 
 
 class RuntimeDecoder:
@@ -218,41 +266,70 @@ class RuntimeDecoder:
     """
 
     def __init__(self, metadata_hex: str):
-        self._config = RuntimeConfigurationObject(ss58_format=SS58_FORMAT)
+        self._config = _MeteredConfig(ss58_format=SS58_FORMAT)
         self._config.update_type_registry(load_type_registry_preset("core"))
         self._metadata = self._config.create_scale_object("MetadataVersioned", data=ScaleBytes(metadata_hex))
         self._metadata.decode()
         self._config.add_portable_registry(self._metadata)
+        # scalecodec hashes a call while decoding it, before its end offset is set, and so
+        # hashes everything after the call too: a batch's decode would grow with its length
+        # squared. The runtime's call types are classes of this registry alone.
+        for name, decoder_class in self._config.type_registry["types"].items():
+            if name.startswith("scale_info::") and issubclass(decoder_class, GenericCall):
+                decoder_class.get_used_bytes = _bytes_read
         self._events_type = (self._metadata.get_metadata_pallet("System")
                              .get_storage_function("Events").get_value_type_string())
 
+    @property
+    def values(self) -> int:
+        """The values this decoder has built so far; what a block cost is the difference."""
+        return self._config.values
+
     def extrinsics(self, extrinsics_hex: list[str]) -> list[dict]:
         """Each extrinsic decoded, or ``{"undecodable": hex, "error": ...}`` for one this
-        runtime's metadata cannot read, so a call the watcher does not know is reported
-        rather than silently skipped."""
-        decoded = []
-        for x in extrinsics_hex:
+        runtime's metadata cannot read or the block's DECODE_BUDGET does not reach, so a
+        call the watcher has not read is reported rather than silently skipped.
+
+        The block's unsigned extrinsics, its inherents among them, are decoded first and
+        the signed ones smallest first, so a large extrinsic cannot spend the budget
+        that the inherents and a privileged call, which is small, need."""
+        decoded: list[dict] = [{} for _ in extrinsics_hex]
+        budget = DECODE_BUDGET
+        for index in sorted(range(len(extrinsics_hex)),
+                            key=lambda i: (_signed(extrinsics_hex[i]), len(extrinsics_hex[i]))):
+            x = extrinsics_hex[index]
+            before = self.values
             try:
-                decoded.append(self._decode("Extrinsic", x))
+                decoded[index] = self._decode("Extrinsic", x, budget)
             except Exception as e:  # scalecodec raises any type on bytes it cannot place
-                decoded.append({"undecodable": x, "error": f"{type(e).__name__}: {e}"[:200]})
+                decoded[index] = {"undecodable": x, "error": f"{type(e).__name__}: {e}"[:200]}
+            budget -= self.values - before
         return decoded
 
     def events(self, events_hex: str) -> dict[int, list[str]]:
         grouped: dict[int, list[str]] = defaultdict(list)
-        for record in self._decode(self._events_type, events_hex):
+        for record in self._decode(self._events_type, events_hex, DECODE_BUDGET):
             if record.get("phase") == "ApplyExtrinsic":
                 grouped[record["extrinsic_idx"]].append(_event_text(record))
         return dict(grouped)
 
-    def _decode(self, type_string: str, data_hex: str):
-        obj = self._config.create_scale_object(type_string, data=ScaleBytes(data_hex), metadata=self._metadata)
+    def _decode(self, type_string: str, data_hex: str, budget: int):
+        """``data_hex`` decoded as ``type_string``, building at most ``budget`` values."""
+        config = self._config
+        config.stop_at, config.stopped = config.values + budget, False
         limit = sys.getrecursionlimit()
         sys.setrecursionlimit(max(limit, DECODE_RECURSION_LIMIT))
         try:
-            return obj.decode(check_remaining=True)
+            obj = config.create_scale_object(type_string, data=ScaleBytes(data_hex), metadata=self._metadata)
+            value = obj.decode(check_remaining=True)
         finally:
             sys.setrecursionlimit(limit)
+            config.stop_at = None
+        # scalecodec's opaque-call wrappers catch every error, a stopped decode's
+        # included, and return the bytes they did not read as though decoded.
+        if config.stopped:
+            raise DecodeBudgetExceeded()
+        return value
 
 
 def _event_text(record: dict) -> str:
@@ -412,7 +489,7 @@ def _is_call(value) -> bool:
     return isinstance(value, dict) and "call_module" in value
 
 
-def hex_digest(hex_text: str) -> str:
+def _hex_digest(hex_text: str) -> str:
     """The length and blake2_256 of the bytes that 0x-prefixed ``hex_text`` spells, read a
     chunk at a time so a block-sized value costs no copy of itself."""
     digest = hashlib.blake2b(digest_size=32)
@@ -433,7 +510,7 @@ def _render_value(value) -> str:
     and its newlines stay escaped."""
     if (isinstance(value, str) and value.startswith("0x") and len(value) % 2 == 0
             and len(value) >= 2 + 2 * _LONG_HEX_BYTES and _HEX_DIGITS.fullmatch(value, 2)):
-        return f"<{hex_digest(value)}>"
+        return f"<{_hex_digest(value)}>"
     # A string's first 401 characters encode to the same first 400 as the whole of it.
     text = json.dumps(value[:401] if isinstance(value, str) else value, default=str)
     return text if len(text) <= 400 else text[:400] + "\u2026"
@@ -450,6 +527,7 @@ _ROOT = "Root"
 MAX_PATH = 200
 MAX_SITE_ARGS = 300
 MAX_SITE_LINES = 20
+MAX_UNDECODED_LINES = 20
 MAX_TREE_LINES = 200
 MAX_INDENT = 16
 
@@ -611,6 +689,10 @@ def runtime_upgraded(header: dict) -> bool:
     return RUNTIME_ENVIRONMENT_UPDATED in header["digest"]["logs"]
 
 
+def plural(n: int, word: str) -> str:
+    return f"{n:,} {word}" + ("" if n == 1 else "s")
+
+
 def unclassifiable(key: str, what: str, error: Exception, *details: str, group: str | None = None) -> Finding:
     """The CRITICAL raised in place of a classification that failed, so the item is
     still paged and its cursor still moves."""
@@ -629,18 +711,21 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     # What cannot be read may hide any call, so it pages CRITICAL; grouped, because
     # anyone can send it.
     unreadable = f"{chain} unclassifiable"
+    undecoded = [(index, ext) for index, ext in enumerate(extrinsics) if "undecodable" in ext]
+    if undecoded:
+        # One finding a block, however many extrinsics it could not read.
+        listed = [f"extrinsic {index}: {_hex_digest(ext['undecodable'])}: {ext['error']}"
+                  for index, ext in undecoded[:MAX_UNDECODED_LINES]]
+        if len(undecoded) > MAX_UNDECODED_LINES:
+            listed.append(f"... {len(undecoded) - MAX_UNDECODED_LINES:,} more")
+        findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded",
+                                f"{chain} #{number}: {plural(len(undecoded), 'extrinsic')} could not be decoded",
+                                details=tuple(listed), group=unreadable))
     reported = []
     for index, ext in enumerate(extrinsics):
-        key = f"{chain}:{number}:{index}"
         if "undecodable" in ext:
-            findings.append(Finding(
-                severity=CRITICAL,
-                key=key,
-                headline=f"{chain} #{number} extrinsic {index} could not be decoded against the runtime metadata",
-                details=(hex_digest(ext["undecodable"]), ext["error"]),
-                group=unreadable,
-            ))
             continue
+        key = f"{chain}:{number}:{index}"
         signer = _account(ext.get("address"))
         tree = _Tree(sudo_key, authorities | ({sudo_key} if sudo_key else frozenset()))
         try:
