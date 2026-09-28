@@ -183,6 +183,19 @@ token_rejects "the token is refused without branch metadata" "push pipeline of t
 token_rejects "the token is only sent to the allowed registry" "may only be sent to $REG" PLUGIN_REGISTRY=evil.example
 token_rejects "the target must be under the allowed prefix" "outside $REG/fps/" PLUGIN_TARGET="$REG/elsewhere:abc"
 token_rejects "a source must be under the allowed prefix" "outside $REG/fps/" PLUGIN_SOURCES="/tmp/layout-amd64=$REG/elsewhere:abc"
+# A workspace directory can be named like a ref under the prefix, so a sources item holding
+# two words passes a check that reads it as one ref unless it is refused as a whole.
+mkdir -p "/tmp/ws/$REG/fps" && cp -r /tmp/layout-amd64 "/tmp/ws/$REG/fps/lay"
+# two_refs NAME SEPARATOR: the item must be refused and nothing pushed outside the prefix.
+two_refs() {
+  token_rejects "a sources item holding two refs split by a $1 is refused" "must not contain whitespace" \
+    PLUGIN_SOURCES="/tmp/layout-amd64=$REG/fps/two:abc$2$REG/fps/lay=$REG/elsewhere:$1"
+  if exists "$REG/elsewhere:$1"; then bad "a sources item holding two refs split by a $1 pushed outside the prefix"; fi
+}
+cd /tmp/ws
+two_refs space ' '
+two_refs tab "$(printf '\t')"
+cd "$HERE"
 token_rejects "a password without a username fails" "password needs registry and username" PLUGIN_USERNAME=
 # A restart runs its stored configuration with the restart's variables, however old it is.
 token_rejects "the token is refused on a restarted pipeline" "not used on a restarted pipeline" CI_PIPELINE_PARENT=4

@@ -28,6 +28,11 @@ die() { echo "oci-index: $*" >&2; exit 1; }
 list() { echo "$1" | tr ',' '\n' | sed '/^$/d'; }
 words() { sort | tr '\n' ' '; }
 
+# The prefix check and the push loop must read the same refs: the check reads each sources
+# item as one ref, the loop splits the list into words.
+case "${PLUGIN_SOURCES:-}${PLUGIN_PLATFORMS:-}${PLUGIN_TARGET:-}${PLUGIN_TAGS:-}" in
+  *[[:space:]]*) die "sources, platforms, target and tags must not contain whitespace" ;;
+esac
 SOURCES=$(list "${PLUGIN_SOURCES:-}")
 PLATFORMS=$(list "${PLUGIN_PLATFORMS:-}")
 TARGET=${PLUGIN_TARGET:-}
