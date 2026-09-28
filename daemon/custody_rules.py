@@ -434,7 +434,8 @@ def _render_value(value) -> str:
     if (isinstance(value, str) and value.startswith("0x") and len(value) % 2 == 0
             and len(value) >= 2 + 2 * _LONG_HEX_BYTES and _HEX_DIGITS.fullmatch(value, 2)):
         return f"<{hex_digest(value)}>"
-    text = json.dumps(value, default=str)
+    # A string's first 401 characters encode to the same first 400 as the whole of it.
+    text = json.dumps(value[:401] if isinstance(value, str) else value, default=str)
     return text if len(text) <= 400 else text[:400] + "\u2026"
 
 

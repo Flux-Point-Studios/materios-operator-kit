@@ -330,6 +330,13 @@ def test_a_block_sized_byte_argument_is_shown_as_its_hash_in_memory_near_its_own
     assert rules._render_value(blob[:-1] + "z").startswith('"0xabab')
 
 
+def test_a_block_sized_text_argument_is_rendered_from_its_start_alone():
+    text = "\x00" * NORMAL_BLOCK_LENGTH
+    shown, peak = _peak_memory(lambda: rules._render_value(text))
+    assert shown == json.dumps(text)[:400] + "\u2026"
+    assert peak < 64 * 1024
+
+
 def test_a_remark_of_text_that_looks_like_hex_is_classified(decoder):
     remark = "0x" + TEXT_THAT_LOOKS_LIKE_HEX.encode().hex()
     [ext] = decoder.extrinsics([_encode(decoder, "System", "remark", remark=remark)])
