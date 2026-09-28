@@ -124,22 +124,38 @@ which would otherwise move with the host's time zone.
 
 ## Paging
 
-Pages go out most severe first, and within a severity a finding that pages alone goes
-before a group. Findings that anyone can cause cheaply are grouped: Materios findings
-by signer (unless an authority is involved), Cardano payments into, or contract
-spends from, one address, and anything unclassifiable that anyone could have sent, per
-source. Every pending finding of a group goes out as one message, and when more than
-three groups are waiting they all go out in one summary that names each group, its
-count and its first headline. Custody outflows, surrender-pool spends and
-watched-policy mints always page alone.
+Pages go out in three lanes, most severe first within each:
+
+1. What only `Sudo.Key`, an authority account, a custody key, or the keys that spend
+   the surrender pool or mint under a watched policy can cause: what `Sudo.Key` or an
+   authority signs, its multisig legs included; a change of `Sudo.Key`, of the runtime
+   code or of the genesis; a runtime environment digest; a change in the recovery of
+   `Sudo.Key` or an authority other than a recovery started; a custody outflow; a
+   surrender-pool spend that is not a surrender; a mint or burn under a watched policy.
+2. Every other finding that pages alone, such as a coverage page, a committee change or
+   a stale source.
+3. Groups. Only what an account anyone can be causes is grouped, per source: Materios
+   findings by signer, those whose dispatch result could not be verified and anything
+   unclassifiable per chain, and on Cardano payments into, or contract spends from, one
+   address, and a surrender whose claimant made it underpay or pay above `max_payout`,
+   per address.
+
+A group pages its first finding at once. After that it waits ten minutes
+(`GROUP_WINDOW`) and pages everything it gathered in one message, so an account that
+raises a finding in every block costs one message per ten minutes. All groups together
+take at most one post every 30 seconds, a fifth of the bucket below, however many
+accounts send them, and when more than three groups are ready they go out in one
+summary that names each group, its count and its first headline.
 
 Every post, page or digest, spends a token from a bucket that holds three and refills
 one every 6 seconds: ten messages a minute at most, a third of Discord's 30 a minute
 per channel and inside its 5 per 2 seconds per webhook. However many accounts flood a
 block, the watcher never holds the webhook at its rate limit, so a watchdog that shares
-it still gets through. Once the digest is due, one token is kept back for it, so a
-flood cannot starve the watcher's liveness signal. `discord_webhook_file` gives the
-watcher its own channel (below); without it, it pages through `DISCORD_WEBHOOK_URL`.
+it still gets through. Only a page of the first lane may spend the bucket's last token,
+so it goes out the moment it is found whatever else is paging. Once the digest is due,
+one more token is kept back for it, so a flood cannot starve the watcher's liveness
+signal. `discord_webhook_file` gives the watcher its own channel (below); without it, it
+pages through `DISCORD_WEBHOOK_URL`.
 
 A failing webhook holds every post, the digest included: for its `Retry-After` when
 it rate-limits, otherwise for a delay that doubles with each consecutive failure, up

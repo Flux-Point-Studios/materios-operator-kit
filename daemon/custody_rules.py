@@ -59,7 +59,12 @@ class Finding:
     kind: str = "event"
     amount: int = 0
     # Pending findings that share a group are paged as one message; None pages alone.
+    # Only what an account anyone can be causes is grouped.
     group: str | None = None
+    # Caused by Sudo.Key or an authority account, a custody key, or the keys that spend
+    # the surrender pool or mint under a watched policy: paged first, from capacity kept
+    # for it alone.
+    authority: bool = False
 
     def render(self) -> str:
         return "\n".join([f"[{self.severity.name}] {self.headline}", *(f"  {d}" for d in self.details)])
@@ -825,7 +830,7 @@ def runtime_changed(chain: str, number: int) -> Finding:
     return Finding(CRITICAL, f"{chain}:{number}:runtime",
                    f"{chain} #{number}: the runtime environment changed (a new runtime or heap pages)",
                    details=("the block's header carries a RuntimeEnvironmentUpdated digest; the blocks after it "
-                            "are decoded with the new runtime's metadata",))
+                            "are decoded with the new runtime's metadata",), authority=True)
 
 
 def plural(n: int, word: str) -> str:
@@ -880,7 +885,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
         else:
             role = "Sudo.Key" if signer == sudo_key else "an authority account"
             findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded:{render_account(signer)}",
-                                    f"{what}, signed by {role}", details=tuple(listed)))
+                                    f"{what}, signed by {role}", details=tuple(listed), authority=True))
     reported = []
     for index, ext in enumerate(extrinsics):
         if "undecodable" in ext:
@@ -966,6 +971,7 @@ def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None
         details=tuple(notes + sites + ["call tree:"] + lines),
         group=(None if not ordinary else f"{chain} unverified" if own is None
                else f"{chain} signer {render_account(signer)}"),
+        authority=tree.involved,
     )
 
 
@@ -1304,10 +1310,11 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
     names = _Names(network)
     lines: list[tuple[Severity, str]] = []
     kind, amount = "event", 0
-    # Anyone may pay into an address, so a transaction that only pays in, or only spends
-    # from a contract, is grouped with the others at that address; one that moves custody
-    # or pool value or mints under a watched policy always pages alone.
-    alone, label = False, None
+    # Anyone may pay into an address, or surrender a legacy unit, so a transaction that only
+    # pays in, only spends from a contract, or makes a surrender do what its claimant chose,
+    # is grouped with the others at that address; one that moves custody, spends the pool
+    # other than as a surrender, or mints under a watched policy is the keys' and pages alone.
+    authority, label = False, None
 
     for watched in network.addresses:
         out = _value([u for u in spent if u["address"] == watched.address])
@@ -1317,7 +1324,7 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
             lines.append((CRITICAL if custody else watched.severity,
                           f"{'outflow from' if custody else 'spent from'} {watched.label}: "
                           f"net {names.value(_delta(into, out))}"))
-            alone = alone or custody
+            authority = authority or custody
             label = label or watched.label
         elif into:
             lines.append((ALERT, f"{'inflow to' if custody else 'paid to'} {watched.label}: {names.value(into)}"))
@@ -1332,14 +1339,17 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
             if unit.startswith(policy.policy_id):
                 verb = "minted" if quantity > 0 else "burned"
                 lines.append((policy.severity, f"{verb} {names.quantity(unit, abs(quantity))} under {policy.label}"))
-                alone = True
+                authority = True
 
     pool = network.pool
     if pool and any(u["address"] == pool.address for u in spent):
         severity, pool_lines, paid = _classify_pool(network, spent, produced, redeemers, minted, names)
         lines.extend((severity, t) for t in pool_lines)
-        alone = True
-        if severity == INFO and valid:
+        if severity == CRITICAL:
+            authority = True
+        elif severity == ALERT:
+            label = label or pool.label
+        elif valid:
             kind, amount = "surrender", paid
     elif pool and any(u["address"] == pool.address for u in produced):
         received = _value([u for u in produced if u["address"] == pool.address])
@@ -1358,5 +1368,6 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
         details=tuple(t for _, t in lines),
         kind=kind,
         amount=amount,
-        group=None if alone or label is None else f"{network.name} {label}",
+        group=None if authority or label is None else f"{network.name} {label}",
+        authority=authority,
     )

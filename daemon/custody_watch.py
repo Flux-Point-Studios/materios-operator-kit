@@ -82,8 +82,10 @@ CREATE TABLE IF NOT EXISTS finding (
     grp TEXT,
     found_at REAL NOT NULL,
     sent_at REAL,
-    failures INTEGER NOT NULL DEFAULT 0
+    failures INTEGER NOT NULL DEFAULT 0,
+    authority INTEGER NOT NULL DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS finding_sent ON finding (sent_at);
 CREATE TABLE IF NOT EXISTS processed (key TEXT PRIMARY KEY, at REAL NOT NULL);
 """
 
@@ -139,10 +141,10 @@ class Store:
     def add(self, finding: rules.Finding, now: float) -> bool:
         """Store a finding unless one with its key exists; True when it is new."""
         cursor = self._db.execute(
-            "INSERT OR IGNORE INTO finding (key, severity, kind, amount, headline, details, grp, found_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO finding (key, severity, kind, amount, headline, details, grp, found_at, authority) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (finding.key, int(finding.severity), finding.kind, str(finding.amount), finding.headline,
-             json.dumps(finding.details), finding.group, now))
+             json.dumps(finding.details), finding.group, now, int(finding.authority)))
         return cursor.rowcount == 1
 
     def retire(self, prefix: str, suffix: str) -> None:
@@ -159,19 +161,27 @@ class Store:
 
     def _rows(self, where: str, params: tuple = (), order: str = "seq") -> list[StoredFinding]:
         rows = self._db.execute(
-            "SELECT key, severity, kind, amount, headline, details, grp, found_at, sent_at, failures FROM finding "
-            f"WHERE {where} ORDER BY {order}", params).fetchall()
+            "SELECT key, severity, kind, amount, headline, details, grp, authority, found_at, sent_at, failures "
+            f"FROM finding WHERE {where} ORDER BY {order}", params).fetchall()
         return [StoredFinding(severity=rules.Severity(s), key=k, headline=h, details=tuple(json.loads(d)),
-                              kind=kind, amount=int(a), group=g, found_at=f, sent_at=sent, failures=n)
-                for k, s, kind, a, h, d, g, f, sent, n in rows]
+                              kind=kind, amount=int(a), group=g, authority=bool(auth), found_at=f, sent_at=sent,
+                              failures=n)
+                for k, s, kind, a, h, d, g, auth, f, sent, n in rows]
 
     def findings(self) -> list[StoredFinding]:
         return self._rows("1")
 
     def unsent_pages(self) -> list[StoredFinding]:
-        """Most severe first; within a severity, findings that page alone come first."""
+        """An authority's findings first, then the rest that page alone, then groups; most
+        severe first within each."""
         return self._rows("sent_at IS NULL AND severity >= ?", (int(rules.ALERT),),
-                          order="severity DESC, grp IS NOT NULL, seq")
+                          order="authority DESC, grp IS NOT NULL, severity DESC, seq")
+
+    def paged_groups(self, since: float) -> set[str]:
+        """The groups a page went out for after ``since``."""
+        rows = self._db.execute("SELECT DISTINCT grp FROM finding WHERE sent_at > ? AND grp IS NOT NULL "
+                                "AND severity >= ?", (since, int(rules.ALERT))).fetchall()
+        return {g for (g,) in rows}
 
     def unsent_routine(self) -> list[StoredFinding]:
         return self._rows("sent_at IS NULL AND severity < ?", (int(rules.ALERT),))
@@ -245,7 +255,15 @@ PAYLOAD_REFUSED = frozenset({400, 413})
 # webhook, so a watchdog sharing the webhook still gets through a flood.
 PAGE_BURST = 3
 PAGE_INTERVAL = 6.0
-# Past this many groups waiting, every group goes out in one summary message.
+# Only an authority's page may spend the bucket's last token, so it goes out the moment
+# it is found whatever else is paging.
+AUTHORITY_RESERVE = 1
+# A group is what any funded account can cause. It pages its first finding at once and
+# then what it has gathered once per GROUP_WINDOW, and all groups together take at most
+# one post per GROUPED_INTERVAL, a fifth of the bucket, however many accounts send them.
+GROUP_WINDOW = 600.0
+GROUPED_INTERVAL = 5 * PAGE_INTERVAL
+# Past this many groups ready at once, they all go out in one summary message.
 MAX_GROUP_MESSAGES = 3
 
 
@@ -253,25 +271,18 @@ def _doubling(n: int) -> float:
     return min(2.0 ** (n - 1), MAX_HOLD)
 
 
-def _messages(pending: list[StoredFinding]) -> list[list[StoredFinding]]:
-    """Pending pages as messages, in order: a finding alone, or its whole group at the
-    place of the group's first finding. When more than MAX_GROUP_MESSAGES groups wait,
-    they go as one summary at the place of the first of them."""
-    messages: list[list[StoredFinding]] = []
+def _messages(pending: list[StoredFinding], held: set[str]) -> list[list[StoredFinding]]:
+    """Pending pages as messages, in order: every finding that pages alone, then each group
+    not ``held`` whole, most severe group first. When more than MAX_GROUP_MESSAGES groups
+    are ready, they go as one summary."""
     groups: dict[str, list[StoredFinding]] = {}
     for finding in pending:
-        if finding.group is None:
-            messages.append([finding])
-        elif finding.group in groups:
-            groups[finding.group].append(finding)
-        else:
-            groups[finding.group] = [finding]
-            messages.append(groups[finding.group])
-    if len(groups) <= MAX_GROUP_MESSAGES:
-        return messages
-    first = next(i for i, m in enumerate(messages) if m[0].group is not None)
-    alone = [m for m in messages if m[0].group is None]
-    return alone[:first] + [[f for members in groups.values() for f in members]] + alone[first:]
+        if finding.group is not None and finding.group not in held:
+            groups.setdefault(finding.group, []).append(finding)
+    grouped = list(groups.values())
+    if len(grouped) > MAX_GROUP_MESSAGES:
+        grouped = [[f for members in grouped for f in members]]
+    return [[f] for f in pending if f.group is None] + grouped
 
 
 def _message_name(message: list[StoredFinding]) -> str:
@@ -284,8 +295,10 @@ def _message_name(message: list[StoredFinding]) -> str:
 class Pager:
     """Posts every message through the one webhook without hammering it.
 
-    Posts are paced by a token bucket (PAGE_BURST, PAGE_INTERVAL), most severe first, so
-    no flood of findings can hold the webhook at Discord's rate limit. A failure of the
+    Posts are paced by a token bucket (PAGE_BURST, PAGE_INTERVAL), so no flood of findings
+    can hold the webhook at Discord's rate limit. An authority's pages go first and may
+    spend the last token; the rest that page alone go next; groups go last, each at most
+    once per GROUP_WINDOW and all of them at most once per GROUPED_INTERVAL. A failure of the
     webhook (unreachable, a server error, a rate limit, or a refusal of every post, as a
     revoked or deleted webhook answers) holds all posting: for a rate limit's
     Retry-After, otherwise for a delay that doubles with each consecutive failure up to
@@ -303,6 +316,7 @@ class Pager:
         self._refused: dict[str, tuple[int, float]] = {}
         self._tokens = float(PAGE_BURST)
         self._counted_at: float | None = None
+        self._grouped_at = float("-inf")
 
     def _available(self, now: float) -> float:
         if self._counted_at is not None:
@@ -310,9 +324,10 @@ class Pager:
         self._counted_at = now
         return self._tokens
 
-    def ready(self, name: str, now: float) -> bool:
-        """Whether the message ``name`` is off hold and a token is left for it."""
-        return now >= max(self._resume_at, self._refused.get(name, (0, 0.0))[1]) and self._available(now) >= 1
+    def ready(self, name: str, now: float, keep: int = 0) -> bool:
+        """Whether the message ``name`` is off hold and a token beyond ``keep`` is left for it."""
+        return (now >= max(self._resume_at, self._refused.get(name, (0, 0.0))[1])
+                and self._available(now) >= keep + 1)
 
     def post(self, name: str, payload: dict, now: float) -> None:
         """Post ``payload`` as the message ``name``, spending a token, or raise
@@ -333,17 +348,19 @@ class Pager:
         self._refused.pop(name, None)
 
     def flush(self, store: Store, now: float, keep: int = 0) -> int:
-        """Page unsent ALERTs and CRITICALs, most severe first, while tokens beyond
-        ``keep`` remain; returns how many findings went out. Undelivered pages stay
-        pending, in order, and a message refused FALLBACK_AFTER times goes out as its
-        headline alone."""
+        """Page unsent ALERTs and CRITICALs in turn while tokens remain: an authority's
+        page may spend the last one, any other leaves AUTHORITY_RESERVE and ``keep`` more.
+        Returns how many findings went out. Undelivered pages stay pending, in order, and a
+        message refused FALLBACK_AFTER times goes out as its headline alone."""
         delivered = 0
-        for message in _messages(store.unsent_pages()):
-            if self._available(now) < keep + 1:
+        for message in _messages(store.unsent_pages(), store.paged_groups(now - GROUP_WINDOW)):
+            grouped = message[0].group is not None
+            floor = 0 if message[0].authority else AUTHORITY_RESERVE + keep
+            if self._available(now) < floor + 1 or (grouped and now - self._grouped_at < GROUPED_INTERVAL):
                 break
             keys = [f.key for f in message]
             name = _message_name(message)
-            if not self.ready(name, now):
+            if not self.ready(name, now, floor):
                 continue
             headline_only = max(f.failures for f in message) >= FALLBACK_AFTER
             try:
@@ -354,6 +371,8 @@ class Pager:
                 logger.warning("page for %s not delivered: %s", keys[0], e)
                 continue
             store.mark_sent(keys, now)
+            if grouped:
+                self._grouped_at = now
             delivered += len(keys)
         return delivered
 
@@ -455,7 +474,7 @@ class Watch:
                 store.put(f"health:{name}:stale-since", str(int(last_ok)))
 
     def _digest(self, now: float) -> None:
-        if not self._digest_due(now) or not self._pager.ready("digest", now):
+        if not self._digest_due(now) or not self._pager.ready("digest", now, AUTHORITY_RESERVE):
             return
         day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
         routine = self._store.unsent_routine()
@@ -679,7 +698,8 @@ class MateriosSource:
             self._store.add(rules.Finding(
                 rules.CRITICAL, f"{self.name}:genesis:{genesis}",
                 f"{self.name} genesis changed: the chain was reset",
-                details=(f"from {stored}", f"to   {genesis}", f"watching again from finalized #{head}")), now)
+                details=(f"from {stored}", f"to   {genesis}", f"watching again from finalized #{head}"),
+                authority=True), now)
             for kept in ("sudo-key", "committee", "code", "recovery"):
                 self._store.delete(f"{kept}:{self.name}")
             self.start_at(head)
@@ -697,7 +717,7 @@ class MateriosSource:
                 self._store.add(rules.Finding(
                     rules.CRITICAL, f"{self.name}:sudo-key:{head}",
                     f"{self.name} Sudo.Key changed (seen at finalized #{head})",
-                    details=(f"from {_account(stored)}", f"to   {_account(raw)}")), now)
+                    details=(f"from {_account(stored)}", f"to   {_account(raw)}"), authority=True), now)
             self._store.put(name, raw)
         return bytes.fromhex(raw[2:]) if raw else None
 
@@ -714,7 +734,8 @@ class MateriosSource:
                     rules.CRITICAL, f"{self.name}:code:{head}",
                     f"{self.name}: runtime code changed (seen at finalized #{head})",
                     details=(f"from blake2_256 {stored}", f"to   blake2_256 {code}",
-                             "blocks read from here on are decoded with the new code's metadata")), now)
+                             "blocks read from here on are decoded with the new code's metadata"),
+                    authority=True), now)
                 self._decoder = None
             self._store.put(name, code)
         return code
@@ -809,7 +830,8 @@ class MateriosSource:
                 rules.CRITICAL, f"{self.name}:recovery:{head}",
                 f"{self.name}: a recovery of Sudo.Key or an authority started (seen at finalized #{head})" if started
                 else f"{self.name}: recovery of Sudo.Key or an authority changed (seen at finalized #{head})",
-                details=tuple(lines), group=f"{self.name} recovery started" if started else None), now)
+                details=tuple(lines), group=f"{self.name} recovery started" if started else None,
+                authority=not started), now)
 
     def _keys(self, prefix: str, at_hash: str) -> list[str]:
         keys: list[str] = []

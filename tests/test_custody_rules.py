@@ -1257,6 +1257,26 @@ def test_a_surrender_paying_more_than_the_ceiling_is_an_alert(networks):
     assert "above the per-surrender ceiling of 100,000.000000 cMATRA" in finding.render()
 
 
+def test_what_a_claimant_can_make_a_surrender_do_is_grouped_by_the_pool(networks):
+    # Anyone holding a legacy unit can surrender it, so an underpayment or a payout above
+    # the ceiling is the claimant's doing, not a move of the pool's keys.
+    def underpay(utxos):
+        pool, claimant = _outputs(utxos)
+        _move_cmatra(utxos, claimant, pool, 1_000_000)
+
+    tx = _tampered_surrender(underpay)
+    underpaid = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    network = networks["cardano-mainnet"]
+    pool = rules.SurrenderPool(**{**network.pool.__dict__, "max_payout": 100_000_000_000})
+    tx = _tx("surrender_t2_pass")
+    above = rules.classify_cardano_tx(rules.CardanoNetwork(**{**network.__dict__, "pool": pool}), tx["tx"],
+                                      tx["utxos"], tx["redeemers"])
+    assert "underpaid" in underpaid.render() and "ceiling" in above.render()
+    for finding in (underpaid, above):
+        assert finding.severity == rules.ALERT
+        assert finding.group == "cardano-mainnet surrender-pool"
+
+
 def test_the_ceiling_is_read_from_the_config():
     doc = json.loads((FIX / "config.json").read_text())
     doc["cardano"][0]["surrender_pool"]["max_payout"] = 25_000_000_000_000

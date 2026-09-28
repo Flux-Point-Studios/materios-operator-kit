@@ -47,9 +47,9 @@ def config():
     return rules.parse_config(json.loads((FIX / "config.json").read_text()))
 
 
-def _finding(key="k", severity=rules.CRITICAL, kind="event", amount=0, details=("d",)):
+def _finding(key="k", severity=rules.CRITICAL, kind="event", amount=0, details=("d",), authority=False):
     return rules.Finding(severity=severity, key=key, headline=f"headline {key}", details=details,
-                         kind=kind, amount=amount)
+                         kind=kind, amount=amount, authority=authority)
 
 
 class Posts:
@@ -105,14 +105,151 @@ def _headlines(posts):
     return [p["content"].split("\n")[1] for p in posts.payloads]
 
 
-def test_pages_go_out_most_severe_first_and_ungrouped_before_grouped(tmp_path):
+def test_pages_that_go_alone_go_before_any_group_whatever_its_severity(tmp_path):
+    # Only what an account anyone can be causes is grouped, so however severe a group is,
+    # it waits behind every page that goes alone.
     store = cw.Store(str(tmp_path / "state.db"))
     store.add(_finding("alert", severity=rules.ALERT), now=1.0)
     store.add(rules.Finding(rules.CRITICAL, "flood", "headline flood", group="preprod signer X"), now=2.0)
-    store.add(_finding("custody"), now=3.0)
+    store.add(_finding("stale"), now=3.0)
     posts = Posts()
-    assert cw.Pager(posts).flush(store, now=4.0) == 3
-    assert _headlines(posts) == ["**headline custody**", "**headline flood**", "**headline alert**"]
+    pager = cw.Pager(posts)
+    for second in range(0, 60, 6):
+        pager.flush(store, now=4.0 + second)
+    assert _headlines(posts) == ["**headline stale**", "**headline alert**", "**headline flood**"]
+
+
+def _outsider_groups(store, second: int, now: float, outsiders: int) -> None:
+    """One grouped CRITICAL from each of ``outsiders`` accounts, as any funded account can
+    cause in every block."""
+    for g in range(outsiders):
+        store.add(rules.Finding(rules.CRITICAL, f"materios-preprod:{second}:{g}", f"outsider {g} #{second}",
+                                group=f"materios-preprod signer {g}"), now)
+
+
+@pytest.mark.parametrize("outsiders", [1, 2, 3, 5])
+def test_grouped_pages_outsiders_cause_every_block_never_hold_back_a_page_that_goes_alone(tmp_path, outsiders):
+    store = cw.Store(str(tmp_path / "state.db"))
+    clock = [_at("2026-09-28T02:00:00")]
+    pager = cw.Pager(DiscordModel(clock))
+    for second in range(600):
+        if second % 6 == 0:
+            _outsider_groups(store, second, clock[0], outsiders)
+        if second % 60 == 0 and second:
+            store.add(rules.Finding(rules.ALERT, f"cardano-mainnet:coverage:{second}",
+                                    "cardano-mainnet surrender pool covers 87.13%"), clock[0])
+        pager.flush(store, clock[0])
+        clock[0] += 1
+    alone = [f for f in store.findings() if f.group is None]
+    assert len(alone) == 9
+    assert [f.sent_at for f in alone] == [f.found_at for f in alone]
+
+
+def test_a_group_pages_its_first_finding_at_once_and_then_one_summary_per_window(tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    posts = Posts()
+    pager = cw.Pager(posts)
+    started = _at("2026-09-28T02:00:00")
+    for block in range(300):
+        now = started + 6 * block
+        store.add(rules.Finding(rules.ALERT, f"materios-preprod:{block}:3",
+                                f"materios-preprod #{block} extrinsic 3: Recovery.create_recovery",
+                                group="materios-preprod signer X"), now)
+        pager.flush(store, now)
+    assert _headlines(posts) == ["**materios-preprod #0 extrinsic 3: Recovery.create_recovery**",
+                                 "**100 findings from materios-preprod signer X**",
+                                 "**100 findings from materios-preprod signer X**"]
+
+
+def test_groups_from_fresh_accounts_take_at_most_one_post_in_five(tmp_path):
+    # Each block brings a group from an account never seen before.
+    store = cw.Store(str(tmp_path / "state.db"))
+    clock = [_at("2026-09-28T02:00:00")]
+    sent = []
+    pager = cw.Pager(lambda payload: sent.append(clock[0]))
+    for second in range(300):
+        if second % 6 == 0:
+            store.add(rules.Finding(rules.ALERT, f"materios-preprod:{second}:3", f"fresh #{second}",
+                                    group=f"materios-preprod signer {second}"), clock[0])
+        pager.flush(store, clock[0])
+        clock[0] += 1
+    assert min(later - earlier for earlier, later in zip(sent, sent[1:])) >= 5 * cw.PAGE_INTERVAL
+
+
+def _classified_cardano(name):
+    def add(config, store, now):
+        tx = _tx(name)
+        store.add(rules.classify_cardano_tx(_mainnet(config), tx["tx"], tx["utxos"], tx["redeemers"]), now)
+    return add
+
+
+def _sudo_multisig_leg(config, store, now):
+    block = json.loads(_read("materios/block_1829210.json"))
+    [leg] = rules.classify_materios_block("materios-preprod", block["number"],
+                                          _decoder_238().extrinsics(block["extrinsics"]), lambda: None, SUDO)
+    store.add(leg, now)
+
+
+def _polled_twice(prepare, change):
+    """A Materios source polled at a head, then again after ``change`` at the next one."""
+    def add(config, store, now):
+        chain = FakeChain(head=1000, blocks={}, state_at={1000, 1001})
+        prepare(chain)
+        source = _materios(config, store, chain)
+        source.poll(now)
+        change(chain)
+        chain.head = 1001
+        source.poll(now)
+    return add
+
+
+def _replace_code(chain):
+    chain.code_hash = "0x" + "11" * 32
+
+
+AUTHORITY_CAUSED = {
+    "custody outflow": _classified_cardano("custody_outflow"),
+    "pool spend that is not a surrender": _classified_cardano("pool_rotate"),
+    "mint under a watched policy": _classified_cardano("mint_v2"),
+    "multisig leg of Sudo.Key": _sudo_multisig_leg,
+    "Sudo.Key changed": _polled_twice(lambda chain: None, lambda chain: setattr(
+        chain, "sudo_key", "0x" + rules.account_bytes(ALICE).hex())),
+    "a friend vouched in the recovery of Sudo.Key": _polled_twice(
+        lambda chain: (_recoverable_by(chain, SUDO, FRIENDS), _recovering(chain, SUDO, RESCUER, [])),
+        lambda chain: _recovering(chain, SUDO, RESCUER, FRIENDS[:1])),
+    "runtime code replaced": _polled_twice(lambda chain: None, _replace_code),
+    "runtime environment digest": lambda config, store, now: store.add(
+        rules.runtime_changed("materios-preprod", 1829227), now),
+}
+
+
+def _drained(tmp_path):
+    """A pager whose bucket ten ALERTs, paging alone, have drained as far as they may."""
+    store = cw.Store(str(tmp_path / "state.db"))
+    for i in range(10):
+        store.add(_finding(f"alert-{i}", severity=rules.ALERT), now=1.0)
+    posts = Posts()
+    pager = cw.Pager(posts)
+    pager.flush(store, now=2.0)
+    return store, posts, pager
+
+
+@pytest.mark.parametrize("cause", sorted(AUTHORITY_CAUSED))
+def test_a_token_is_kept_for_what_only_sudo_key_an_authority_or_a_custody_key_can_cause(config, tmp_path, cause):
+    store, posts, pager = _drained(tmp_path)
+    AUTHORITY_CAUSED[cause](config, store, 3.0)
+    [page] = [f for f in store.unsent_pages() if not f.key.startswith("alert-")]
+    pager.flush(store, now=3.0)
+    assert f"**{page.headline}**" in posts.payloads[-1]["content"]
+
+
+def test_what_anyone_else_causes_waits_for_the_bucket_to_refill(tmp_path):
+    store, posts, pager = _drained(tmp_path)
+    store.add(_finding("stale"), now=3.0)
+    pager.flush(store, now=3.0)
+    assert "headline stale" not in posts.text()
+    pager.flush(store, now=3.0 + cw.PAGE_INTERVAL)
+    assert "headline stale" in posts.payloads[-1]["content"]
 
 
 def test_pending_findings_of_one_group_go_out_as_one_page(tmp_path):
@@ -160,8 +297,10 @@ def test_a_page_the_webhook_refuses_does_not_hold_back_the_rest_and_goes_out_as_
 
 
 def test_a_refused_page_is_retried_on_a_doubling_delay_not_every_flush(tmp_path):
+    # An authority's page, which the bucket's reserve never holds back, so only its
+    # refusals pace it.
     store = cw.Store(str(tmp_path / "state.db"))
-    store.add(_finding("refused"), now=1.0)
+    store.add(_finding("refused", authority=True), now=1.0)
     posts = Posts(fail=set(range(1, 100)), error=discord.DiscordError("webhook answered HTTP 400", status=400))
     pager = cw.Pager(posts)
     attempts = []
@@ -1159,7 +1298,11 @@ def test_what_a_friend_or_rescuer_of_sudo_key_signs_is_decoded_whatever_filler_t
     source = _materios(config, store, chain)
     source.start_at(7999)
     posts = Posts()
-    _watch(config, store, [source], posts, [_at("2026-09-28T02:00:00")]).cycle()
+    clock = [_at("2026-09-28T02:00:00")]
+    watch = _watch(config, store, [source], posts, clock)
+    for _ in range(int(cw.GROUPED_INTERVAL) + 1):
+        watch.cycle()
+        clock[0] += 1
     [page] = [p["content"] for p in posts.payloads if named in p["content"]]
     assert page.startswith("\U0001f6a8 **CRITICAL** @here")
     assert SUDO_KEY in page and f"signer {rules.render_account(signer)}" in page
