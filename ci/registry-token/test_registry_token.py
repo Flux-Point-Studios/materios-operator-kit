@@ -39,7 +39,9 @@ GITHUB_USERS = {
     "ghp_" + "D" * 36: ("realdecimalist", "write:packages", 200),
     "github_pat_" + "F" * 82: ("realdecimalist", None, 403),
 }
-PUSHERS = {NEW_TOKEN}
+# Tokens the registry lets push. Every token a check in check_token must refuse is listed, so a
+# refusal can only come from that check and never from the push probe that runs after it.
+PUSHERS = {NEW_TOKEN, "ghp_" + "B" * 36, "ghp_" + "S" * 36, "ghp_" + "P" * 36}
 
 
 def secret(value, images, events):
@@ -350,16 +352,16 @@ class RegistryTokenTest(unittest.TestCase):
         self.assert_refused_without_writes("github_pat_" + "F" * 82, "classic")
 
     def test_apply_refuses_a_token_with_more_than_package_scopes(self):
-        self.assert_refused_without_writes("ghp_" + "B" * 36, "repo")
+        self.assert_refused_without_writes("ghp_" + "B" * 36, "the token also carries repo; mint one with only write:packages")
 
     def test_apply_refuses_a_token_that_cannot_write_packages(self):
         self.assert_refused_without_writes("ghp_" + "R" * 36, "write:packages")
 
     def test_apply_refuses_a_token_of_another_user(self):
-        self.assert_refused_without_writes("ghp_" + "S" * 36, "someone-else")
+        self.assert_refused_without_writes("ghp_" + "S" * 36, "the token belongs to someone-else")
 
     def test_apply_refuses_a_token_the_organization_rejects(self):
-        self.assert_refused_without_writes("ghp_" + "P" * 36, "403")
+        self.assert_refused_without_writes("ghp_" + "P" * 36, "Flux-Point-Studios refused to list its packages to the token: HTTP 403")
 
     def test_apply_refuses_an_unknown_token(self):
         self.assert_refused_without_writes("ghp_" + "U" * 36, "401")
