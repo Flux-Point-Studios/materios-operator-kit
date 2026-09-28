@@ -525,7 +525,7 @@ class FakeChain:
 
 
 def _materios(config, store, chain):
-    return cw.MateriosSource(config.materios, chain, store)
+    return cw.MateriosSource(config.materios, chain, store, config.source_stale_seconds)
 
 
 def _drain(source, now=1.0):
@@ -768,6 +768,20 @@ def test_a_committee_inherent_that_cannot_be_read_pages_and_the_cursor_moves_on(
     [finding] = store.findings()
     assert finding.severity == rules.CRITICAL
     assert "committee inherent could not be classified" in finding.text and "KeyError" in finding.text
+
+
+def test_a_finalized_head_that_stops_advancing_is_a_source_failure(config, tmp_path):
+    """A node that has stopped following the chain still answers every read; without this
+    the watcher would report itself healthy while it watched nothing."""
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1000, blocks={}, state_at={1000, 1001})
+    source = _materios(config, store, chain)
+    source.poll(1.0)
+    source.poll(1.0 + config.source_stale_seconds)
+    with pytest.raises(cw.SourceError, match="finalized head #1000 has not advanced for 15 min"):
+        source.poll(2.0 + config.source_stale_seconds)
+    chain.head = 1001
+    assert source.poll(3.0 + config.source_stale_seconds)
 
 
 def test_a_dropped_connection_is_reopened_before_polling(config, tmp_path):
@@ -1095,7 +1109,7 @@ def test_a_backtest_reports_every_finding_in_its_window_and_pages_nothing(config
     network = _mainnet(config)
     api = FakeBlockfrost(tip=13_500_100, time=int(_at("2026-09-27T01:00:00")))
     api.add_tx("surrender_agent", address=network.pool.address, height=13_500_050)
-    sources = [cw.MateriosSource(config.materios, chain, store),
+    sources = [cw.MateriosSource(config.materios, chain, store, config.source_stale_seconds),
                cw.CardanoSource(network, api, store, stale_seconds=10 ** 9)]
     sources[0].start_at(1829209)
     sources[1].start_at(13_500_000)

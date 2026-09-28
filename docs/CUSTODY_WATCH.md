@@ -161,7 +161,10 @@ message through the webhook to prove delivery end to end.
 - **Its own death is visible.** The daily digest is also the liveness signal, and it
   names every stale source instead of reporting the watcher alive. A source that
   cannot be read for `source_stale_seconds` is paged CRITICAL, again every hour it
-  stays unreadable, and once more (ALERT) when it recovers. systemd restarts a loop
+  stays unreadable, and once more (ALERT) when it recovers. A node answering with a
+  finalized head that has not moved for `source_stale_seconds`, or a Cardano tip older
+  than that, counts as unreadable, since a node that has stopped following its chain
+  still answers every read. systemd restarts a loop
   that stops pinging its watchdog, and `OnFailure` pages when restarts are exhausted.
 
 ## Replaying history

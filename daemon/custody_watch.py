@@ -477,14 +477,19 @@ class MateriosSource:
 
     ``client`` is daemon-core's ``SubstrateClient`` (bounded per-call timeout and
     reconnect) or anything with the same ``connected``/``connect``/``rpc`` surface.
+    A finalized head that stops moving for ``stale_seconds`` is a failure to read the
+    source, since a node that has stopped following the chain still answers.
     """
 
-    def __init__(self, config: rules.MateriosConfig, client, store: Store):
+    def __init__(self, config: rules.MateriosConfig, client, store: Store, stale_seconds: int):
         self.name = config.name
         self.poll_seconds = config.poll_seconds
         self._config = config
         self._client = client
         self._store = store
+        self._stale_seconds = stale_seconds
+        # (finalized head, when it was first seen)
+        self._moved: tuple[int, float] | None = None
         self._cursor_key = f"cursor:{self.name}"
         self._authorities = frozenset(rules.account_bytes(a) for a in config.authority_accounts)
         # Keyed by genesis and spec version: a reset chain may reuse a spec version with
@@ -517,6 +522,11 @@ class MateriosSource:
     def poll(self, now: float) -> bool:
         """Process up to ``MAX_BLOCKS_PER_POLL`` blocks; True once at the finalized head."""
         head_hash, head = self._head()
+        if self._moved is None or self._moved[0] != head:
+            self._moved = (head, now)
+        elif now - self._moved[1] > self._stale_seconds:
+            raise SourceError(f"{self.name}: finalized head #{head} has not advanced for "
+                              f"{int(now - self._moved[1]) // 60} min")
         if self._reset(head, now):
             return True
         sudo_key = self._sudo_key(head_hash, head, now)
@@ -864,7 +874,7 @@ def build_sources(config: rules.WatchConfig, store: Store, materios_rpc: str | N
     sources: list = []
     if config.materios:
         client = SubstrateClient(DaemonConfig(rpc_url=materios_rpc or config.materios.rpc_url))
-        sources.append(MateriosSource(config.materios, client, store))
+        sources.append(MateriosSource(config.materios, client, store, config.source_stale_seconds))
     for network in config.cardano:
         api = Blockfrost(network.blockfrost_url, network.project_id_file)
         sources.append(CardanoSource(network, api, store, config.source_stale_seconds))
