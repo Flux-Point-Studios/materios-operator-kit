@@ -80,7 +80,7 @@ def http(method, url, auth, body=None):
     except urllib.error.HTTPError as e:
         return e.code, e.headers, e.read()
     except OSError as e:
-        raise Refused(f"{method} {url}: {getattr(e, 'reason', e)}") from None
+        raise Refused(f"{method} {url}: network error ({type(e).__name__})") from None
     except (ValueError, HTTPException) as e:
         # Their messages can quote a header value, and the Authorization header holds a token.
         raise Refused(f"{method} {url}: malformed request or response ({type(e).__name__})") from None
@@ -110,10 +110,7 @@ class Woodpecker:
     def call(self, method, path, body=None):
         status, _, raw = http(method, self.api + path, self._auth, body)
         if status >= 300:
-            reply = raw.decode(errors="replace")
-            if body and body.get("value"):
-                reply = reply.replace(body["value"], "<token>")
-            raise Refused(f"{method} {path}: HTTP {status} {reply[:200]}")
+            raise Refused(f"{method} {path}: HTTP {status}")
         return json.loads(raw) if raw.strip() else None
 
     def listing(self, path):

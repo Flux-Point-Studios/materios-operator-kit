@@ -7,6 +7,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -446,6 +447,20 @@ class RegistryTokenTest(unittest.TestCase):
         self.assertEqual(code, 1, text)
         self.assertIn("HTTP 422", text)
         self.assertIn("gchr_token", self.fake.global_secrets)
+
+    def test_woodpecker_read_error_cannot_echo_admin_token(self):
+        client = registry_token.Woodpecker("https://ci.example.invalid", self.wp_file)
+        with patch.object(registry_token, "http", return_value=(401, {}, f"bad Authorization: Bearer {WOODPECKER_TOKEN}".encode())):
+            with self.assertRaises(registry_token.Refused) as caught:
+                client.listing("/repos")
+        self.assertIn("HTTP 401", str(caught.exception))
+        self.assertNotIn(WOODPECKER_TOKEN, str(caught.exception))
+
+    def test_network_failure_cannot_echo_authorization_header(self):
+        with patch.object(registry_token.OPENER, "open", side_effect=OSError(f"Bearer {WOODPECKER_TOKEN}")):
+            with self.assertRaises(registry_token.Refused) as caught:
+                registry_token.http("GET", "https://ci.example.invalid/api/repos", f"Bearer {WOODPECKER_TOKEN}")
+        self.assertNotIn(WOODPECKER_TOKEN, str(caught.exception))
 
     def test_apply_keeps_every_part_of_the_token_out_of_a_truncated_echo(self):
         self.global_state()
