@@ -74,6 +74,7 @@ class Fake:
         self.github_calls = []
         self.registry_tokens = {}
         self.uploads = {}
+        self.upload_origin = ""
 
     def listing(self, secrets):
         return [{"name": n, "images": s["images"], "events": sorted(s["events"])} for n, s in sorted(secrets.items())]
@@ -157,7 +158,7 @@ class Fake:
                 return 403, {"errors": [{"code": "DENIED"}]}, {}
             session = f"{path}/session-{len(self.uploads)}"
             self.uploads[session] = "open"
-            return 202, None, {"Location": "/ghcr" + session}
+            return 202, None, {"Location": self.upload_origin + "/ghcr" + session}
         if method == "DELETE" and self.uploads.get(path) == "open" and token in PUSHERS:
             self.uploads[path] = "cancelled"
             return 204, None, {}
@@ -198,6 +199,39 @@ def serve(fake):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+class Elsewhere:
+    """A server on another origin. It records the Authorization header of every request it gets and
+    answers 404, or, given a target, redirects each request to the same path there."""
+
+    def __init__(self, target=None):
+        self.seen = []
+        seen = self.seen
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def handle_any(self):
+                seen.append(self.headers.get("Authorization"))
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(302 if target else 404)
+                if target:
+                    self.send_header("Location", target + self.path)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"[]")
+
+            do_GET = do_POST = do_PATCH = do_DELETE = handle_any
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
 
 
 class RegistryTokenTest(unittest.TestCase):
@@ -436,6 +470,53 @@ class RegistryTokenTest(unittest.TestCase):
         code, text = self.run_tool("plan", *self.repo_args())
         self.assertEqual(code, 1, text)
         self.assertIn("one line", text)
+
+    def elsewhere(self, target=None):
+        server = Elsewhere(target)
+        self.addCleanup(server.close)
+        return server
+
+    @contextlib.contextmanager
+    def env_set(self, name, value):
+        saved = self.env[name]
+        self.env[name] = value
+        try:
+            yield
+        finally:
+            self.env[name] = saved
+
+    def test_no_redirect_is_followed_with_a_credential(self):
+        sink = self.elsewhere()
+        apply_args = ["apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args()]
+        for name, argv in (("WOODPECKER_SERVER", ["plan", *self.repo_args()]),
+                           ("GITHUB_API_URL", apply_args), ("REGISTRY_URL", apply_args)):
+            with self.subTest(name), self.env_set(name, self.elsewhere(target=sink.base).base):
+                self.global_state()
+                code, text = self.run_tool(*argv)
+                self.assertEqual(sink.seen, [])
+                self.assertEqual(code, 1, text)
+                self.assertIn("redirect not followed", text)
+                self.assertEqual(self.fake.writes, [])
+
+    def test_credentials_leave_this_machine_only_over_https(self):
+        for name in ("WOODPECKER_SERVER", "GITHUB_API_URL", "REGISTRY_URL"):
+            with self.subTest(name), self.env_set(name, "http://ci.example.invalid"):
+                self.global_state()
+                code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+                self.assertEqual(code, 1, text)
+                self.assertIn("http://ci.example.invalid", text)
+                self.assertIn("only over https", text)
+                self.assertEqual(self.fake.writes, [])
+
+    def test_apply_refuses_a_probe_upload_the_registry_places_on_another_origin(self):
+        self.global_state()
+        sink = self.elsewhere()
+        self.fake.upload_origin = sink.base
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("another origin", text)
+        self.assertEqual(sink.seen, [])
+        self.assertEqual(self.fake.writes, [])
 
     def test_a_request_the_http_client_rejects_is_refused_without_its_header(self):
         with self.assertRaises(registry_token.Refused) as caught:

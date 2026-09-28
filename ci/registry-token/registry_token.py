@@ -20,10 +20,12 @@ only an admin may edit a global one. A repository copy's filter is therefore onl
 set of Woodpecker users: plan and apply name every user who is not an admin.
 
 Environment: WOODPECKER_SERVER, WOODPECKER_TOKEN_FILE (a file holding an admin API token),
-GITHUB_API_URL (default https://api.github.com), REGISTRY_URL (default https://ghcr.io).
+GITHUB_API_URL (default https://api.github.com), REGISTRY_URL (default https://ghcr.io). Each must use
+https, or plain http to a loopback address. No redirect is followed.
 """
 import argparse
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -47,12 +49,33 @@ class Refused(Exception):
     pass
 
 
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib copies every request header, Authorization included, onto the request a redirect makes."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        fp.close()
+        raise Refused(f"{req.get_method()} {req.full_url}: HTTP {code} redirect not followed")
+
+
+OPENER = urllib.request.build_opener(RefuseRedirects)
+
+
+def is_loopback(host):
+    try:
+        return host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def http(method, url, auth, body=None):
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" and not (parts.scheme == "http" and is_loopback(parts.hostname or "")):
+        raise Refused(f"{method} {url}: credentials leave this machine only over https")
     request = urllib.request.Request(
         url, method=method, data=None if body is None else json.dumps(body).encode(),
         headers={"Authorization": auth, "Content-Type": "application/json", "User-Agent": "registry-token/1"})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with OPENER.open(request, timeout=30) as response:
             return response.status, response.headers, response.read()
     except urllib.error.HTTPError as e:
         return e.code, e.headers, e.read()
@@ -223,7 +246,10 @@ def prove_push(registry_url, token):
     location = headers.get("Location")
     if status != 202 or not location:
         raise Refused(f"{REGISTRY} refused an upload to {PLUGIN_PACKAGE} with the token: HTTP {status}")
-    status, _, _ = http("DELETE", urllib.parse.urljoin(uploads, location), bearer)
+    session = urllib.parse.urljoin(uploads, location)
+    if urllib.parse.urlsplit(session)[:2] != urllib.parse.urlsplit(uploads)[:2]:
+        raise Refused(f"{REGISTRY} placed the probe upload on another origin; its token is not sent there")
+    status, _, _ = http("DELETE", session, bearer)
     return f"may push to {REGISTRY}/{PLUGIN_PACKAGE} (probe upload opened; its cancel answered HTTP {status})"
 
 
