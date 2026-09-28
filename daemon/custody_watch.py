@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Callable
 
 from substrateinterface.exceptions import SubstrateRequestException
+from substrateinterface.utils.hasher import blake2_128_concat, xxh128
 
 from daemon import custody_rules as rules
 from daemon import discord
@@ -516,8 +517,14 @@ class Watch:
 # --- Materios ---------------------------------------------------------------------------
 
 
-SUDO_KEY_STORAGE = "0x5c0d1176a568c1f92944340dbfed9e9c530ebca703c85910e7164cb7d1c9e47b"
-SYSTEM_EVENTS_STORAGE = "0x26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7"
+SUDO_KEY_STORAGE = "0x" + (xxh128(b"Sudo") + xxh128(b"Key")).hex()
+SYSTEM_EVENTS_STORAGE = "0x" + (xxh128(b"System") + xxh128(b"Events")).hex()
+RECOVERY_PROXY = xxh128(b"Recovery") + xxh128(b"Proxy")
+
+
+def recovery_proxy_key(rescuer: bytes) -> str:
+    """The storage key of Recovery.Proxy(rescuer): the account the rescuer may act as."""
+    return "0x" + (RECOVERY_PROXY + blake2_128_concat(rescuer)).hex()
 MAX_BLOCKS_PER_POLL = 600
 BLOCK_SECONDS = 6
 
@@ -682,6 +689,24 @@ class MateriosSource:
             logger.warning("%s: events at %s do not decode: %s: %s", self.name, block_hash, type(e).__name__, e)
             return None
 
+    def _storage_at(self, keys: list[str], at_hash: str) -> dict[str, str | None]:
+        """Each of ``keys`` at ``at_hash``, None for one that holds nothing, in one read."""
+        [changes] = self._rpc("state_queryStorageAt", [keys, at_hash])
+        return {key: value for key, value in changes["changes"]}
+
+    def _dispatch_facts(self, parent_hash: str, block_hash: str, rescuers: frozenset[bytes]) -> dict | None:
+        """Sudo.Key and each rescuer's Recovery.Proxy, for those that held one value at
+        both the block's parent and the block, so none changed inside it; None once the
+        node has pruned either state."""
+        keys = {rules.SUDO: SUDO_KEY_STORAGE, **{rules.proxy_fact(r): recovery_proxy_key(r) for r in rescuers}}
+        try:
+            before = self._storage_at(list(keys.values()), parent_hash)
+            after = self._storage_at(list(keys.values()), block_hash)
+        except SubstrateRequestException:
+            return None
+        return {fact: bytes.fromhex(after[key][2:]) if after.get(key) else None
+                for fact, key in keys.items() if before.get(key) == after.get(key)}
+
     def _block(self, number: int, block_hash: str, sudo_key: bytes | None, now: float) -> int:
         """Classify one block and commit its findings with the cursor; returns the values
         its extrinsics and events decoded into."""
@@ -692,9 +717,9 @@ class MateriosSource:
         decoder = self._decoder
         before = decoder.values
         extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, self._authorities))
-        findings = rules.classify_materios_block(self.name, number, extrinsics,
-                                                 lambda: self._events(block_hash, decoder), sudo_key,
-                                                 self._authorities)
+        findings = rules.classify_materios_block(
+            self.name, number, extrinsics, lambda: self._events(block_hash, decoder), sudo_key, self._authorities,
+            lambda rescuers: self._dispatch_facts(header["parentHash"], block_hash, rescuers))
         try:
             committee = rules.committee_of(extrinsics)
         except Exception as e:  # the inherent's shape is the block author's; it must not stall the cursor

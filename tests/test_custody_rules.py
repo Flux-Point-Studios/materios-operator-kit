@@ -463,7 +463,8 @@ ALICE = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
     ],
 )
 def test_privileged_calls_without_history_are_classified(call, severity):
-    [finding] = rules.classify_materios_block("materios-preprod", 1, [{"address": ALICE, "call": call}],
+    # Unsigned, so no account's origin keeps a root-gated call from counting.
+    [finding] = rules.classify_materios_block("materios-preprod", 1, [{"call": call}],
                                               read_events=lambda: None, sudo_key=None)
     assert finding.severity == severity
 
@@ -583,7 +584,7 @@ def test_a_multisig_of_more_signatories_than_any_limit_is_classified():
 def test_an_extrinsic_the_classifier_cannot_read_pages_critical_and_the_rest_are_classified():
     broken = {"extrinsic_hash": "0x" + "ab" * 32, "address": ALICE,
               "call": {"call_module": "Sudo", "call_function": "sudo", "call_args": 5}}
-    later = _signed(ALICE, "Balances", "force_transfer", source=ALICE, dest=ALICE, value=1)
+    later = _signed(SUDO_KEY, "Balances", "force_transfer", source=ALICE, dest=ALICE, value=1)
     first, second = _classify_extrinsics([broken, later])
     assert first.severity == rules.CRITICAL
     assert first.headline == "materios-preprod #9 extrinsic 0 could not be classified"
@@ -660,28 +661,43 @@ def test_an_ordinary_account_calling_sudo_goes_to_the_digest_once_the_call_faile
     assert unverified.severity == rules.CRITICAL
 
 
-@pytest.mark.parametrize(
-    "call, events",
-    [
-        (_call("Utility", "batch", calls=[_call("Sudo", "sudo", call=SET_CODE)]),
-         {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
-        (_call("Utility", "force_batch", calls=[_call("Balances", "force_transfer", source=ALICE, dest=BOB, value=1)]),
-         {0: ["Utility.ItemFailed", "Utility.BatchCompletedWithErrors", "System.ExtrinsicSuccess"]}),
-        (_call("Multisig", "as_multi", threshold=2, other_signatories=[BOB], maybe_timepoint=None,
-               call=_call("Sudo", "sudo", call=SET_CODE)),
-         {0: ["Multisig.NewMultisig", "System.ExtrinsicSuccess"]}),
-        (_call("Utility", "batch", calls=[_call("Utility", "dispatch_as", as_origin={"system": "Root"}, call=SET_CODE)]),
-         {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
-        (_call("Utility", "batch", calls=[_call("Utility", "as_derivative", index=0, call=_call("Sudo", "sudo", call=SET_CODE))]),
-         {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
-    ],
-)
+ROOT_GATED_FROM_AN_ACCOUNT = [
+    (_call("Utility", "force_batch", calls=[_call("Balances", "force_transfer", source=ALICE, dest=BOB, value=1)]),
+     {0: ["Utility.ItemFailed", "Utility.BatchCompletedWithErrors", "System.ExtrinsicSuccess"]}),
+    (_call("Utility", "batch", calls=[_call("Utility", "dispatch_as", as_origin={"system": "Root"}, call=SET_CODE)]),
+     {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
+]
+SUDO_FROM_AN_ACCOUNT = [
+    (_call("Utility", "batch", calls=[_call("Sudo", "sudo", call=SET_CODE)]),
+     {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
+    (_call("Multisig", "as_multi", threshold=2, other_signatories=[BOB], maybe_timepoint=None,
+           call=_call("Sudo", "sudo", call=SET_CODE)),
+     {0: ["Multisig.NewMultisig", "System.ExtrinsicSuccess"]}),
+    (_call("Utility", "batch", calls=[_call("Utility", "as_derivative", index=0, call=_call("Sudo", "sudo", call=SET_CODE))]),
+     {0: ["Utility.BatchInterrupted", "System.ExtrinsicSuccess"]}),
+]
+
+
+@pytest.mark.parametrize("call, events", ROOT_GATED_FROM_AN_ACCOUNT + SUDO_FROM_AN_ACCOUNT)
 def test_a_root_gated_call_an_ordinary_origin_cannot_dispatch_goes_to_the_digest(call, events):
     [finding] = _classify_extrinsics([{"address": ALICE, "call": call}], events=events)
     assert finding.severity == rules.INFO
     assert "cannot take effect from this origin" in finding.render()
-    [unverified] = _classify_extrinsics([{"address": ALICE, "call": call}], events=None)
-    assert unverified.severity == rules.CRITICAL
+
+
+@pytest.mark.parametrize("call, events", ROOT_GATED_FROM_AN_ACCOUNT)
+def test_a_root_gated_call_from_an_account_needs_neither_events_nor_state_to_be_inert(call, events):
+    # Root comes only from Sudo, never from an account's own origin.
+    [finding] = _classify_extrinsics([{"address": ALICE, "call": call}], events=None)
+    assert finding.severity == rules.INFO
+    assert "cannot take effect from this origin" in finding.render()
+
+
+@pytest.mark.parametrize("call, events", SUDO_FROM_AN_ACCOUNT)
+def test_a_sudo_call_from_an_account_without_events_or_state_pages_grouped_per_source(call, events):
+    [finding] = _classify_extrinsics([{"address": ALICE, "call": call}], events=None)
+    assert finding.severity == rules.CRITICAL
+    assert finding.group == "materios-preprod unverified"
 
 
 def test_a_live_call_beside_an_inert_one_still_pages():
@@ -780,7 +796,7 @@ def test_recovery_that_touches_an_authority_account_is_critical(ext, authorities
 
 def test_an_ordinary_signers_findings_share_a_group_and_an_authoritys_page_alone(decoder):
     [ordinary] = _classify_extrinsics([_signed(ALICE, "Recovery", "create_recovery", friends=[BOB],
-                                               threshold=1, delay_period=0)])
+                                               threshold=1, delay_period=0)], events=SUCCEEDED)
     assert ordinary.group == f"materios-preprod signer {ALICE}"
     [authority] = _findings(decoder, "block_1829210.json")
     assert authority.group is None
@@ -817,7 +833,7 @@ def test_the_call_tree_stops_growing_at_its_line_limit_while_it_is_walked():
     calls = [_call("System", "remark", remark="0x00") for _ in range(5000)]
     batch = _call("Utility", "batch", calls=calls)
     tree = rules._Tree(None, frozenset())
-    rules._walk(batch, None, tree, 0, (), False, True)
+    rules._walk(batch, None, tree, 0, (), frozenset(), True)
     assert len(tree.lines) == rules.MAX_TREE_LINES
     [finding] = _classify_extrinsics([_signed(ALICE, "Sudo", "sudo", call=batch)])
     assert finding.details[-1] == "... 4,802 more lines of the call tree"

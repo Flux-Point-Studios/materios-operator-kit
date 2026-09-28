@@ -50,8 +50,18 @@ rather than paging unless its signer, or a multisig or derivative account of its
 signer, is `Sudo.Key` or a configured authority. Naming an authority as the target of
 `sudo_as`, `as_recovered` or `dispatch_as` proves nothing about who signed, so it does
 not count. An event from the `Sudo` pallet proves its caller held the
-key at that block, so the call pages whatever key the watcher last read. While the
-events cannot be read, every attempt pages as though it took effect.
+key at that block, so the call pages whatever key the watcher last read.
+
+Any funded account can push a block's events past the decode budget, so a block's
+events are not what decides whether an ordinary account's attempt could have taken
+effect. When an extrinsic's events cannot be read, the watcher reads `Sudo.Key`, and
+`Recovery.Proxy` of every account that calls `as_recovered`, at the block's parent and
+at the block, in one storage query each. A value that is the same at both held
+throughout the block, so a `Sudo` call from any other account, and an `as_recovered`
+whose caller is not the proxy of the account it names, could not take effect and goes
+to the digest with everything it wraps. A root-gated call from an account needs no
+proof. What the state cannot rule out pages, grouped per source rather than per
+signer; an authority's attempts page alone as before.
 
 ## Paging
 

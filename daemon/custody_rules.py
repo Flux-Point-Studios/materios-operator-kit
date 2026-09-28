@@ -563,20 +563,36 @@ def _indent(depth: int) -> str:
     return "  " * min(depth, MAX_INDENT)
 
 
+# What must hold for a call to dispatch, as (fact, value): the call is blocked once a
+# block's state proves the fact holds another value. SUDO is Sudo.Key; ("proxy", rescuer)
+# is Recovery.Proxy(rescuer), the account the rescuer may act as. NEVER, a root-gated call
+# reached from an account, needs no proof: Root comes only from Sudo.
+SUDO = ("sudo",)
+NEVER = (("never",), None)
+
+
+def proxy_fact(rescuer: bytes) -> tuple:
+    return ("proxy", rescuer)
+
+
 @dataclass(frozen=True)
 class _Site:
     """A privileged call in an extrinsic's call tree, with its own arguments rendered;
-    ``inert`` when its origin cannot dispatch it, ``unlisted`` when it is in neither
-    call table."""
+    ``conditions`` for its dispatch, ``unlisted`` when it is in neither call table."""
     path: str
     args: str
     depth: int
     severity: Severity
-    inert: bool
+    conditions: frozenset
     unlisted: bool
 
-    def line(self, counted: bool) -> str:
-        notes = [" (cannot take effect from this origin)"] if self.inert and not counted else []
+    def blocked(self, facts: dict) -> bool:
+        """Whether ``facts`` (fact -> the value the chain's state proves it held) show this
+        call could not dispatch."""
+        return any(c == NEVER or (c[0] in facts and facts[c[0]] != c[1]) for c in self.conditions)
+
+    def line(self, counted: bool, blocked: bool) -> str:
+        notes = [" (cannot take effect from this origin)"] if blocked and not counted else []
         if self.unlisted:
             notes.append(" (in neither the severity table nor the routine list)")
         args = self.args if len(self.args) <= MAX_SITE_ARGS else self.args[:MAX_SITE_ARGS] + "\u2026"
@@ -677,19 +693,26 @@ def _abridged(path: tuple[str, ...]) -> str:
     return f"{path[0]} > \u2026 {len(path) - 2} calls \u2026 > {path[-1]}"
 
 
-def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...], inert: bool,
+def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...], conditions: frozenset,
           proven: bool) -> None:
-    """Record ``call`` and every call it wraps. A subtree is inert when its origin is an
-    account that cannot dispatch it: a Sudo call from any account but Sudo.Key, or a
-    root-gated call from any account at all. ``proven`` holds while the origin follows
-    from the signer alone; only such an origin can make an authority's attempt."""
+    """Record ``call`` and every call it wraps. From an account's origin a root-gated call
+    never dispatches, a Sudo call dispatches only if that account holds Sudo.Key, and
+    Recovery.as_recovered, with everything it wraps, only if its Recovery.Proxy is the
+    account named; a subtree carries the conditions of every call above it. ``proven``
+    holds while the origin follows from the signer alone; only such an origin can make
+    an authority's attempt."""
     module, function = call["call_module"], call["call_function"]
     args = _args(call)
     path = (*parents, f"{module}.{function}")
     rendered = ", ".join(f"{k}={_render_value(v)}" for k, v in args.items() if not _holds_calls(v))
     tree.line(f"{_indent(depth)}{module}.{function}({rendered})")
     if isinstance(origin, bytes):
-        inert = inert or (module == "Sudo" and origin != tree.sudo_key) or (module, function) in _ROOT_GATED
+        if (module, function) in _ROOT_GATED:
+            conditions = conditions | {NEVER}
+        elif module == "Sudo":
+            conditions = conditions | {(SUDO, origin)}
+        elif (module, function) == ("Recovery", "as_recovered") and (lost := _account(args.get("account"))):
+            conditions = conditions | {(proxy_fact(origin), lost)}
     inner = _inner_origin(module, function, args, origin, tree, depth)
     inner_proven = proven and (module, function) in _DERIVED
     if any(p and isinstance(o, bytes) and o in tree.authority for o, p in ((origin, proven), (inner, inner_proven))):
@@ -699,11 +722,11 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     if unlisted:
         severity = ALERT
     if severity is not None:
-        tree.sites.append(_Site(_abridged(path), rendered, depth, severity, inert, unlisted))
+        tree.sites.append(_Site(_abridged(path), rendered, depth, severity, conditions, unlisted))
     for value in args.values():
         for child in ([value] if _is_call(value) else value if isinstance(value, list) else []):
             if _is_call(child):
-                _walk(child, inner, tree, depth + 1, path, inert, inner_proven)
+                _walk(child, inner, tree, depth + 1, path, conditions, inner_proven)
 
 
 RUNTIME_ENVIRONMENT_UPDATED = "0x08"
@@ -733,11 +756,17 @@ def _undecoded_line(index: int, ext: dict) -> str:
 
 def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
                             read_events: Callable[[], dict[int, list[str]] | None], sudo_key: bytes | None,
-                            authorities: frozenset[bytes] = frozenset()) -> list[Finding]:
+                            authorities: frozenset[bytes] = frozenset(),
+                            read_state: Callable[[frozenset[bytes]], dict | None] = lambda rescuers: None,
+                            ) -> list[Finding]:
     """Findings for a block's extrinsics, each call tree walked once. ``read_events``
     returns the block's events by extrinsic, or None when they could not be read, and is
-    called once, only when an extrinsic has something to report. Without events an
-    attempt is paged as though it took effect, since nothing shows it failed."""
+    called once, only when an extrinsic has something to report. Without an extrinsic's
+    events its calls page as though they took effect, except those the chain's state
+    proves could not: ``read_state`` is called at most once, only then, with the
+    rescuers whose Recovery.Proxy matters, and returns the facts (SUDO, and
+    ("proxy", rescuer)) that held the same value at the block's parent and at the
+    block, or None when that state is gone too."""
     findings = []
     accounts = accountable(sudo_key, authorities)
     # What cannot be read may hide any call, so it pages CRITICAL: grouped per source
@@ -769,7 +798,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
         signer = _account(ext.get("address"))
         tree = _Tree(sudo_key, accounts)
         try:
-            _walk(ext["call"], signer, tree, 0, (), False, True)
+            _walk(ext["call"], signer, tree, 0, (), frozenset(), True)
         except Exception as e:  # argument values are the signer's choice; none may stall the block
             findings.append(unclassifiable(key, f"{chain} #{number} extrinsic {index}", e,
                                            f"extrinsic hash {ext.get('extrinsic_hash')}", group=unreadable))
@@ -777,12 +806,19 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
         if tree.sites or (signer is not None and signer == sudo_key):
             reported.append((index, ext, signer, tree))
     events = read_events() if reported else None
-    findings.extend(_report(chain, number, index, ext, signer, tree, events) for index, ext, signer, tree in reported)
+    unverified = [tree for index, _, signer, tree in reported
+                  if (events is None or events.get(index) is None) and signer not in (None, sudo_key)
+                  and not tree.involved]
+    rescuers = frozenset(fact[1] for tree in unverified for site in tree.sites
+                         for fact, _ in site.conditions if fact[0] == "proxy")
+    facts = read_state(rescuers) if unverified else None
+    findings.extend(_report(chain, number, index, ext, signer, tree, events, facts)
+                    for index, ext, signer, tree in reported)
     return findings
 
 
 def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None, tree: _Tree,
-            events: dict[int, list[str]] | None) -> Finding:
+            events: dict[int, list[str]] | None, facts: dict | None) -> Finding:
     address = ext.get("address")
     # Every applied extrinsic has events, so one with none is as unverified as a block
     # whose events could not be read.
@@ -801,19 +837,26 @@ def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None
         notes = [f"signer {render_account(signer)}"]
     if by_sudo:
         notes.append("signed by Sudo.Key")
-    counted = tree.sites
+    # An authority's attempts page whatever their outcome; anyone else's page only when
+    # they could have taken effect.
+    counted, proof = tree.sites, {}
+    ordinary = not tree.involved and signer is not None
     if own is None:
         notes.append("events unavailable (state pruned or undecodable): dispatch result not verified")
+        if ordinary:
+            proof = facts or {}
+            counted = [s for s in tree.sites if not s.blocked(proof)]
+            notes.append("Sudo.Key and Recovery.Proxy, the same at the block and its parent, decide what could "
+                         "take effect" if facts is not None else "state at the block unavailable too")
     else:
         shown = [e for e in own if not e.startswith(EVENT_NOISE)]
         notes.append("result: " + (", ".join(shown) if shown else "no events"))
-        # An authority's attempts page whatever their outcome; anyone else's page only
-        # when they could have taken effect.
+        proof = {SUDO: tree.sudo_key}
         if not tree.involved and any(e.startswith("System.ExtrinsicFailed") for e in own):
             counted = []
             notes.append("dispatch failed: nothing took effect")
         elif not tree.involved:
-            counted = [s for s in tree.sites if not s.inert]
+            counted = [s for s in tree.sites if not s.blocked(proof)]
     severity = CRITICAL if by_sudo else max((s.severity for s in counted), default=INFO)
     # Calls that count lead, most severe and then innermost first, so the headline and
     # the top of a truncated page name the call that matters.
@@ -821,7 +864,7 @@ def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None
     ranked = sorted(tree.sites, key=lambda s: (id(s) not in live, -s.severity, -s.depth))
     call = ext["call"]
     top = ranked[0].path if ranked else f"{call['call_module']}.{call['call_function']}"
-    sites = [s.line(id(s) in live) for s in ranked[:MAX_SITE_LINES]]
+    sites = [s.line(id(s) in live, s.blocked(proof)) for s in ranked[:MAX_SITE_LINES]]
     if len(ranked) > MAX_SITE_LINES:
         sites.append(f"... {len(ranked) - MAX_SITE_LINES:,} more privileged calls")
     lines = tree.lines + ([f"... {tree.hidden:,} more lines of the call tree"] if tree.hidden else [])
@@ -830,7 +873,8 @@ def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None
         key=f"{chain}:{number}:{index}",
         headline=f"{chain} #{number} extrinsic {index}: {top}",
         details=tuple(notes + sites + ["call tree:"] + lines),
-        group=None if tree.involved or signer is None else f"{chain} signer {render_account(signer)}",
+        group=(None if not ordinary else f"{chain} unverified" if own is None
+               else f"{chain} signer {render_account(signer)}"),
     )
 
 

@@ -7,6 +7,7 @@ Cardano from the captured Blockfrost transactions (see test_custody_rules).
 
 import copy
 import dataclasses
+import functools
 import gzip
 import http.server
 import json
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import pytest
 from substrateinterface.exceptions import SubstrateRequestException
+from substrateinterface.utils.hasher import blake2_128_concat, xxh128
 
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
@@ -612,6 +614,10 @@ class FakeChain:
         self.state_at = set(state_at or ())
         self.events_hex = events_hex
         self.sudo_key = "0x" + rules.account_bytes(SUDO_KEY).hex()
+        # Storage beyond Sudo.Key and the events, by key; ``storage_at`` overrides it,
+        # Sudo.Key included, at one block number.
+        self.storage: dict[str, str] = {}
+        self.storage_at: dict[int, dict[str, str | None]] = {}
         self.metadata = _read("materios/metadata_spec238.hex.gz").decode()
         self.headers = json.loads(_read("materios/headers_spec238_upgrade.json"))
         self.calls = []
@@ -643,6 +649,12 @@ class FakeChain:
         if block_hash is not None and self.number_of(block_hash) not in self.state_at:
             raise SubstrateRequestException({"code": 4003, "message": "State already discarded"})
 
+    def value(self, key: str, block_hash: str):
+        at = self.storage_at.get(self.number_of(block_hash), {})
+        if key in at:
+            return at[key]
+        return self.sudo_key if key == SUDO_STORAGE_KEY else self.storage.get(key)
+
     def rpc(self, method, params):
         self.calls.append((method, params))
         if method == "chain_getFinalizedHead":
@@ -665,10 +677,14 @@ class FakeChain:
         if method == "state_getStorage":
             key, at = params
             self._state(at)
-            if key == SUDO_STORAGE_KEY:
-                return self.sudo_key
             if key == EVENTS_KEY:
                 return self.events_hex
+            if key == SUDO_STORAGE_KEY:
+                return self.value(key, at)
+        if method == "state_queryStorageAt":
+            keys, at = params
+            self._state(at)
+            return [{"block": at, "changes": [[k, self.value(k, at)] for k in keys]}]
         raise AssertionError(f"unexpected RPC {method} {params}")
 
 
@@ -955,6 +971,111 @@ def test_filler_smaller_than_an_authoritys_leg_leaves_the_legs_page_its_call_and
     assert "multisig account is Sudo.Key" in leg["content"]
     assert f"signer {rules.render_account(LEG_SIGNER)}" in leg["content"]
     assert f"signer {rules.render_account(STRANGER)}" in undecoded["content"]
+
+
+UTILITY_BATCH, REMARK_WITH_EVENT = bytes([8, 0]), bytes([0, 7])
+REMARK_X = bytes([0, 0]) + rules._compact(1) + b"x"
+SUDO_REMARK = bytes([6, 0]) + REMARK_X
+AS_SUDO_KEY_REMARK = bytes([24, 0, 0]) + rules.account_bytes(SUDO_KEY) + REMARK_X
+ATTEMPTERS = [bytes([0xB0 + i]) * 32 for i in range(6)]
+OVERFLOW_AT = 7000
+
+
+def _events_overflow(chain, attempts, items=3200):
+    """At OVERFLOW_AT, ``attempts`` ((call, signer), each failing) behind one routine
+    Utility.batch of ``items`` remark_with_event, whose Remarked and ItemCompleted events
+    take the block's events past DECODE_BUDGET: any funded account can send one."""
+    batch = signed_extrinsic(UTILITY_BATCH + rules._compact(items) + (REMARK_WITH_EVENT + rules._compact(0)) * items,
+                             bytes([0xA0]) * 32)
+    chain.extra[OVERFLOW_AT] = [batch, *(signed_extrinsic(call, signer) for call, signer in attempts)]
+    chain.events_hex = _batch_events(items, len(attempts))
+
+
+@functools.lru_cache(maxsize=None)
+def _batch_events(items: int, failed: int) -> str:
+    """System.Events of the routine block's three inherents, a batch of ``items``
+    remark_with_event, then ``failed`` extrinsics that failed with Sudo's RequireSudo."""
+    decoder = rules.RuntimeDecoder(_read("materios/metadata_spec238.hex.gz").decode())
+    info = {"weight": {"ref_time": 1, "proof_size": 0}, "class": "Normal", "pays_fee": "Yes"}
+
+    def record(index, event):
+        return {"phase": {"ApplyExtrinsic": index}, "event": event, "topics": []}
+
+    success = {"System": {"ExtrinsicSuccess": {"dispatch_info": info}}}
+    records = [record(i, success) for i in range(3)]
+    for _ in range(items):
+        records += [record(3, {"System": {"Remarked": {"sender": "0x" + "a0" * 32, "hash": "0x" + "00" * 32}}}),
+                    record(3, {"Utility": "ItemCompleted"})]
+    records += [record(3, {"Utility": "BatchCompleted"}), record(3, success)]
+    records += [record(4 + i, {"System": {"ExtrinsicFailed": {
+        "dispatch_error": {"Module": {"index": 6, "error": "0x00000000"}}, "dispatch_info": info}}})
+        for i in range(failed)]
+    events = decoder._config.create_scale_object(decoder._events_type, metadata=decoder._metadata)
+    return events.encode(records).to_hex()
+
+
+def _watch_overflow(config, tmp_path, attempts, state_at=(OVERFLOW_AT - 1, OVERFLOW_AT), items=3200):
+    chain = FakeChain(head=OVERFLOW_AT + 1, blocks={}, state_at={*state_at, OVERFLOW_AT + 1})
+    _events_overflow(chain, attempts, items)
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(OVERFLOW_AT - 1)
+    posts = Posts()
+    _watch(config, store, [source], posts, [_at("2026-09-28T02:00:00")]).cycle()
+    return store, posts, chain
+
+
+@pytest.mark.parametrize("call", [SUDO_REMARK, AS_SUDO_KEY_REMARK], ids=["sudo", "as_recovered"])
+def test_failed_attempts_in_a_block_whose_events_overflow_are_proven_inert_from_its_state(config, tmp_path, call):
+    store, posts, _ = _watch_overflow(config, tmp_path, [(call, signer) for signer in ATTEMPTERS])
+    findings = store.findings()
+    assert len(findings) == len(ATTEMPTERS)
+    assert all(f.severity == rules.INFO and "events unavailable" in f.text for f in findings)
+    assert all("cannot take effect from this origin" in f.text for f in findings)
+    assert posts.payloads == []
+
+
+def test_the_same_block_with_its_events_read_is_the_control(config, tmp_path):
+    store, posts, _ = _watch_overflow(config, tmp_path, [(SUDO_REMARK, s) for s in ATTEMPTERS], items=100)
+    assert [f.severity for f in store.findings()] == [rules.INFO] * len(ATTEMPTERS)
+    assert all("dispatch failed" in f.text for f in store.findings())
+
+
+def test_unverified_attempts_page_as_one_group_per_source_when_the_state_is_pruned_too(config, tmp_path):
+    store, posts, _ = _watch_overflow(config, tmp_path, [(SUDO_REMARK, s) for s in ATTEMPTERS], state_at=())
+    findings = store.findings()
+    assert {f.severity for f in findings} == {rules.CRITICAL}
+    assert {f.group for f in findings} == {"materios-preprod unverified"}
+    [page] = posts.payloads
+    assert f"**{len(ATTEMPTERS)} findings from materios-preprod unverified**" in page["content"]
+
+
+def test_a_sudo_key_that_changed_inside_the_block_proves_nothing(config, tmp_path):
+    # No events are served, so the attempt is unverified.
+    signer = ATTEMPTERS[0]
+    chain = FakeChain(head=OVERFLOW_AT, blocks={}, state_at={OVERFLOW_AT - 1, OVERFLOW_AT})
+    chain.storage_at[OVERFLOW_AT - 1] = {SUDO_STORAGE_KEY: "0x" + signer.hex()}
+    chain.extra[OVERFLOW_AT] = [signed_extrinsic(SUDO_REMARK, signer)]
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(OVERFLOW_AT - 1)
+    source.poll(1.0)
+    [finding] = store.findings()
+    assert finding.severity == rules.CRITICAL and "Sudo.sudo" in finding.text
+
+
+def test_an_attempt_by_the_proxy_of_the_account_it_acts_as_still_pages(config, tmp_path):
+    signer = ATTEMPTERS[0]
+    chain = FakeChain(head=OVERFLOW_AT, blocks={}, state_at={OVERFLOW_AT - 1, OVERFLOW_AT})
+    proxy = "0x" + (xxh128(b"Recovery") + xxh128(b"Proxy") + blake2_128_concat(signer)).hex()
+    chain.storage[proxy] = "0x" + rules.account_bytes(SUDO_KEY).hex()
+    chain.extra[OVERFLOW_AT] = [signed_extrinsic(AS_SUDO_KEY_REMARK, signer)]
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(OVERFLOW_AT - 1)
+    source.poll(1.0)
+    [finding] = store.findings()
+    assert finding.severity == rules.CRITICAL and "Recovery.as_recovered" in finding.text
 
 
 def _custody_outflow_pending(config, tmp_path):
