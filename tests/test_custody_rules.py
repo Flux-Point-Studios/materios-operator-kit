@@ -121,15 +121,53 @@ def test_a_changed_committee_is_an_alert(decoder):
     assert committee[0][0] in finding.render()
 
 
-def test_an_extrinsic_the_runtime_metadata_cannot_decode_is_an_alert(decoder):
+def test_an_extrinsic_the_runtime_metadata_cannot_decode_pages_critical_grouped_per_source(decoder):
     block = _block("block_2029707.json")
     garbage = "0x" + (bytes([12, 4, 0xFE, 0x01]) + bytes(2)).hex()
     extrinsics = decoder.extrinsics(block["extrinsics"] + [garbage])
     [finding] = rules.classify_materios_block("materios-preprod", block["number"], extrinsics,
                                               events=None, sudo_key=None)
-    assert finding.severity == rules.ALERT
+    assert finding.severity == rules.CRITICAL
+    assert finding.group == "materios-preprod unclassifiable"
     assert finding.key == f"materios-preprod:{block['number']}:{len(block['extrinsics'])}"
     assert "could not be decoded" in finding.render()
+
+
+UTILITY_BATCH = bytes([8, 0])
+AUTHORIZE_UPGRADE = bytes([0, 9])
+
+
+def nested_sudo_leg(levels: int) -> str:
+    """The spec-238 propose leg as block 1829210 carries it, signature and all, with the
+    System.authorize_upgrade its Sudo.sudo wraps nested ``levels`` Utility.batch calls deep."""
+    raw = bytes.fromhex(_block("block_1829210.json")["extrinsics"][2][2:])
+    body = raw[2:]
+    assert raw[:2] == rules._compact(len(body))
+    at = body.index(AUTHORIZE_UPGRADE + bytes.fromhex(SPEC_238_CODE_HASH[2:]))
+    call = body[at:at + 34]
+    for _ in range(levels):
+        call = UTILITY_BATCH + rules._compact(1) + call
+    body = body[:at] + call + body[at + 34:]
+    return "0x" + (rules._compact(len(body)) + body).hex()
+
+
+@pytest.mark.parametrize("levels", [0, 1, 250])
+def test_a_sudo_leg_nested_as_deep_as_a_runtime_decodes_is_read_and_named(decoder, levels):
+    # A runtime decodes an extrinsic nested up to MAX_EXTRINSIC_DEPTH (256) deep.
+    leg = nested_sudo_leg(levels)
+    if levels == 0:
+        assert leg == _block("block_1829210.json")["extrinsics"][2]
+    [ext] = decoder.extrinsics([leg])
+    assert "undecodable" not in ext
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [ext], None, rules.account_bytes(SUDO_KEY))
+    text = finding.render()
+    assert finding.severity == rules.CRITICAL and finding.group is None
+    assert finding.headline.endswith("System.authorize_upgrade")
+    assert "Sudo.sudo" in text and "multisig account is Sudo.Key" in text
+    # The call's own arguments lead the details however deep it sits in the tree, and
+    # the finding stays small.
+    assert SPEC_238_CODE_HASH in "\n".join(finding.details[:5])
+    assert len(text) < 20_000
 
 
 def test_a_runtime_upgrade_is_read_from_the_block_digest():
@@ -505,7 +543,7 @@ def test_the_headline_names_the_most_severe_call_and_its_line_leads_the_details(
     [finding] = _classify_extrinsics([{"address": SUDO_KEY, "call": call}])
     assert finding.headline.endswith("extrinsic 0: Sudo.sudo > Utility.batch_all > System.set_code")
     sites = [d for d in finding.details if d.startswith(("CRITICAL: ", "ALERT: "))]
-    assert sites[0] == "CRITICAL: Sudo.sudo > Utility.batch_all > System.set_code"
+    assert sites[0].startswith("CRITICAL: Sudo.sudo > Utility.batch_all > System.set_code(code=")
     assert finding.details.index(sites[0]) < finding.details.index("call tree:")
 
 

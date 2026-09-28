@@ -23,6 +23,7 @@ import enum
 import hashlib
 import json
 import re
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -202,6 +203,12 @@ def _parse_redemption(network: str, doc: dict) -> Redemption:
 # --- Materios --------------------------------------------------------------------
 
 
+# A runtime decodes an extrinsic whose calls nest up to MAX_EXTRINSIC_DEPTH (256) deep,
+# and scalecodec recurses about 13 frames per nested call, so Python's default limit of
+# 1000 would stop at about 75 and leave a deeper call unread.
+DECODE_RECURSION_LIMIT = 10_000
+
+
 class RuntimeDecoder:
     """Decodes extrinsics and ``System.Events`` against one runtime's metadata.
 
@@ -239,7 +246,12 @@ class RuntimeDecoder:
 
     def _decode(self, type_string: str, data_hex: str):
         obj = self._config.create_scale_object(type_string, data=ScaleBytes(data_hex), metadata=self._metadata)
-        return obj.decode(check_remaining=True)
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(limit, DECODE_RECURSION_LIMIT))
+        try:
+            return obj.decode(check_remaining=True)
+        finally:
+            sys.setrecursionlimit(limit)
 
 
 def _event_text(record: dict) -> str:
@@ -421,11 +433,26 @@ def _holds_calls(value) -> bool:
 _ROOT = "Root"
 
 
+MAX_PATH = 200
+MAX_SITE_ARGS = 300
+MAX_SITE_LINES = 20
+MAX_TREE_LINES = 200
+MAX_INDENT = 16
+
+
+def _indent(depth: int) -> str:
+    """A tree line's indent; past MAX_INDENT levels it stops growing, so a call nested
+    hundreds deep costs only its line's text."""
+    return "  " * min(depth, MAX_INDENT)
+
+
 @dataclass(frozen=True)
 class _Site:
-    """A privileged call in an extrinsic's call tree; ``inert`` when its origin cannot
-    dispatch it, ``unlisted`` when it is in neither call table."""
+    """A privileged call in an extrinsic's call tree, with its own arguments rendered;
+    ``inert`` when its origin cannot dispatch it, ``unlisted`` when it is in neither
+    call table."""
     path: str
+    args: str
     depth: int
     severity: Severity
     inert: bool
@@ -435,7 +462,8 @@ class _Site:
         notes = [" (cannot take effect from this origin)"] if self.inert and not counted else []
         if self.unlisted:
             notes.append(" (in neither the severity table nor the routine list)")
-        return f"{self.severity.name}: {self.path}{''.join(notes)}"
+        args = self.args if len(self.args) <= MAX_SITE_ARGS else self.args[:MAX_SITE_ARGS] + "\u2026"
+        return f"{self.severity.name}: {self.path}({args}){''.join(notes)}"
 
 
 @dataclass
@@ -490,7 +518,7 @@ def _inner_origin(module: str, function: str, args: dict, origin, tree: _Tree, d
         account = _multisig_origin(function, args, origin)
         if account is not None:
             label = "is Sudo.Key " if account == tree.sudo_key else ""
-            tree.lines.append(f"{'  ' * depth}  multisig account {label}{render_account(account)}")
+            tree.lines.append(f"{_indent(depth + 1)}multisig account {label}{render_account(account)}")
         return account
     return None
 
@@ -514,11 +542,6 @@ _DERIVED = frozenset({*(("Utility", f) for f in (*_BATCH_CALLS, "with_weight", "
                       *(("Multisig", f) for f in _MULTISIG_CALLS)})
 
 
-MAX_PATH = 200
-MAX_SITE_LINES = 20
-MAX_TREE_LINES = 200
-
-
 def _abridged(path: tuple[str, ...]) -> str:
     """A call path short enough for a headline; the outermost and innermost calls
     survive however deep the nesting."""
@@ -538,7 +561,7 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     args = _args(call)
     path = (*parents, f"{module}.{function}")
     rendered = ", ".join(f"{k}={_render_value(v)}" for k, v in args.items() if not _holds_calls(v))
-    tree.lines.append(f"{'  ' * depth}{module}.{function}({rendered})")
+    tree.lines.append(f"{_indent(depth)}{module}.{function}({rendered})")
     if isinstance(origin, bytes):
         inert = inert or (module == "Sudo" and origin != tree.sudo_key) or (module, function) in _ROOT_GATED
     inner = _inner_origin(module, function, args, origin, tree, depth)
@@ -550,7 +573,7 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     if unlisted:
         severity = ALERT
     if severity is not None:
-        tree.sites.append(_Site(_abridged(path), depth, severity, inert, unlisted))
+        tree.sites.append(_Site(_abridged(path), rendered, depth, severity, inert, unlisted))
     for value in args.values():
         for child in ([value] if _is_call(value) else value if isinstance(value, list) else []):
             if _is_call(child):
@@ -579,23 +602,27 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     or None when they could not be read: an attempt is then paged as though it took
     effect, since nothing shows it failed."""
     findings = []
+    # What cannot be read may hide any call, so it pages CRITICAL; grouped, because
+    # anyone can send it.
+    unreadable = f"{chain} unclassifiable"
     for index, ext in enumerate(extrinsics):
         key = f"{chain}:{number}:{index}"
         if "undecodable" in ext:
             raw = bytes.fromhex(ext["undecodable"][2:])
             findings.append(Finding(
-                severity=ALERT,
+                severity=CRITICAL,
                 key=key,
                 headline=f"{chain} #{number} extrinsic {index} could not be decoded against the runtime metadata",
                 details=(f"{len(raw)} bytes blake2_256 0x{hashlib.blake2b(raw, digest_size=32).hexdigest()}",
                          ext["error"]),
+                group=unreadable,
             ))
             continue
         try:
             finding = _classify_extrinsic(chain, number, index, ext, events, sudo_key, authorities)
         except Exception as e:  # argument values are the signer's choice; none may stall the block
             finding = unclassifiable(key, f"{chain} #{number} extrinsic {index}", e,
-                                     f"extrinsic hash {ext.get('extrinsic_hash')}", group=f"{chain} unclassifiable")
+                                     f"extrinsic hash {ext.get('extrinsic_hash')}", group=unreadable)
         if finding is not None:
             findings.append(finding)
     return findings

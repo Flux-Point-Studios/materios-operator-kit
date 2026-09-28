@@ -7,7 +7,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 
 | Source | CRITICAL (immediate, `@here`) | ALERT (immediate) | INFO (daily digest) |
 |---|---|---|---|
-| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, a new genesis (chain reset), an extrinsic the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, an extrinsic the runtime metadata cannot decode, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below) |
+| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, a new genesis (chain reset), an extrinsic the runtime metadata cannot decode or the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below) |
 | Cardano custody addresses | any outflow | any inflow | reads as a reference input |
 | Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
 | Cardano policies | mint or burn, as configured | as configured | |
@@ -16,8 +16,11 @@ custody and authority move it can see. It holds no signing key and submits nothi
 Each Materios page carries the decoded call tree, the signer, the derived multisig
 account and, while the node still holds the block's state, the dispatch result. Its
 headline names the most severe call's path (`Sudo.sudo > Utility.batch_all >
-System.set_code`), and every privileged call is listed, most severe first, ahead of
-the tree, so a page cut to Discord's length still shows what matters. Every call of the
+System.set_code`), and every privileged call is listed with its own arguments, most
+severe first, ahead of the tree, so a page cut to Discord's length still shows what
+matters. Calls nested as deep as a runtime decodes them (`MAX_EXTRINSIC_DEPTH`, 256)
+are decoded and named; an extrinsic that still cannot be decoded may hide any call, so
+it pages CRITICAL. Every call of the
 pinned runtime is in the severity table or the routine list, and a test holds it there;
 a call a runtime upgrade adds pages as an ALERT until it is classified. Text from the
 chain is rendered as JSON with every backtick replaced, so it can never close the
@@ -164,5 +167,5 @@ python -m daemon.custody_watch backtest --config /etc/custody-watch/config.json 
 
 prints every finding the watcher would have raised over the window, one JSON object per
 line, and pages nothing. Blocks whose state the node has pruned are decoded against the
-node's current runtime; an extrinsic that runtime cannot read is reported as an ALERT,
+node's current runtime; an extrinsic that runtime cannot read is reported as CRITICAL,
 never dropped.

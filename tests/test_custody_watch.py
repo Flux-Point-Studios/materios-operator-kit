@@ -20,6 +20,7 @@ from substrateinterface.exceptions import SubstrateRequestException
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
 from daemon import discord
+from tests.test_custody_rules import nested_sudo_leg
 
 FIX = Path(__file__).parent / "fixtures" / "custody"
 SUDO_KEY = "5H2M5Dbt8hSfSCXS6hfEBPR1N21yh679finzcfMEwD62i7iP"
@@ -678,6 +679,20 @@ def test_a_hostile_argument_does_not_stall_the_privileged_calls_after_it(config,
     assert store.get("cursor:materios-preprod") == "1000"
     [finding] = [f for f in store.findings() if f.severity == rules.CRITICAL]
     assert "Sudo.set_key" in finding.text
+
+
+def test_a_sudo_leg_nested_deep_in_batches_pages_critical_naming_its_calls(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1000, blocks={}, state_at={1000}, extra={1000: [nested_sudo_leg(250)]})
+    source = _materios(config, store, chain)
+    source.start_at(999)
+    posts = Posts()
+    clock = [_at("2026-09-27T03:00:00")]
+    _watch(config, store, [source], posts, clock).cycle()
+    [page] = posts.payloads
+    assert page["content"].startswith("\U0001f6a8 **CRITICAL** @here")
+    assert page["allowed_mentions"] == {"parse": ["everyone"]}
+    assert "System.authorize_upgrade**" in page["content"] and "Sudo.sudo" in page["content"]
 
 
 def test_a_committee_inherent_that_cannot_be_read_pages_and_the_cursor_moves_on(config, tmp_path, monkeypatch):
