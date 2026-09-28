@@ -58,7 +58,7 @@ class PipelineInputsTest(unittest.TestCase):
 
     def test_every_step_holding_the_token_declares_every_plugin_input(self):
         inputs = {k.lower() for k in re.findall(r"\bPLUGIN_([A-Z_]+)", read("ci/oci-index/oci-index.sh"))}
-        self.assertEqual(sorted(TOKEN_STEPS), ["publish-index", "push-oci-index"])
+        self.assertEqual(sorted(TOKEN_STEPS), ["publish-index", "push-npm-publish", "push-oci-index"])
         for name, (_, declared, _) in TOKEN_STEPS.items():
             self.assertEqual(inputs - set(declared), set(), f"{name} leaves plugin inputs undeclared")
 
@@ -67,7 +67,7 @@ class PipelineInputsTest(unittest.TestCase):
 
     def test_every_kaniko_step_declares_every_kaniko_input(self):
         _, inputs = kaniko_inputs()
-        self.assertEqual(sorted(KANIKO_STEPS), ["build-amd64", "build-arm64", "build-oci-index"])
+        self.assertEqual(sorted(KANIKO_STEPS), ["build-amd64", "build-arm64", "build-npm-publish", "build-oci-index"])
         for name, (_, declared, _) in KANIKO_STEPS.items():
             self.assertEqual(inputs - set(declared), set(), f"{name} leaves kaniko inputs undeclared")
 
@@ -75,7 +75,8 @@ class PipelineInputsTest(unittest.TestCase):
         built = {p for _, declared, _ in KANIKO_STEPS.values()
                  for p in re.findall(r"--oci-layout-path=(\S+)", declared.get("extra_opts", ""))}
         published = {p for _, _, body in TOKEN_STEPS.values() for p in re.findall(r"^        - (/\S+)=", body, flags=re.M)}
-        self.assertEqual(sorted(published), ["/woodpecker/oci/amd64", "/woodpecker/oci/arm64", "/woodpecker/oci/oci-index"])
+        self.assertEqual(sorted(published), ["/woodpecker/oci/amd64", "/woodpecker/oci/arm64", "/woodpecker/oci/npm-publish",
+                                             "/woodpecker/oci/oci-index"])
         self.assertEqual(published - built, set())
 
     def test_every_image_a_kaniko_step_builds_on_is_pinned_by_digest(self):

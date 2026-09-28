@@ -26,6 +26,8 @@ variables:
   # The plugin already on GHCR, which pushes the plugin image built here. A plugin change
   # moves publish-index to the new digest first; this pin follows once that is on GHCR.
   - &oci_index_in_service ghcr.io/flux-point-studios/materios-operator-kit@sha256:d3178aaf4dc548dda5bd2d15a09f7c650ac1325fa7bc9215a861a3f34774c84b
+  # ci/npm-publish's base image, where its test runs.
+  - &npm_publish_base node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
   # The crane debug image ships busybox under /busybox and has no /bin/sh.
   - &busybox_entrypoint ["/busybox/sh", "-c", "echo $$CI_SCRIPT | base64 -d | /busybox/sh -e"]
   # Every setting the pinned kaniko plugin reads (ci/registry-token/kaniko-plugin-inputs).
@@ -127,6 +129,43 @@ steps:
       - D=$$(cat /woodpecker/oci-index.digest)
       - 'P=$$(sed -n "/^  - name: publish-index$$/,/^  - name: /s/^    image: //p" .woodpecker.yaml)'
       - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index to the new digest and add it to every gchr_token copy with ci/registry-token pin --add"; exit 1; }'
+
+  # The test replaces npm and the plugin's busybox inside this step's own container.
+  - name: test-npm-publish
+    image: *npm_publish_base
+    commands:
+      - sh ci/npm-publish/test.sh
+
+  - name: build-npm-publish
+    image: *kaniko
+    settings:
+      <<: *kaniko_inputs
+      dockerfile: ci/npm-publish/Dockerfile
+      context: ci/npm-publish
+      extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/npm-publish.digest --oci-layout-path=/woodpecker/oci/npm-publish
+
+  # A consumer pins this digest in its publish step and in its npm token's image filter.
+  - name: show-npm-publish-digest
+    image: *crane
+    entrypoint: *busybox_entrypoint
+    commands:
+      - echo "ci/npm-publish builds ghcr.io/flux-point-studios/materios-operator-kit@$$(cat /woodpecker/npm-publish.digest)"
+
+  - name: push-npm-publish
+    image: *oci_index_in_service
+    settings:
+      registry: ghcr.io
+      username: realdecimalist
+      password:
+        from_secret: gchr_token
+      sources:
+        - /woodpecker/oci/npm-publish=ghcr.io/flux-point-studios/materios-operator-kit:ci-npm-publish
+      platforms:
+        - linux/amd64
+      target: ghcr.io/flux-point-studios/materios-operator-kit:ci-npm-publish
+      # Declared empty for the reason push-oci-index gives.
+      tags: ""
+    when: *on_main
 
   - name: build-amd64
     image: *kaniko

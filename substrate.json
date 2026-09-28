@@ -147,6 +147,17 @@
         "oci-index-plugin"
       ],
       "status": "experimental"
+    },
+    {
+      "id": "npm-publish-plugin",
+      "name": "npm publish plugin",
+      "desc": "Woodpecker plugin that publishes npm tarballs an earlier step packed without the token, so no install, build or package script runs beside the npm token. With the token it runs only on the first run of a push pipeline of the default branch and refuses manual runs and restarts before any program starts, in a statically linked busybox that LD_PRELOAD cannot load code into. It checks every tarball before publishing any (scope @orynq or @fluxpointstudios, a release version, no other publishConfig.registry), then runs npm with an environment it sets, --ignore-scripts, and the token bound to registry.npmjs.org. Publishes orynq-sdk.",
+      "kind": "toolkit",
+      "paths": [
+        "ci/npm-publish"
+      ],
+      "consumes": [],
+      "status": "experimental"
     }
   ]
 }
