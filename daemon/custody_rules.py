@@ -252,6 +252,9 @@ def _parse_coverage(network: str, doc: dict, redemptions: tuple[Redemption, ...]
                              int(row["quarantined"]))
                   for asset, entry in pin["assets"].items() for name, row in entry["units"].items())
     deadline = datetime.fromisoformat(doc["deadline_utc"])
+    if deadline.utcoffset() is None:
+        raise ValueError(f"{network}: surrender_pool coverage deadline_utc {doc['deadline_utc']!r} names no UTC "
+                         "offset; end it in Z")
     return PoolCoverage(units, rates, deadline.timestamp(), int(doc.get("floor_percent", 90)),
                         int(doc.get("runout_page_days", 14)))
 

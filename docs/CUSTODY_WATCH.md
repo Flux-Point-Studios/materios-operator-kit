@@ -109,7 +109,8 @@ outstanding, or that at the last 7 days' pace runs out before the deadline and w
 happens once a day with the digest; one that fails is named in the digest in its place.
 The config refuses a pinned asset the rate table does not price, and a `redemptions`
 entry priced differently from the rate table, so the digest and the surrender checks
-never disagree about a rate.
+never disagree about a rate. It also refuses a `deadline_utc` without a UTC offset,
+which would otherwise move with the host's time zone.
 
 ```json
 "coverage": {

@@ -1445,6 +1445,13 @@ def test_coverage_without_the_quarantine_address_it_counts_is_refused():
         rules.parse_config(doc)
 
 
+def test_a_coverage_deadline_without_a_utc_offset_is_refused():
+    # Read without an offset, the deadline would move with the host's time zone.
+    with pytest.raises(ValueError, match="deadline_utc"):
+        rules.parse_config(coverage_doc(deadline_utc="2026-11-29T00:00:00"))
+    assert _covered(deadline_utc="2026-11-29T00:00:00+00:00").pool.coverage.deadline == _covered().pool.coverage.deadline
+
+
 def test_the_pool_outflow_of_a_surrender_is_its_payout():
     tx = _tx("surrender_agent")
     network = _covered()
