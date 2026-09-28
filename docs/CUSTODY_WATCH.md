@@ -21,8 +21,9 @@ severe first, ahead of the tree, so a page cut to Discord's length still shows w
 matters. Calls nested as deep as a runtime decodes them (`MAX_EXTRINSIC_DEPTH`, 256)
 are decoded and named; an extrinsic that still cannot be decoded may hide any call, so
 it pages CRITICAL, in one finding per block that lists each such extrinsic's signer, size
-and hash. Those signed by `Sudo.Key` or a configured authority page alone, in one finding
-per signer and block. Every call of the
+and hash. Those signed by `Sudo.Key` or an authority account (a configured authority,
+or a recovery friend or rescuer named below) page alone, in one finding per signer and
+block. Every call of the
 pinned runtime is in the severity table or the routine list, and a test holds it there;
 a call a runtime upgrade adds pages as an ALERT until it is classified. Text from the
 chain is rendered as JSON with every backtick replaced, so it can never close the
@@ -61,7 +62,7 @@ throughout the block, so a `Sudo` call from any other account, and an `as_recove
 whose caller is not the proxy of the account it names, could not take effect and goes
 to the digest with everything it wraps. A root-gated call from an account needs no
 proof. What the state cannot rule out pages, grouped per source rather than per
-signer; an authority's attempts page alone as before.
+signer; an authority's attempts always page alone.
 
 `Sudo.Key` has a recovery config on the chain, so its friends can take it over together
 with a rescuer after a delay. Each poll reads, at the finalized head, `Recovery.Recoverable`
@@ -146,7 +147,8 @@ sources nor their pages.
 ## Configuration
 
 The configuration lives on the host that runs the watcher, never in this repository.
-`tests/fixtures/custody/config.json` shows every field; the shape is:
+`tests/fixtures/custody/config.json` shows every field of a source, and a pool's
+`coverage` block is shown above; the shape is:
 
 ```json
 {
@@ -179,7 +181,8 @@ count read only when that asset's supply moves, and every count once an hour.
 `role` is `custody` (outflow CRITICAL, inflow ALERT) or `contract` (a spend at the
 address's own `severity`, a payment in as an ALERT). `materios.authority_accounts` lists
 the SS58 accounts besides `Sudo.Key` whose moves are authority moves, such as the sudo
-multisig's signatories. A relative `project_id_file` is read from the config file's
+multisig's signatories; the recovery friends and rescuers of `Sudo.Key` and of these
+accounts are added to them each poll. A relative `project_id_file` is read from the config file's
 directory. `discord_webhook_file` names a file, read the same way, that holds the
 webhook of a channel of the watcher's own; without it the webhook comes from
 `DISCORD_WEBHOOK_URL` in the environment. `run` refuses to start without an https
