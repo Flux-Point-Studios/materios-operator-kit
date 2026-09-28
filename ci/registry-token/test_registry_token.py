@@ -456,10 +456,13 @@ class RegistryTokenTest(unittest.TestCase):
     def test_apply_names_every_woodpecker_user_who_is_not_an_admin_before_it_writes(self):
         self.global_state()
         self.fake.users.append({"login": "collaborator", "admin": False})
+        self.fake.echo_rejections = "Error inserting secret. "
         code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
-        self.assertEqual(code, 0, text)
-        self.assertLess(text.index("warning:"), text.index("done:"))
-        self.assertIn("collaborator", text)
+        self.assertEqual(code, 1, text)
+        self.assertEqual([w[0] for w in self.fake.writes], ["POST"], text)
+        warnings = [line for line in text.splitlines() if line.startswith("warning:")]
+        self.assertEqual(len(warnings), 1, text)
+        self.assertIn("collaborator", warnings[0])
 
     def test_plan_reads_every_page_of_woodpecker_users(self):
         self.global_state()
