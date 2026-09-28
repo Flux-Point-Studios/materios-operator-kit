@@ -1,0 +1,143 @@
+{
+  "report_type": "redemption_rate_table",
+  "generated_at": "2026-04-19T23:50:42.269958+00:00",
+  "public_pool_base": 722500000000000,
+  "public_pool_display": 722500000.0,
+  "validator_reserve_base": 277500000000000,
+  "team_waiver_supplies": {
+    "AGENT": 29644656,
+    "SHARDS": 446969700000
+  },
+  "legacy_reward_adjustments": {},
+  "tokens": {
+    "AGENT": {
+      "bucket_base": 449168051406055,
+      "bucket_display": 449168051.406055,
+      "on_chain_supply_base": 1000000000,
+      "team_waiver_base": 29644656,
+      "legacy_reward_adjustment_base": 0,
+      "redeemable_supply_base": 970355344,
+      "redeemable_supply_display": 970355344.0,
+      "rate_base_per_unit": 462890,
+      "rate_numerator": 449168051406055,
+      "rate_denominator": 970355344,
+      "rate_display": 0.46289,
+      "rate_display_exact": 0.4628902743550563,
+      "is_nft": false
+    },
+    "SHARDS": {
+      "bucket_base": 76929202239379,
+      "bucket_display": 76929202.239379,
+      "on_chain_supply_base": 3088534450001,
+      "team_waiver_base": 446969700000,
+      "legacy_reward_adjustment_base": 0,
+      "redeemable_supply_base": 2641564750001,
+      "redeemable_supply_display": 2641564.750001,
+      "rate_base_per_unit": 29,
+      "rate_numerator": 76929202239379,
+      "rate_denominator": 2641564750001,
+      "rate_display": 2.9e-05,
+      "rate_display_exact": 2.912258813241276e-05,
+      "is_nft": false
+    },
+    "FLUX_PASS": {
+      "bucket_base": 27777511969476,
+      "bucket_display": 27777511.969476,
+      "on_chain_supply_base": 401,
+      "team_waiver_base": 0,
+      "legacy_reward_adjustment_base": 0,
+      "redeemable_supply_base": 401,
+      "redeemable_supply_display": 401.0,
+      "rate_base_per_unit": 69270603415,
+      "rate_numerator": 27777511969476,
+      "rate_denominator": 401,
+      "rate_display": 69270.603415,
+      "rate_display_exact": 69270.60341515212,
+      "is_nft": true
+    },
+    "SE_BRAWLERS": {
+      "bucket_base": 8541197187044,
+      "bucket_display": 8541197.187044,
+      "on_chain_supply_base": 242,
+      "team_waiver_base": 0,
+      "legacy_reward_adjustment_base": 0,
+      "redeemable_supply_base": 242,
+      "redeemable_supply_display": 242.0,
+      "rate_base_per_unit": 35294203252,
+      "rate_numerator": 8541197187044,
+      "rate_denominator": 242,
+      "rate_display": 35294.203252,
+      "rate_display_exact": 35294.203252247935,
+      "is_nft": true
+    },
+    "BRAWL_PASS_ETD": {
+      "bucket_base": 4941188455314,
+      "bucket_display": 4941188.455314,
+      "on_chain_supply_base": 44,
+      "team_waiver_base": 0,
+      "legacy_reward_adjustment_base": 0,
+      "redeemable_supply_base": 44,
+      "redeemable_supply_display": 44.0,
+      "rate_base_per_unit": 112299737620,
+      "rate_numerator": 4941188455314,
+      "rate_denominator": 44,
+      "rate_display": 112299.73762,
+      "rate_display_exact": 112299.73762077272,
+      "is_nft": true
+    },
+    "T1_ADAM_PASS": {
+      "bucket_base": 137250603007574,
+      "bucket_display": 137250603.007574,
+      "on_chain_supply_base": 43,
+      "team_waiver_base": 0,
+      "legacy_reward_adjustment_base": 0,
+      "redeemable_supply_base": 43,
+      "redeemable_supply_display": 43.0,
+      "rate_base_per_unit": 3191874488548,
+      "rate_numerator": 137250603007574,
+      "rate_denominator": 43,
+      "rate_display": 3191874.488548,
+      "rate_display_exact": 3191874.4885482322,
+      "is_nft": true
+    },
+    "T2_ADAM_PASS": {
+      "bucket_base": 17892245735158,
+      "bucket_display": 17892245.735158,
+      "on_chain_supply_base": 95,
+      "team_waiver_base": 0,
+      "legacy_reward_adjustment_base": 0,
+      "redeemable_supply_base": 95,
+      "redeemable_supply_display": 95.0,
+      "rate_base_per_unit": 188339428791,
+      "rate_numerator": 17892245735158,
+      "rate_denominator": 95,
+      "rate_display": 188339.428791,
+      "rate_display_exact": 188339.42879113683,
+      "is_nft": true
+    }
+  },
+  "team_carve": {
+    "per_asset": {
+      "AGENT": {
+        "waiver_base": 29644656,
+        "rate_base_per_unit": 462890,
+        "rate_numerator": 449168051406055,
+        "rate_denominator": 970355344,
+        "carve_cmatra_base": 13722222949001,
+        "carve_cmatra_display": 13722222.949001
+      },
+      "SHARDS": {
+        "waiver_base": 446969700000,
+        "rate_base_per_unit": 29,
+        "rate_numerator": 76929202239379,
+        "rate_denominator": 2641564750001,
+        "carve_cmatra_base": 13016914480768,
+        "carve_cmatra_display": 13016914.480768
+      }
+    },
+    "total_carve_base": 26739137429769,
+    "total_carve_display": 26739137.429769,
+    "pool_after_carve_base": 695760862570231,
+    "pool_after_carve_display": 695760862.570231
+  }
+}

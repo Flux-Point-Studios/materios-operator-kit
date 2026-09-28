@@ -75,6 +75,41 @@ their attempts page whatever their outcome. An authority acting as the rescuer o
 other account is paged from its own extrinsics, and from its `Recovery.Proxy` once it
 claims.
 
+## Surrender-pool coverage
+
+With `surrender_pool.coverage` configured, the daily digest says whether the pool can pay
+everything still redeemable before the deadline. It reads the merger's redemption pin
+and rate table as the merger publishes them (`audit_pack/<date>/redemption_pin.json`,
+`audit_pack/<date>/rate_table_cmatra.json`). A unit may still be surrendered up to its
+supply at the pin, less the team waiver, less what the quarantine address held at the
+pin; units the quarantine address has received since are no longer outstanding. The
+outstanding units of each asset are summed and priced floor(count × numerator /
+denominator), as the merger's `compute_redemption` prices a surrender, and a test holds
+the result equal to the merger's own figure at the pin. The digest gives:
+
+- the pool's cMATRA balance and what is outstanding, with the coverage and any shortfall;
+- the cMATRA the pool paid out in the last 7 days, read from each of its transactions
+  (at most 200; beyond that the figure is a lower bound and says so);
+- the days to the deadline, and how long the pool lasts at the last 7 days' pace.
+
+Before the deadline, a pool that covers less than `floor_percent` (default 90) of what is
+outstanding, or that at the last 7 days' pace runs out before the deadline and within
+`runout_page_days` (default 14), pages an ALERT, without `@here`, once a day. The reading
+happens once a day with the digest; one that fails is named in the digest in its place.
+The config refuses a pinned asset the rate table does not price, and a `redemptions`
+entry priced differently from the rate table, so the digest and the surrender checks
+never disagree about a rate.
+
+```json
+"coverage": {
+  "redemption_pin_file": "redemption_pin.json",
+  "rate_table_file": "rate_table_cmatra.json",
+  "deadline_utc": "2026-11-29T00:00:00Z",
+  "floor_percent": 90,
+  "runout_page_days": 14
+}
+```
+
 ## Paging
 
 Pages go out most severe first, and within a severity a finding that pages alone goes
@@ -172,6 +207,8 @@ EnvironmentFile=/etc/custody-watch/discord.env
 LoadCredential=config.json:/etc/custody-watch/config.json
 LoadCredential=blockfrost-mainnet.key:/etc/custody-watch/blockfrost-mainnet.key
 LoadCredential=discord-webhook:/etc/custody-watch/discord-webhook
+LoadCredential=redemption_pin.json:/etc/custody-watch/redemption_pin.json
+LoadCredential=rate_table_cmatra.json:/etc/custody-watch/rate_table_cmatra.json
 Environment=PYTHONDONTWRITEBYTECODE=1
 WorkingDirectory=/opt/custody-watch/src
 ExecStart=/opt/custody-watch/venv/bin/python -m daemon.custody_watch run --config %d/config.json
@@ -191,8 +228,8 @@ WantedBy=multi-user.target
 ```
 
 `LoadCredential` hands the service its config and keys in a directory only it can
-read (`%d`), where the config's relative `project_id_file` finds them; the unit needs
-one `LoadCredential=` line for each key file its config names.
+read (`%d`), where the config's relative paths find them; the unit needs one
+`LoadCredential=` line for each file its config names.
 `custody-watch-failed.service` is a oneshot with the same `EnvironmentFile` running
 `python -m daemon.custody_watch page-failure --unit custody-watch.service`, so a unit
 that exhausts its restarts pages too. It reads no config, so a config that keeps the

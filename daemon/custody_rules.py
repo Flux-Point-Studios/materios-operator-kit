@@ -38,6 +38,7 @@ from substrateinterface.utils.ss58 import ss58_decode, ss58_encode
 from daemon.cardano_address import decode_cardano_address
 
 SS58_FORMAT = 42
+DAY = 86_400
 
 
 class Severity(enum.IntEnum):
@@ -95,6 +96,28 @@ class Redemption:
 
 
 @dataclass(frozen=True)
+class PinnedUnit:
+    """A legacy unit as the merger's redemption pin records it: what may still be
+    surrendered is its supply less the team waiver less what quarantine holds."""
+    unit: str
+    asset: str
+    supply: int
+    waiver: int
+    quarantined: int
+
+
+@dataclass(frozen=True)
+class PoolCoverage:
+    """What the surrender pool still owes: every pinned unit, priced at its asset's
+    rate-table rate, against a floor and a deadline."""
+    units: tuple[PinnedUnit, ...]
+    rates: dict[str, tuple[int, int]]
+    deadline: float
+    floor_percent: int
+    runout_page_days: int
+
+
+@dataclass(frozen=True)
 class SurrenderPool:
     label: str
     address: str
@@ -105,6 +128,7 @@ class SurrenderPool:
     surrender_redeemer: str
     redemptions: tuple[Redemption, ...]
     max_payout: int | None = None
+    coverage: PoolCoverage | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +204,10 @@ def _parse_network(doc: dict, base_dir: Path | None) -> CardanoNetwork:
         addresses.append(WatchedAddress(a["label"], a["address"], a["role"],
                                         Severity[a.get("severity", "ALERT")]))
     pool = doc.get("surrender_pool")
+    redemptions = tuple(_parse_redemption(doc["name"], r) for r in pool.get("redemptions", [])) if pool else ()
+    coverage = pool.get("coverage") if pool else None
+    if coverage and not pool.get("quarantine_address"):
+        raise ValueError(f"{doc['name']}: surrender_pool coverage needs the quarantine_address it counts")
     return CardanoNetwork(
         name=doc["name"],
         blockfrost_url=doc["blockfrost_url"].rstrip("/"),
@@ -197,10 +225,46 @@ def _parse_network(doc: dict, base_dir: Path | None) -> CardanoNetwork:
             quarantine_address=pool.get("quarantine_address"),
             redeemers={int(k): v for k, v in pool["redeemers"].items()},
             surrender_redeemer=pool["surrender_redeemer"],
-            redemptions=tuple(_parse_redemption(doc["name"], r) for r in pool.get("redemptions", [])),
+            redemptions=redemptions,
             max_payout=pool.get("max_payout"),
+            coverage=_parse_coverage(doc["name"], coverage, redemptions, base_dir) if coverage else None,
         ) if pool else None,
     )
+
+
+def _parse_coverage(network: str, doc: dict, redemptions: tuple[Redemption, ...],
+                    base_dir: Path | None) -> PoolCoverage:
+    """The merger's redemption pin and rate table, as it publishes them. Every pinned
+    asset must have a rate, and every redemption the classifier checks surrenders
+    against must be priced as the rate table prices it."""
+    pin = json.loads(Path(_relative(doc["redemption_pin_file"], base_dir)).read_text())
+    table = json.loads(Path(_relative(doc["rate_table_file"], base_dir)).read_text())["tokens"]
+    rates = {}
+    for asset in pin["assets"]:
+        if asset not in table:
+            raise ValueError(f"{network}: pinned asset {asset} has no rate in the rate table")
+        rates[asset] = (int(table[asset]["rate_numerator"]), int(table[asset]["rate_denominator"]))
+    for r in redemptions:
+        if r.key in rates and rates[r.key] != (r.numerator, r.denominator):
+            raise ValueError(f"{network}: redemption {r.key} is priced {r.numerator}/{r.denominator}, "
+                             f"the rate table {rates[r.key][0]}/{rates[r.key][1]}")
+    units = tuple(PinnedUnit(entry["policy_id"] + name, asset, int(row["supply"]), int(row["waiver"]),
+                             int(row["quarantined"]))
+                  for asset, entry in pin["assets"].items() for name, row in entry["units"].items())
+    deadline = datetime.fromisoformat(doc["deadline_utc"])
+    return PoolCoverage(units, rates, deadline.timestamp(), int(doc.get("floor_percent", 90)),
+                        int(doc.get("runout_page_days", 14)))
+
+
+def outstanding(coverage: PoolCoverage, held: dict[str, int]) -> dict[str, int]:
+    """cMATRA the pool still owes per asset: each unit's remaining at the pin, less what
+    quarantine has received of it since, summed per asset and priced floor(count *
+    numerator / denominator), as the merger's compute_redemption prices a surrender."""
+    counts: dict[str, int] = defaultdict(int)
+    for u in coverage.units:
+        pinned = u.supply - u.waiver - u.quarantined
+        counts[u.asset] += max(0, min(pinned, u.supply - u.waiver - held.get(u.unit, 0)))
+    return {asset: count * coverage.rates[asset][0] // coverage.rates[asset][1] for asset, count in counts.items()}
 
 
 def _parse_redemption(network: str, doc: dict) -> Redemption:
@@ -1037,6 +1101,55 @@ def redemption_overruns(network: CardanoNetwork, holding: dict[str, int]) -> lis
                     f"{r.denominator:,}",
                     details=("each surrender past that supply is paid from the other holders' share of the pool",))
             for r in network.pool.redemptions if held[r.key] > r.denominator]
+
+
+def pool_outflow(pool: SurrenderPool, utxos: dict) -> int:
+    """The cMATRA a transaction took out of the pool, net of what it put back there. A
+    failed script's rows are its collateral, which a script address never provides."""
+    def at_pool(rows: list[dict]) -> int:
+        return _value([u for u in rows if u["address"] == pool.address and not u.get("reference")
+                       and not u.get("collateral")]).get(pool.cmatra_unit, 0)
+    return max(0, at_pool(utxos["inputs"]) - at_pool(utxos["outputs"]))
+
+
+def pool_coverage(network: CardanoNetwork, balance: int, held: dict[str, int], week: int, unread: int,
+                  now: float) -> tuple[list[str], Finding | None]:
+    """The digest's lines on whether the pool, holding ``balance``, can pay everything
+    still redeemable with ``held`` at the quarantine address, having paid ``week`` in the
+    last seven days (``unread`` of whose transactions were not read). An ALERT, once a
+    day, while before the deadline the pool covers less than the floor, or at that pace
+    runs out within ``runout_page_days`` and before the deadline."""
+    pool, coverage = network.pool, network.pool.coverage
+    names = _Names(network)
+
+    def cmatra(quantity: int) -> str:
+        return names.quantity(pool.cmatra_unit, quantity)
+
+    owed = sum(outstanding(coverage, held).values())
+    deadline = datetime.fromtimestamp(coverage.deadline, timezone.utc).date().isoformat()
+    left = (coverage.deadline - now) / DAY
+    covered = f"{balance * 10_000 // owed / 100:.2f}%" if owed else None
+    head = f"{network.name} surrender pool: {cmatra(balance)} against {cmatra(owed)} outstanding at the pinned rates"
+    if covered:
+        head += f", {covered} covered" + (f" ({cmatra(owed - balance)} short)" if balance < owed else "")
+    redeemed = f"at least {cmatra(week)} ({plural(unread, 'transaction')} left unread)" if unread else cmatra(week)
+    pace = [f"redeemed in the last 7 days: {redeemed}",
+            f"{int(left)} days to the {deadline} deadline" if left > 0 else f"the {deadline} deadline has passed"]
+    lasts = balance * 7 / week if week else None
+    if lasts is not None:
+        pace.append(f"at that pace the pool lasts {int(lasts)} days")
+    lines = [head, "  " + "; ".join(pace)]
+    reasons = []
+    if left > 0 and covered and balance * 100 < coverage.floor_percent * owed:
+        reasons.append(f"covers {covered} of what is outstanding, below the {coverage.floor_percent}% floor")
+    if left > 0 and lasts is not None and lasts < left and lasts <= coverage.runout_page_days:
+        reasons.append(f"runs out in about {round(lasts)} days at the last 7 days' pace, "
+                       f"before the {deadline} deadline")
+    if not reasons:
+        return lines, None
+    day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
+    return lines, Finding(ALERT, f"{network.name}:coverage:{day}",
+                          f"{network.name} surrender pool " + " and ".join(reasons), details=tuple(lines))
 
 
 def _redeemer_name(pool: SurrenderPool, json_value) -> str:

@@ -23,8 +23,9 @@ from substrateinterface.utils.hasher import blake2_128_concat, two_x64_concat, x
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
 from daemon import discord
-from tests.test_custody_rules import (LEG_SIGNER, NORMAL_BLOCK_LENGTH, STRANGER, _count_walks, filler_call,
-                                      fillers_past_the_budget, nested_sudo_leg, signed_extrinsic)
+from tests.test_custody_rules import (LEG_SIGNER, NORMAL_BLOCK_LENGTH, STRANGER, TODAYS_POOL, _count_walks,
+                                      coverage_doc, filler_call, fillers_past_the_budget, nested_sudo_leg,
+                                      signed_extrinsic)
 
 FIX = Path(__file__).parent / "fixtures" / "custody"
 SUDO_KEY = "5H2M5Dbt8hSfSCXS6hfEBPR1N21yh679finzcfMEwD62i7iP"
@@ -1586,6 +1587,76 @@ def test_a_cardano_tip_older_than_the_stale_window_is_a_source_failure(config, t
     store, network, api, source = _baselined(config, tmp_path)
     with pytest.raises(cw.SourceError, match="tip"):
         source.poll(_at("2026-09-27T01:30:00"))
+
+
+@pytest.fixture
+def covered():
+    return rules.parse_config(coverage_doc())
+
+
+def _covered_source(covered, tmp_path, balance, api_class=None):
+    """cardano-mainnet with its pool holding ``balance`` cMATRA, quarantine holding what it
+    held at the pin, and one surrender two days before the digest."""
+    network = _mainnet(covered)
+    store = cw.Store(str(tmp_path / "state.db"))
+    api = (api_class or FakeBlockfrost)(tip=13_989_360, time=int(_at("2026-09-28T13:00:00")))
+    api.routes[f"/addresses/{network.pool.address}"] = {"amount": [
+        {"unit": "lovelace", "quantity": "1500000"}, {"unit": network.pool.cmatra_unit, "quantity": str(balance)}]}
+    api.routes[f"/addresses/{network.pool.quarantine_address}"] = {"amount": [
+        {"unit": u.unit, "quantity": str(u.quarantined)} for u in network.pool.coverage.units if u.quarantined]}
+    api.add_tx("surrender_agent", address=network.pool.address, height=13_989_350)
+    source = cw.CardanoSource(network, api, store, stale_seconds=900)
+    source.start_at(13_989_360)
+    return store, api, source
+
+
+def test_the_daily_digest_reports_whether_the_pool_covers_what_is_outstanding(covered, tmp_path):
+    store, api, source = _covered_source(covered, tmp_path, TODAYS_POOL)
+    posts = Posts()
+    _watch(covered, store, [source], posts, [_at("2026-09-28T13:00:05")]).cycle()
+    [digest] = [p["content"] for p in posts.payloads]
+    assert ("cardano-mainnet surrender pool: 333,944,276.732371 cMATRA against 344,302,945.315701 cMATRA "
+            "outstanding at the pinned rates, 96.99% covered (10,358,668.583330 cMATRA short)") in digest
+    assert "redeemed in the last 7 days: 1,056.778496 cMATRA; 61 days to the 2026-11-29 deadline" in digest
+
+
+def test_a_pool_below_its_floor_pages_an_alert_once_a_day_and_the_digest_still_goes(covered, tmp_path):
+    store, api, source = _covered_source(covered, tmp_path, 300_000_000_000_000)
+    posts = Posts()
+    clock = [_at("2026-09-28T13:00:05")]
+    watch = _watch(covered, store, [source], posts, clock)
+    for _ in range(3):
+        watch.cycle()
+        clock[0] += 60
+    digest, page = posts.payloads
+    assert "daily digest" in digest["content"] and "87.13% covered" in digest["content"]
+    assert page["content"].startswith("⚠️ **ALERT**") and page["allowed_mentions"] == {"parse": []}
+    assert "covers 87.13% of what is outstanding, below the 90% floor" in page["content"]
+
+
+class FailingPoolRead(FakeBlockfrost):
+    """Blockfrost failing every read of what the pool address holds."""
+
+    def get(self, path, **params):
+        if path == "/addresses/addr1w8s6rqdjlzm5he27v9s202p8vjumza8qfsmufm2f6dy68hg9mn27a":
+            self.calls.append((path, params))
+            raise cw.SourceError("blockfrost answered HTTP 500 for the pool")
+        return super().get(path, **params)
+
+
+def test_a_coverage_reading_that_fails_is_reported_in_the_digest_and_not_retried_that_day(covered, tmp_path):
+    store, api, source = _covered_source(covered, tmp_path, TODAYS_POOL, FailingPoolRead)
+    posts = Posts(fail={1})
+    clock = [_at("2026-09-28T13:00:05")]
+    watch = _watch(covered, store, [source], posts, clock)
+    watch.cycle()
+    clock[0] += 120
+    watch.cycle()
+    [digest] = [p["content"] for p in posts.payloads]
+    assert "cardano-mainnet surrender pool coverage not read: SourceError: blockfrost answered HTTP 500" in digest
+    assert "alive" in digest
+    pool = _mainnet(covered).pool.address
+    assert [c[0] for c in api.calls].count(f"/addresses/{pool}") == 1
 
 
 class _Blockfrost(http.server.BaseHTTPRequestHandler):

@@ -14,6 +14,7 @@ import gzip
 import hashlib
 import json
 import tracemalloc
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -1292,3 +1293,141 @@ def test_the_finding_key_is_the_network_and_transaction(networks):
     tx = _tx("custody_outflow")
     finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
     assert finding.key == f"cardano-mainnet:{tx['tx']['hash']}"
+
+
+# --- surrender-pool coverage --------------------------------------------------
+#
+# Byte copies of matra-token-merger's audit_pack/2026-09-27/redemption_pin.json and
+# audit_pack/2026-04-19/rate_table_cmatra.json, as on its main at 5d1ae8d.
+
+COVERAGE = FIX / "coverage"
+PIN_SHA256 = "c21c230055fe6ace0d7aae252cb3184f8ec0ff6f1bf2cc9fd37fb5dd87d909c4"
+RATE_TABLE_SHA256 = "316cb65c2b309b09242754b322a2763c5ae622304769ed0baffc2f13482b0970"
+# The merger's own figures at the pin: load_redemption_pin(pin).remaining summed per merge
+# asset and priced by compute_redemption(rate_table, asset, count), floor(count *
+# rate_numerator / rate_denominator), run at 5d1ae8d.
+MERGER_LIABILITIES = {
+    "AGENT": 205_895_069_264_433, "BRAWL_PASS_ETD": 2_358_294_490_036, "FLUX_PASS": 17_871_815_681_109,
+    "SE_BRAWLERS": 5_400_013_097_593, "SHARDS": 47_582_303_806_424, "T1_ADAM_PASS": 51_069_991_816_771,
+    "T2_ADAM_PASS": 14_125_457_159_335,
+}
+# The pool after the last surrender before the pin, and the cMATRA the pool paid out in the
+# seven days before 2026-09-28 13:00Z (six surrenders), both read from mainnet.
+TODAYS_POOL = 333_944_276_732_371
+TODAYS_WEEK = 20_266_203_828_110
+TODAY = datetime.fromisoformat("2026-09-28T13:00:00+00:00").timestamp()
+
+
+def coverage_doc(**overrides) -> dict:
+    doc = json.loads((FIX / "config.json").read_text())
+    doc["cardano"][0]["surrender_pool"]["coverage"] = {
+        "redemption_pin_file": str(COVERAGE / "redemption_pin.json"),
+        "rate_table_file": str(COVERAGE / "rate_table_cmatra.json"),
+        "deadline_utc": "2026-11-29T00:00:00Z", **overrides}
+    return doc
+
+
+def _covered(**overrides) -> rules.CardanoNetwork:
+    return rules.parse_config(coverage_doc(**overrides)).cardano[0]
+
+
+def _at_the_pin(network) -> dict[str, int]:
+    return {u.unit: u.quarantined for u in network.pool.coverage.units}
+
+
+def test_the_vendored_pin_and_rate_table_are_the_mergers_audit_packs():
+    assert hashlib.sha256((COVERAGE / "redemption_pin.json").read_bytes()).hexdigest() == PIN_SHA256
+    assert hashlib.sha256((COVERAGE / "rate_table_cmatra.json").read_bytes()).hexdigest() == RATE_TABLE_SHA256
+
+
+def test_what_is_outstanding_at_the_pin_matches_the_mergers_own_redemption_code():
+    network = _covered()
+    assert rules.outstanding(network.pool.coverage, _at_the_pin(network)) == MERGER_LIABILITIES
+    assert sum(MERGER_LIABILITIES.values()) == 344_302_945_315_701
+
+
+def test_units_surrendered_since_the_pin_are_no_longer_outstanding():
+    network = _covered()
+    held = _at_the_pin(network)
+    held[AGENT_UNIT] += 1_000
+    agent = next(r for r in network.pool.redemptions if r.key == "AGENT")
+    assert rules.outstanding(network.pool.coverage, held)["AGENT"] == \
+        (444_803_187 - 1_000) * agent.numerator // agent.denominator
+
+
+def test_todays_pool_is_covered_above_the_floor_and_pages_nothing():
+    network = _covered()
+    lines, page = rules.pool_coverage(network, TODAYS_POOL, _at_the_pin(network), TODAYS_WEEK, 0, TODAY)
+    assert page is None
+    assert lines == [
+        "cardano-mainnet surrender pool: 333,944,276.732371 cMATRA against 344,302,945.315701 cMATRA outstanding "
+        "at the pinned rates, 96.99% covered (10,358,668.583330 cMATRA short)",
+        "  redeemed in the last 7 days: 20,266,203.828110 cMATRA; 61 days to the 2026-11-29 deadline; "
+        "at that pace the pool lasts 115 days",
+    ]
+
+
+def test_coverage_below_the_floor_pages_an_alert_once_a_day():
+    network = _covered()
+    liabilities = sum(MERGER_LIABILITIES.values())
+    _, page = rules.pool_coverage(network, liabilities * 89 // 100, _at_the_pin(network), TODAYS_WEEK, 0, TODAY)
+    assert page.severity == rules.ALERT and page.group is None
+    assert page.key == "cardano-mainnet:coverage:2026-09-28"
+    assert page.headline == "cardano-mainnet surrender pool covers 88.99% of what is outstanding, below the 90% floor"
+
+
+def test_a_pool_that_runs_out_within_two_weeks_and_before_the_deadline_pages():
+    network = _covered()
+    _, page = rules.pool_coverage(network, TODAYS_POOL, _at_the_pin(network), TODAYS_POOL * 7 // 10, 0, TODAY)
+    assert page.severity == rules.ALERT
+    assert page.headline == ("cardano-mainnet surrender pool runs out in about 10 days at the last 7 days' pace, "
+                             "before the 2026-11-29 deadline")
+
+
+@pytest.mark.parametrize("days, now", [(20, TODAY), (10, datetime.fromisoformat(
+    "2026-11-25T00:00:00+00:00").timestamp()), (10, datetime.fromisoformat("2026-11-30T00:00:00+00:00").timestamp())])
+def test_a_run_out_further_than_two_weeks_or_past_the_deadline_pages_nothing(days, now):
+    network = _covered()
+    _, page = rules.pool_coverage(network, TODAYS_POOL, _at_the_pin(network), TODAYS_POOL * 7 // days, 0, now)
+    assert page is None
+
+
+def test_the_floor_and_the_run_out_window_are_read_from_the_config():
+    network = _covered(floor_percent=98, runout_page_days=200)
+    lines, page = rules.pool_coverage(network, TODAYS_POOL, _at_the_pin(network), TODAYS_WEEK, 0, TODAY)
+    assert "below the 98% floor" in page.headline
+    assert "runs out" not in page.headline
+
+
+def test_a_weeks_payouts_read_only_in_part_say_so():
+    network = _covered()
+    lines, _ = rules.pool_coverage(network, TODAYS_POOL, _at_the_pin(network), TODAYS_WEEK, 12, TODAY)
+    assert "at least 20,266,203.828110 cMATRA (12 transactions left unread)" in lines[1]
+
+
+def test_a_coverage_rate_that_differs_from_the_redemption_it_prices_is_refused():
+    doc = coverage_doc()
+    doc["cardano"][0]["surrender_pool"]["redemptions"][0]["numerator"] += 1
+    with pytest.raises(ValueError, match="AGENT"):
+        rules.parse_config(doc)
+
+
+def test_a_pinned_asset_the_rate_table_does_not_price_is_refused(tmp_path):
+    table = json.loads((COVERAGE / "rate_table_cmatra.json").read_text())
+    del table["tokens"]["SE_BRAWLERS"]
+    (tmp_path / "rates.json").write_text(json.dumps(table))
+    with pytest.raises(ValueError, match="SE_BRAWLERS"):
+        rules.parse_config(coverage_doc(rate_table_file=str(tmp_path / "rates.json")))
+
+
+def test_coverage_without_the_quarantine_address_it_counts_is_refused():
+    doc = coverage_doc()
+    del doc["cardano"][0]["surrender_pool"]["quarantine_address"]
+    with pytest.raises(ValueError, match="quarantine_address"):
+        rules.parse_config(doc)
+
+
+def test_the_pool_outflow_of_a_surrender_is_its_payout():
+    tx = _tx("surrender_agent")
+    network = _covered()
+    assert rules.pool_outflow(network.pool, tx["utxos"]) == 1_056_778_496

@@ -48,7 +48,7 @@ MESSAGE_LIMIT = 1900
 # Leaves room for the badge, the fallback note and a useful part of the body.
 MAX_TITLE = 400
 HOUR = 3600
-DAY = 86400
+DAY = rules.DAY
 
 
 class SourceError(Exception):
@@ -460,7 +460,7 @@ class Watch:
         day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
         routine = self._store.unsent_routine()
         try:
-            self._pager.post("digest", self.digest_message(routine, now), now)
+            self._pager.post("digest", self.digest_message(routine, now, self._coverage(now, day)), now)
         except discord.DiscordError as e:
             logger.warning("daily digest not delivered, retrying: %s", e)
             return
@@ -468,7 +468,31 @@ class Watch:
             self._store.mark_sent([f.key for f in routine], now)
             self._store.put("digest:last-day", day)
 
-    def digest_message(self, routine: list[StoredFinding], now: float) -> dict:
+    def _coverage(self, now: float, day: str) -> list[str]:
+        """Today's surrender-pool coverage lines, read once a day, and its page when the
+        pool falls short. A reading that fails is reported in the digest in its place."""
+        lines = []
+        for source in self._sources:
+            if not (isinstance(source, CardanoSource) and source.covers_pool):
+                continue
+            name = f"coverage:{source.name}"
+            stored = json.loads(self._store.get(name) or "{}")
+            if stored.get("day") != day:
+                page = None
+                try:
+                    found, page = source.coverage(now)
+                except Exception as e:  # the digest is the liveness signal; nothing it reports may hold it back
+                    logger.exception("%s: surrender pool coverage not read", source.name)
+                    found = [f"{source.name} surrender pool coverage not read: {type(e).__name__}: {e}"[:300]]
+                stored = {"day": day, "lines": found}
+                with self._store.transaction():
+                    self._store.put(name, json.dumps(stored))
+                    if page is not None:
+                        self._store.add(page, now)
+            lines += stored["lines"]
+        return lines
+
+    def digest_message(self, routine: list[StoredFinding], now: float, coverage: list[str] = ()) -> dict:
         store = self._store
         stale = [s.name for s in self._sources if store.get(f"health:{s.name}:stale-since")]
         state = f"STALE: {', '.join(stale)}" if stale else "alive"
@@ -478,6 +502,7 @@ class Watch:
             position = store.get(f"health:{source.name}:position")
             state = f"{position} (last read {_utc(float(ok))})" if ok else "never read"
             lines.append(f"  {source.name}: {state}")
+        lines.extend(coverage)
         paged = store.paged_since(now - DAY)
         critical = sum(1 for f in paged if f.severity == rules.CRITICAL)
         lines.append(f"paged in the last 24h: {len(paged)} ({critical} critical)")
@@ -892,6 +917,10 @@ class Blockfrost:
 PAGE = 100
 MAX_TX_PER_POLL = 200
 EXACT_POLICY_ASSETS = 10
+# Cardano's mean block interval, and how many blocks further back than that a trailing
+# window's listing starts, so a slow week never leaves a transaction out.
+CARDANO_BLOCK_SECONDS = 20
+WINDOW_MARGIN_BLOCKS = 2_000
 
 
 class CardanoSource:
@@ -932,8 +961,8 @@ class CardanoSource:
             self._store.put(f"cursor:{self.name}:tip", str(height))
 
     def rewind(self, seconds: int) -> None:
-        """Start ``seconds`` of blocks behind the tip, at the 20 s mean block interval."""
-        self.start_at(self._api.get("/blocks/latest")["height"] - seconds // 20)
+        """Start ``seconds`` of blocks behind the tip, at the mean block interval."""
+        self.start_at(self._api.get("/blocks/latest")["height"] - seconds // CARDANO_BLOCK_SECONDS)
 
     def _pages(self, path: str, first_page: int = 1, **params):
         page = first_page
@@ -1019,9 +1048,44 @@ class CardanoSource:
         pool = self._network.pool
         if pool is None or pool.quarantine_address is None:
             return []
-        holding = self._api.get(f"/addresses/{pool.quarantine_address}")
-        amounts = {a["unit"]: int(a["quantity"]) for a in holding["amount"]} if holding else {}
-        return rules.redemption_overruns(self._network, amounts)
+        return rules.redemption_overruns(self._network, self._holding(pool.quarantine_address))
+
+    def _holding(self, address: str) -> dict[str, int]:
+        """What ``address`` holds now, by unit; nothing for an address Blockfrost has never seen."""
+        holding = self._api.get(f"/addresses/{address}")
+        return {a["unit"]: int(a["quantity"]) for a in holding["amount"]} if holding else {}
+
+    @property
+    def covers_pool(self) -> bool:
+        return self._network.pool is not None and self._network.pool.coverage is not None
+
+    def coverage(self, now: float) -> tuple[list[str], rules.Finding | None]:
+        """Whether the surrender pool can pay what is still redeemable: its balance, what
+        the quarantine address holds, and what the pool paid in the last seven days."""
+        pool = self._network.pool
+        balance = self._holding(pool.address).get(pool.cmatra_unit, 0)
+        held = self._holding(pool.quarantine_address)
+        week, unread = self._paid_since(now - 7 * DAY)
+        return rules.pool_coverage(self._network, balance, held, week, unread, now)
+
+    def _paid_since(self, since: float) -> tuple[int, int]:
+        """The cMATRA the pool paid out since ``since``, read from at most MAX_TX_PER_POLL
+        of its transactions, and how many more there were."""
+        pool = self._network.pool
+        tip = self._api.get("/blocks/latest")
+        if tip is None:
+            raise SourceError(f"{self.name}: blockfrost served no chain tip")
+        start = tip["height"] - int(tip["time"] - since) // CARDANO_BLOCK_SECONDS - WINDOW_MARGIN_BLOCKS
+        rows = [row for row in self._pages(f"/addresses/{pool.address}/transactions", order="asc",
+                                           **{"from": str(max(start, 0))})
+                if row["block_time"] >= since]
+        paid = 0
+        for row in rows[:MAX_TX_PER_POLL]:
+            utxos = self._api.get(f"/txs/{row['tx_hash']}/utxos")
+            if utxos is None:
+                raise SourceError(f"{self.name}: blockfrost does not serve transaction {row['tx_hash']} yet")
+            paid += rules.pool_outflow(pool, utxos)
+        return paid, max(0, len(rows) - MAX_TX_PER_POLL)
 
     def _classify(self, tx_hash: str, now: float, floor: int | None) -> None:
         tx = self._api.get(f"/txs/{tx_hash}")
