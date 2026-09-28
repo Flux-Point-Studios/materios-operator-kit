@@ -20,8 +20,9 @@ System.set_code`), and every privileged call is listed with its own arguments, m
 severe first, ahead of the tree, so a page cut to Discord's length still shows what
 matters. Calls nested as deep as a runtime decodes them (`MAX_EXTRINSIC_DEPTH`, 256)
 are decoded and named; an extrinsic that still cannot be decoded may hide any call, so
-it pages CRITICAL, in one finding per block that lists each such extrinsic's size and
-hash. Every call of the
+it pages CRITICAL, in one finding per block that lists each such extrinsic's signer, size
+and hash. Those signed by `Sudo.Key` or a configured authority page alone, in one finding
+per signer and block. Every call of the
 pinned runtime is in the severity table or the routine list, and a test holds it there;
 a call a runtime upgrade adds pages as an ALERT until it is classified. Text from the
 chain is rendered as JSON with every backtick replaced, so it can never close the
@@ -50,7 +51,8 @@ events cannot be read, every attempt pages as though it took effect.
 Pages go out most severe first, and within a severity a finding that pages alone goes
 before a group. Findings that anyone can cause cheaply are grouped: Materios findings
 by signer (unless an authority is involved), Cardano payments into, or contract
-spends from, one address, and anything unclassifiable, per source. Every pending finding of a group goes out as one message.
+spends from, one address, and anything unclassifiable that anyone could have sent, per
+source. Every pending finding of a group goes out as one message.
 Custody outflows, surrender-pool spends and watched-policy mints always page alone.
 
 A failing webhook holds every post, the digest included: for its `Retry-After` when
@@ -171,9 +173,14 @@ message through the webhook to prove delivery end to end.
   with one-byte elements, and scalecodec builds a Python object for each one it reads.
   A block's extrinsics, and separately its events, are decoded within a budget of
   50,000 values (`DECODE_BUDGET`), about a second of CPU and a few megabytes at most.
-  Unsigned extrinsics, the inherents among them, are decoded first and signed ones
-  smallest first, so filler cannot spend the budget a small privileged leg needs. What
-  the budget does not reach pages CRITICAL and the cursor moves on. Events past the
+  Extrinsics signed by `Sudo.Key` or a configured authority, whose signer the watcher
+  reads from the extrinsic header before decoding any call, are decoded first against a
+  budget of their own: any funded account can fill a block with extrinsics smaller than
+  a multisig leg, but none can sign as those accounts. The rest share the block's
+  budget, unsigned extrinsics first, the inherents among them, then signed ones
+  smallest first, so a large extrinsic cannot spend what the inherents and a small
+  privileged call need. What a budget does not reach pages CRITICAL with its signer
+  and the cursor moves on. Events past the
   budget are left unread, so the block's attempts page as though they took effect. A
   Materios poll ends after the block that brings it to the budget, so the Cardano
   sources are read between expensive blocks. Every call tree is walked once, holds at

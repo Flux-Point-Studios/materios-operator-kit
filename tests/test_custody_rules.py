@@ -137,7 +137,7 @@ def test_an_extrinsic_the_runtime_metadata_cannot_decode_pages_critical_grouped_
     assert finding.group == "materios-preprod unclassifiable"
     assert finding.key == f"materios-preprod:{block['number']}:undecoded"
     assert finding.headline == f"materios-preprod #{block['number']}: 1 extrinsic could not be decoded"
-    assert finding.details == (f"extrinsic {len(block['extrinsics'])}: 6 bytes blake2_256 "
+    assert finding.details == (f"extrinsic {len(block['extrinsics'])}: unsigned: 6 bytes blake2_256 "
                                f"0x{hashlib.blake2b(bytes.fromhex(garbage[2:]), digest_size=32).hexdigest()}: "
                                f"{extrinsics[-1]['error']}",)
 
@@ -288,6 +288,68 @@ def test_what_the_budget_did_not_reach_pages_as_one_critical_finding_per_block(d
     assert finding.headline == "materios-preprod #2029707: 30 extrinsics could not be decoded"
     assert finding.details[0].startswith("extrinsic 3: ") and "DecodeBudgetExceeded" in finding.details[0]
     assert len(finding.details) == rules.MAX_UNDECODED_LINES + 1 and finding.details[-1] == "... 10 more"
+
+
+LEG_SIGNER = bytes.fromhex(_block(LEG_BLOCK)["extrinsics"][2][2:])[4:36]
+
+
+def remark_filler() -> str:
+    """A signed Utility.batch of 55 empty remarks, which any funded account can have
+    finalized: 271 bytes, smaller than the 281-byte propose leg."""
+    return signed_extrinsic(filler_call("remarks", 165), STRANGER)
+
+
+def fillers_past_the_budget(decoder) -> list[str]:
+    """Enough remark fillers to spend a whole DECODE_BUDGET before a larger extrinsic."""
+    filler = remark_filler()
+    before = decoder.values
+    decoder.extrinsics([filler])
+    return [filler] * (rules.DECODE_BUDGET // (decoder.values - before) + 1)
+
+
+@pytest.mark.parametrize("signer", ["authority", "Sudo.Key"])
+def test_what_sudo_key_or_an_authority_signs_is_decoded_whatever_smaller_filler_the_block_holds(decoder, signer):
+    block = _block(LEG_BLOCK)
+    sudo_key = rules.account_bytes(SUDO_KEY)
+    leg = block["extrinsics"][2]
+    authorities = frozenset({LEG_SIGNER})
+    if signer == "Sudo.Key":
+        leg, authorities = signed_extrinsic(bytes.fromhex(leg[2:])[LEG_CALL_AT:], sudo_key), frozenset()
+    fillers = fillers_past_the_budget(decoder)
+    assert len(fillers[0]) < len(leg)
+    extrinsics = decoder.extrinsics([*block["extrinsics"][:2], leg, *fillers],
+                                    rules.accountable(sudo_key, authorities))
+    found = {f.key.rsplit(":", 1)[1]: f for f in rules.classify_materios_block(
+        "materios-preprod", block["number"], extrinsics, lambda: None, sudo_key, authorities)}
+    text = found["2"].render()
+    assert found["2"].severity == rules.CRITICAL and found["2"].group is None
+    assert "System.authorize_upgrade" in text
+    assert ("multisig account is Sudo.Key" if signer == "authority" else "signed by Sudo.Key") in text
+    assert found["undecoded"].group == "materios-preprod unclassifiable"
+
+
+def test_what_sudo_key_or_an_authority_signed_and_cannot_be_decoded_pages_alone_per_signer(decoder, monkeypatch):
+    # The propose leg decodes into 36 values, more than this budget holds.
+    monkeypatch.setattr(rules, "DECODE_BUDGET", 30)
+    block = _block(LEG_BLOCK)
+    sudo_key = rules.account_bytes(SUDO_KEY)
+    authorities = frozenset({LEG_SIGNER})
+    hexes = [*block["extrinsics"], remark_filler(), signed_extrinsic(filler_call("keys", 1000), LEG_SIGNER)]
+    extrinsics = decoder.extrinsics(hexes, rules.accountable(sudo_key, authorities))
+    found = {f.key: f for f in rules.classify_materios_block(
+        "materios-preprod", block["number"], extrinsics, lambda: None, sudo_key, authorities)}
+    signer, filler = rules.render_account(LEG_SIGNER), len(block["extrinsics"])
+    legs = found[f"materios-preprod:1829210:undecoded:{signer}"]
+    assert legs.severity == rules.CRITICAL and legs.group is None
+    assert legs.headline == "materios-preprod #1829210: 2 extrinsics could not be decoded, signed by an authority account"
+    assert legs.details[0].startswith(f"extrinsic 2: signer {signer}: 281 bytes blake2_256 0x")
+    assert legs.details[1].startswith(f"extrinsic {filler + 1}: signer {signer}: ")
+    assert all("DecodeBudgetExceeded" in line for line in legs.details)
+    grouped = found["materios-preprod:1829210:undecoded"]
+    assert grouped.group == "materios-preprod unclassifiable"
+    assert any(line.startswith(f"extrinsic {filler}: signer {rules.render_account(STRANGER)}: 271 bytes")
+               for line in grouped.details)
+    assert signer not in "\n".join(grouped.details)
 
 
 def test_events_that_would_pass_the_budget_are_not_decoded(decoder, monkeypatch):

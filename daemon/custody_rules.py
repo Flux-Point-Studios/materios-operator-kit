@@ -249,13 +249,24 @@ def _bytes_read(scale_object) -> bytearray:
     return scale_object.data.data[scale_object.data_start_offset:end]
 
 
-def _signed(extrinsic_hex: str) -> bool:
-    """Whether an extrinsic carries a signature: the top bit of the version byte that
-    follows its compact length prefix."""
+def _envelope(extrinsic_hex: str) -> tuple[bool, bytes | None]:
+    """Whether an extrinsic carries a signature, and the account that signed it, read
+    from its fixed-layout header without decoding its call: the version byte after the
+    compact length prefix has its top bit set when signed, and a ``MultiAddress::Id``
+    signer follows it as tag 0 and 32 bytes. The signer is None for any other address."""
     first = int(extrinsic_hex[2:4], 16)
     prefix = 1 << (first & 3) if first & 3 < 3 else (first >> 2) + 5
-    version = extrinsic_hex[2 + 2 * prefix:4 + 2 * prefix]
-    return not version or int(version, 16) & 0x80 != 0
+    at = 2 + 2 * prefix
+    version = extrinsic_hex[at:at + 2]
+    if version and not int(version, 16) & 0x80:
+        return False, None
+    signer = extrinsic_hex[at + 4:at + 68] if extrinsic_hex[at + 2:at + 4] == "00" else ""
+    return True, bytes.fromhex(signer) if len(signer) == 64 else None
+
+
+def accountable(sudo_key: bytes | None, authorities: frozenset[bytes]) -> frozenset[bytes]:
+    """The accounts whose moves are authority moves: Sudo.Key and the configured authorities."""
+    return authorities | ({sudo_key} if sudo_key else frozenset())
 
 
 class RuntimeDecoder:
@@ -285,25 +296,30 @@ class RuntimeDecoder:
         """The values this decoder has built so far; what a block cost is the difference."""
         return self._config.values
 
-    def extrinsics(self, extrinsics_hex: list[str]) -> list[dict]:
+    def extrinsics(self, extrinsics_hex: list[str], accountable: frozenset[bytes] = frozenset()) -> list[dict]:
         """Each extrinsic decoded, or ``{"undecodable": hex, "error": ...}`` for one this
-        runtime's metadata cannot read or the block's DECODE_BUDGET does not reach, so a
-        call the watcher has not read is reported rather than silently skipped.
+        runtime's metadata cannot read or its DECODE_BUDGET does not reach, so a call the
+        watcher has not read is reported rather than silently skipped.
 
-        The block's unsigned extrinsics, its inherents among them, are decoded first and
-        the signed ones smallest first, so a large extrinsic cannot spend the budget
-        that the inherents and a privileged call, which is small, need."""
+        Extrinsics signed by an ``accountable`` account decode first, against a budget of
+        their own: any funded account can fill a block with extrinsics smaller than a
+        multisig leg, but none can sign as these accounts. The rest share a second budget,
+        unsigned extrinsics first, the inherents among them, then the signed ones smallest
+        first, so a large extrinsic cannot spend what the inherents and a small privileged
+        call need."""
+        envelopes = [_envelope(x) for x in extrinsics_hex]
         decoded: list[dict] = [{} for _ in extrinsics_hex]
-        budget = DECODE_BUDGET
-        for index in sorted(range(len(extrinsics_hex)),
-                            key=lambda i: (_signed(extrinsics_hex[i]), len(extrinsics_hex[i]))):
+        budgets = {True: DECODE_BUDGET, False: DECODE_BUDGET}
+        for index in sorted(range(len(extrinsics_hex)), key=lambda i: (
+                envelopes[i][1] not in accountable, envelopes[i][0], len(extrinsics_hex[i]))):
             x = extrinsics_hex[index]
+            reserved = envelopes[index][1] in accountable
             before = self.values
             try:
-                decoded[index] = self._decode("Extrinsic", x, budget)
+                decoded[index] = self._decode("Extrinsic", x, budgets[reserved])
             except Exception as e:  # scalecodec raises any type on bytes it cannot place
                 decoded[index] = {"undecodable": x, "error": f"{type(e).__name__}: {e}"[:200]}
-            budget -= self.values - before
+            budgets[reserved] -= self.values - before
         return decoded
 
     def events(self, events_hex: str) -> dict[int, list[str]]:
@@ -700,6 +716,12 @@ def unclassifiable(key: str, what: str, error: Exception, *details: str, group: 
                    details=(*details, f"{type(error).__name__}: {error}"[:200]), group=group)
 
 
+def _undecoded_line(index: int, ext: dict) -> str:
+    signed, signer = _envelope(ext["undecodable"])
+    who = f"signer {render_account(signer)}" if signer else "signer names no account" if signed else "unsigned"
+    return f"extrinsic {index}: {who}: {_hex_digest(ext['undecodable'])}: {ext['error']}"
+
+
 def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
                             read_events: Callable[[], dict[int, list[str]] | None], sudo_key: bytes | None,
                             authorities: frozenset[bytes] = frozenset()) -> list[Finding]:
@@ -708,26 +730,35 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     called once, only when an extrinsic has something to report. Without events an
     attempt is paged as though it took effect, since nothing shows it failed."""
     findings = []
-    # What cannot be read may hide any call, so it pages CRITICAL; grouped, because
-    # anyone can send it.
+    accounts = accountable(sudo_key, authorities)
+    # What cannot be read may hide any call, so it pages CRITICAL: grouped per source
+    # when anyone could have sent it, alone when Sudo.Key or an authority signed it. One
+    # finding a block for each, however many extrinsics it could not read.
     unreadable = f"{chain} unclassifiable"
-    undecoded = [(index, ext) for index, ext in enumerate(extrinsics) if "undecodable" in ext]
-    if undecoded:
-        # One finding a block, however many extrinsics it could not read.
-        listed = [f"extrinsic {index}: {_hex_digest(ext['undecodable'])}: {ext['error']}"
-                  for index, ext in undecoded[:MAX_UNDECODED_LINES]]
-        if len(undecoded) > MAX_UNDECODED_LINES:
-            listed.append(f"... {len(undecoded) - MAX_UNDECODED_LINES:,} more")
-        findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded",
-                                f"{chain} #{number}: {plural(len(undecoded), 'extrinsic')} could not be decoded",
-                                details=tuple(listed), group=unreadable))
+    undecoded: dict[bytes | None, list[tuple[int, dict]]] = defaultdict(list)
+    for index, ext in enumerate(extrinsics):
+        if "undecodable" in ext:
+            signer = _envelope(ext["undecodable"])[1]
+            undecoded[signer if signer in accounts else None].append((index, ext))
+    for signer, items in undecoded.items():
+        listed = [_undecoded_line(index, ext) for index, ext in items[:MAX_UNDECODED_LINES]]
+        if len(items) > MAX_UNDECODED_LINES:
+            listed.append(f"... {len(items) - MAX_UNDECODED_LINES:,} more")
+        what = f"{chain} #{number}: {plural(len(items), 'extrinsic')} could not be decoded"
+        if signer is None:
+            findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded", what, details=tuple(listed),
+                                    group=unreadable))
+        else:
+            role = "Sudo.Key" if signer == sudo_key else "an authority account"
+            findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded:{render_account(signer)}",
+                                    f"{what}, signed by {role}", details=tuple(listed)))
     reported = []
     for index, ext in enumerate(extrinsics):
         if "undecodable" in ext:
             continue
         key = f"{chain}:{number}:{index}"
         signer = _account(ext.get("address"))
-        tree = _Tree(sudo_key, authorities | ({sudo_key} if sudo_key else frozenset()))
+        tree = _Tree(sudo_key, accounts)
         try:
             _walk(ext["call"], signer, tree, 0, (), False, True)
         except Exception as e:  # argument values are the signer's choice; none may stall the block

@@ -633,7 +633,7 @@ class MateriosSource:
             self._decoder = self._load_decoder(header["parentHash"])
         decoder = self._decoder
         before = decoder.values
-        extrinsics = decoder.extrinsics(block["extrinsics"])
+        extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, self._authorities))
         findings = rules.classify_materios_block(self.name, number, extrinsics,
                                                  lambda: self._events(block_hash, decoder), sudo_key,
                                                  self._authorities)

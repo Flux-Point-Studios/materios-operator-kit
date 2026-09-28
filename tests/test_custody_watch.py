@@ -6,6 +6,7 @@ Cardano from the captured Blockfrost transactions (see test_custody_rules).
 """
 
 import copy
+import dataclasses
 import gzip
 import http.server
 import json
@@ -20,8 +21,8 @@ from substrateinterface.exceptions import SubstrateRequestException
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
 from daemon import discord
-from tests.test_custody_rules import (NORMAL_BLOCK_LENGTH, STRANGER, _count_walks, filler_call,
-                                      nested_sudo_leg, signed_extrinsic)
+from tests.test_custody_rules import (LEG_SIGNER, NORMAL_BLOCK_LENGTH, STRANGER, _count_walks, filler_call,
+                                      fillers_past_the_budget, nested_sudo_leg, signed_extrinsic)
 
 FIX = Path(__file__).parent / "fixtures" / "custody"
 SUDO_KEY = "5H2M5Dbt8hSfSCXS6hfEBPR1N21yh679finzcfMEwD62i7iP"
@@ -787,6 +788,27 @@ def test_a_sudo_leg_nested_deep_in_batches_pages_critical_naming_its_calls(confi
     assert page["content"].startswith("\U0001f6a8 **CRITICAL** @here")
     assert page["allowed_mentions"] == {"parse": ["everyone"]}
     assert "System.authorize_upgrade**" in page["content"] and "Sudo.sudo" in page["content"]
+
+
+def test_filler_smaller_than_an_authoritys_leg_leaves_the_legs_page_its_call_and_signer(config, tmp_path):
+    # Any funded account can fill a block with signed extrinsics smaller than a multisig
+    # leg; decoded smallest first against one budget, they would leave the leg unread.
+    config = dataclasses.replace(config, materios=dataclasses.replace(
+        config.materios, authority_accounts=(rules.render_account(LEG_SIGNER),)))
+    fillers = fillers_past_the_budget(rules.RuntimeDecoder(_read("materios/metadata_spec238.hex.gz").decode()))
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1829210, blocks={1829210: "block_1829210.json"}, state_at={1829210},
+                      extra={1829210: fillers})
+    source = _materios(config, store, chain)
+    source.start_at(1829209)
+    posts = Posts()
+    _watch(config, store, [source], posts, [_at("2026-09-27T03:00:00")]).cycle()
+    leg, undecoded = posts.payloads
+    assert leg["content"].startswith("\U0001f6a8 **CRITICAL** @here")
+    assert "Multisig.as_multi > Sudo.sudo > System.authorize_upgrade" in leg["content"]
+    assert "multisig account is Sudo.Key" in leg["content"]
+    assert f"signer {rules.render_account(LEG_SIGNER)}" in leg["content"]
+    assert f"signer {rules.render_account(STRANGER)}" in undecoded["content"]
 
 
 def _custody_outflow_pending(config, tmp_path):
