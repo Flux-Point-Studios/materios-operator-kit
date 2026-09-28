@@ -1135,14 +1135,14 @@ def _recovering(chain, lost: bytes, rescuer: bytes, vouched: list[bytes]) -> Non
         "created": 7000, "deposit": 1, "friends": [["0x" + f.hex() for f in sorted(vouched)]]})
 
 
-def _filler_like(call: bytes) -> str:
-    """A signed Utility.batch of remarks from STRANGER whose call is exactly as long as ``call``."""
+def _filler_like(call: bytes, signer: bytes = STRANGER) -> str:
+    """A signed Utility.batch of remarks from ``signer`` whose call is exactly as long as ``call``."""
     empty, target = 3, len(call) - 2 - 1 - 3
     count, extra = divmod(target, empty)
     remark = bytes([0, 0]) + rules._compact(extra) + b"x" * extra
     filler = UTILITY_BATCH + rules._compact(count + 1) + (bytes([0, 0]) + rules._compact(0)) * count + remark
     assert len(filler) == len(call)
-    return signed_extrinsic(filler, STRANGER)
+    return signed_extrinsic(filler, signer)
 
 
 @pytest.mark.parametrize("signer, call, named", [(FRIENDS[0], VOUCH, "Recovery.vouch_recovery"),
@@ -1203,6 +1203,69 @@ def test_any_change_in_the_recovery_of_sudo_key_or_an_authority_pages_critical_a
     assert f"- Recovery.Recoverable({SUDO_KEY}, Sudo.Key)" in store.findings()[-1].text
     source.poll(9.0)
     assert len(store.findings()) == 1 + len(changes)
+
+
+ATT = bytes([0xC7]) * 32
+LEG_AT = OVERFLOW_AT + 1
+
+
+def _leg_signer_an_authority(config):
+    return dataclasses.replace(config, materios=dataclasses.replace(
+        config.materios, authority_accounts=(rules.render_account(LEG_SIGNER),)))
+
+
+def test_a_stranger_recovering_sudo_key_is_no_authority_and_its_failed_attempts_hold_back_no_page(config, tmp_path):
+    # Any funded account can start a recovery of Sudo.Key for a deposit. Its 200 failed
+    # Sudo attempts are an outsider's, and the multisig leg in the next block goes at once.
+    config = _leg_signer_an_authority(config)
+    chain = FakeChain(head=LEG_AT, blocks={LEG_AT: "block_1829210.json"},
+                      state_at={OVERFLOW_AT - 1, OVERFLOW_AT, LEG_AT})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    _recovering(chain, SUDO, ATT, [])
+    _events_overflow(chain, [(SUDO_REMARK, ATT)] * 200, items=1)
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(OVERFLOW_AT - 1)
+    clock = [_at("2026-09-28T02:00:00")]
+    posts = Posts()
+    watch = _watch(config, store, [source], posts, clock)
+    watch.cycle()
+    assert any("System.authorize_upgrade" in p["content"] for p in posts.payloads)
+    for _ in range(60):
+        clock[0] += 1
+        watch.cycle()
+    assert not [p for p in posts.payloads if f"signer {rules.render_account(ATT)}" in p["content"]]
+    assert all(f.severity == rules.INFO for f in store.findings() if rules.render_account(ATT) in f.text
+               and ":recovery:" not in f.key)
+
+
+def test_a_stranger_recovering_sudo_key_cannot_spend_the_budget_of_an_authoritys_leg(config, tmp_path):
+    config = _leg_signer_an_authority(config)
+    chain = FakeChain(head=LEG_AT, blocks={LEG_AT: "block_1829210.json"}, state_at={OVERFLOW_AT, LEG_AT},
+                      extra={LEG_AT: [signed_extrinsic(SUDO_REMARK, ATT)] * 2400})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    _recovering(chain, SUDO, ATT, [])
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(OVERFLOW_AT)
+    _drain(source)
+    [leg] = [f for f in store.findings() if f.key == f"materios-preprod:{LEG_AT}:2"]
+    assert leg.severity == rules.CRITICAL and leg.group is None
+    assert "Multisig.as_multi > Sudo.sudo > System.authorize_upgrade" in leg.text
+    assert [f.group for f in store.findings() if ":undecoded" in f.key] == ["materios-preprod unclassifiable"]
+
+
+def test_what_a_friend_of_sudo_key_signs_is_decoded_ahead_of_filler_from_a_stranger_recovering_it(config, tmp_path):
+    chain = FakeChain(head=8000, blocks={}, state_at={8000})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    _recovering(chain, SUDO, ATT, [])
+    chain.extra[8000] = [_filler_like(VOUCH, ATT)] * 1500 + [signed_extrinsic(VOUCH, FRIENDS[0])]
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(7999)
+    _drain(source)
+    [vouch] = [f for f in store.findings() if "Recovery.vouch_recovery" in f.text]
+    assert vouch.severity == rules.CRITICAL and f"signer {rules.render_account(FRIENDS[0])}" in vouch.text
 
 
 def test_a_recovery_entry_the_runtime_cannot_decode_still_pages_as_its_hash(config, tmp_path):

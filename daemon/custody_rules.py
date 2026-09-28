@@ -369,24 +369,34 @@ class RuntimeDecoder:
         """The values this decoder has built so far; what a block cost is the difference."""
         return self._config.values
 
-    def extrinsics(self, extrinsics_hex: list[str], accountable: frozenset[bytes] = frozenset()) -> list[dict]:
+    def extrinsics(self, extrinsics_hex: list[str], accountable: frozenset[bytes] = frozenset(),
+                   ahead: tuple[frozenset[bytes], ...] = ()) -> list[dict]:
         """Each extrinsic decoded, or ``{"undecodable": hex, "error": ...}`` for one this
         runtime's metadata cannot read or its DECODE_BUDGET does not reach, so a call the
         watcher has not read is reported rather than silently skipped.
 
         Extrinsics signed by an ``accountable`` account decode first, against a budget of
         their own: any funded account can fill a block with extrinsics smaller than a
-        multisig leg, but none can sign as these accounts. The rest share a second budget,
-        unsigned extrinsics first, the inherents among them, then the signed ones smallest
-        first, so a large extrinsic cannot spend what the inherents and a small privileged
-        call need."""
+        multisig leg, but none can sign as these accounts, so an account anyone can become
+        never belongs there. The rest share a second budget: unsigned extrinsics first, the
+        inherents among them, then those signed by each set of ``ahead`` in turn, then
+        everyone else's, smallest first within each, so a large extrinsic cannot spend what
+        the inherents and a small privileged call need."""
         envelopes = [_envelope(x) for x in extrinsics_hex]
+
+        def rank(signed: bool, signer: bytes | None) -> int:
+            if signer in accountable:
+                return 0
+            if not signed:
+                return 1
+            return 2 + next((n for n, accounts in enumerate(ahead) if signer in accounts), len(ahead))
+
+        ranks = [rank(*envelope) for envelope in envelopes]
         decoded: list[dict] = [{} for _ in extrinsics_hex]
         budgets = {True: DECODE_BUDGET, False: DECODE_BUDGET}
-        for index in sorted(range(len(extrinsics_hex)), key=lambda i: (
-                envelopes[i][1] not in accountable, envelopes[i][0], len(extrinsics_hex[i]))):
+        for index in sorted(range(len(extrinsics_hex)), key=lambda i: (ranks[i], len(extrinsics_hex[i]))):
             x = extrinsics_hex[index]
-            reserved = envelopes[index][1] in accountable
+            reserved = ranks[index] == 0
             before = self.values
             try:
                 decoded[index] = self._decode("Extrinsic", x, budgets[reserved])

@@ -21,9 +21,8 @@ severe first, ahead of the tree, so a page cut to Discord's length still shows w
 matters. Calls nested as deep as a runtime decodes them (`MAX_EXTRINSIC_DEPTH`, 256)
 are decoded and named; an extrinsic that still cannot be decoded may hide any call, so
 it pages CRITICAL, in one finding per block that lists each such extrinsic's signer, size
-and hash. Those signed by `Sudo.Key` or an authority account (a configured authority,
-or a recovery friend or rescuer named below) page alone, in one finding per signer and
-block. Every call of the
+and hash. Those signed by `Sudo.Key` or a configured authority page alone, in one
+finding per signer and block. Every call of the
 pinned runtime is in the severity table or the routine list, and a test holds it there;
 a call a runtime upgrade adds pages as an ALERT until it is classified. Text from the
 chain is rendered as JSON with every backtick replaced, so it can never close the
@@ -70,9 +69,12 @@ of `Sudo.Key` and of every configured authority, their `Recovery.ActiveRecoverie
 the `Recovery.Proxy` of each of those accounts and of each rescuer: one key listing per
 account and one storage query. The first read goes to the digest; any change after it,
 an entry added, changed or removed, pages CRITICAL alone with the friends, threshold,
-delay, rescuer and vouches decoded. The friends and rescuers it names count as authority
-accounts for that poll, so their extrinsics decode against the reserved budget and
-their attempts page whatever their outcome. An authority acting as the rescuer of some
+delay, rescuer and vouches decoded. What the friends and rescuers it names sign decodes
+ahead of other accounts' extrinsics (below), but none of them counts as an authority:
+any funded account becomes a rescuer of `Sudo.Key` by starting a recovery of it for a
+deposit. Their attempts are judged by their outcome like any other account's, and a
+vouch, claim or `as_recovered` naming `Sudo.Key` or an authority pages CRITICAL once it
+can have taken effect. An authority acting as the rescuer of some
 other account is paged from its own extrinsics, and from its `Recovery.Proxy` once it
 claims.
 
@@ -181,8 +183,8 @@ count read only when that asset's supply moves, and every count once an hour.
 `role` is `custody` (outflow CRITICAL, inflow ALERT) or `contract` (a spend at the
 address's own `severity`, a payment in as an ALERT). `materios.authority_accounts` lists
 the SS58 accounts besides `Sudo.Key` whose moves are authority moves, such as the sudo
-multisig's signatories; the recovery friends and rescuers of `Sudo.Key` and of these
-accounts are added to them each poll. A relative `project_id_file` is read from the config file's
+multisig's signatories. Recovery friends and rescuers are never authority accounts,
+whatever the recovery state names. A relative `project_id_file` is read from the config file's
 directory. `discord_webhook_file` names a file, read the same way, that holds the
 webhook of a channel of the watcher's own; without it the webhook comes from
 `DISCORD_WEBHOOK_URL` in the environment. `run` refuses to start without an https
@@ -258,16 +260,19 @@ message through the webhook to prove delivery end to end.
   with one-byte elements, and scalecodec builds a Python object for each one it reads.
   A block's extrinsics, and separately its events, are decoded within a budget of
   50,000 values (`DECODE_BUDGET`), about a second of CPU and a few megabytes at most.
-  Extrinsics signed by `Sudo.Key`, a configured authority, or a friend or rescuer the
-  recovery state names for one of them, whose signer the watcher reads from the
-  extrinsic header before decoding any call, are decoded first against a budget of their
-  own: any funded account can fill a block with extrinsics smaller than a multisig leg
-  or a vouch, but none can sign as those accounts. The rest share the block's
-  budget, unsigned extrinsics first, the inherents among them, then signed ones
-  smallest first, so a large extrinsic cannot spend what the inherents and a small
-  privileged call need. What a budget does not reach pages CRITICAL with its signer
-  and the cursor moves on. Events past the budget are left unread, and the block's
-  state decides what its attempts could do (above). A
+  Extrinsics signed by `Sudo.Key` or a configured authority, whose signer the watcher
+  reads from the extrinsic header before decoding any call, are decoded first against a
+  budget of their own: any funded account can fill a block with extrinsics smaller than
+  a multisig leg, but none can sign as those accounts. The rest share the block's
+  budget: unsigned extrinsics first, the inherents among them, then those signed by a
+  recovery friend of `Sudo.Key` or an authority, then by a rescuer of one, then
+  everyone else's, smallest first within each. A large extrinsic cannot spend what the
+  inherents and a small privileged call need, and filler cannot push a friend's vouch
+  out. Anyone can become a rescuer, so rescuers' filler can push out another rescuer's
+  claim, though never a friend's vouch or an authority's leg; a claim that takes effect
+  still pages, as a change in `Recovery.Proxy`. What a budget does not reach pages
+  CRITICAL with its signer and the cursor moves on. Events past the budget are left
+  unread, and the block's state decides what its attempts could do (above). A
   Materios poll ends after the block that brings it to the budget, so the Cardano
   sources are read between expensive blocks. Every call tree is walked once, holds at
   most the 200 lines a page can show, and long arguments are rendered from a hash or

@@ -637,7 +637,7 @@ class MateriosSource:
             return True
         sudo_key = self._sudo_key(head_hash, head, now)
         code = self._code(head_hash, head, now)
-        authorities = self._recovery(head_hash, head, sudo_key, code, now)
+        recovering = self._recovery(head_hash, head, sudo_key, code, now)
 
         cursor = self._store.get(self._cursor_key)
         if cursor is None:
@@ -653,7 +653,7 @@ class MateriosSource:
         hashes = self._rpc("chain_getBlockHash", [list(range(first, last + 1))])
         decoded = 0
         for number, block_hash in zip(range(first, last + 1), hashes):
-            decoded += self._block(number, block_hash, sudo_key, authorities, now)
+            decoded += self._block(number, block_hash, sudo_key, recovering, now)
             if decoded >= rules.DECODE_BUDGET:
                 return number == head
         return last == head
@@ -714,11 +714,12 @@ class MateriosSource:
         return code
 
     def _recovery(self, head_hash: str, head: int, sudo_key: bytes | None, code: str,
-                  now: float) -> frozenset[bytes]:
+                  now: float) -> tuple[frozenset[bytes], frozenset[bytes]]:
         """Read at the finalized head who can recover Sudo.Key or a configured authority,
         who is recovering one, and which rescuers may already act as one, and page any
-        change. Returns the configured authorities with those friends and rescuers, whose
-        extrinsics then decode against the reserved budget and count as an authority's."""
+        change. Returns those friends, then those rescuers, whose extrinsics decode ahead
+        of other accounts' but count as nobody's authority: any funded account can start
+        a recovery of Sudo.Key."""
         watched = sorted(rules.accountable(sudo_key, self._authorities))
         items: dict[str, tuple[str, tuple[bytes, ...]]] = {}
         for account in watched:
@@ -735,7 +736,7 @@ class MateriosSource:
             return rules.render_account(account) + role
 
         decoder = self._decoder_for(code, [head_hash]) if values else None
-        described, friends = {}, set(rescuers)
+        described, friends = {}, set()
         for key, value in values.items():
             item, accounts = items[key]
             try:
@@ -747,7 +748,7 @@ class MateriosSource:
                 described[key] = (f"Recovery.{item}({', '.join(who(a) for a in accounts)}): "
                                   f"{rules.hex_digest(value)}, not decodable: {type(e).__name__}: {e}"[:400])
         self._recovery_change(values, described, items, who, head, now)
-        return self._authorities | friends
+        return frozenset(friends), frozenset(rescuers)
 
     def _recovery_change(self, values: dict, described: dict, items: dict, who, head: int, now: float) -> None:
         name = f"recovery:{self.name}"
@@ -843,19 +844,21 @@ class MateriosSource:
         return {fact: bytes.fromhex(after[key][2:]) if after.get(key) else None
                 for fact, key in keys.items() if before.get(key) == after.get(key)}
 
-    def _block(self, number: int, block_hash: str, sudo_key: bytes | None, authorities: frozenset[bytes],
-               now: float) -> int:
+    def _block(self, number: int, block_hash: str, sudo_key: bytes | None,
+               recovering: tuple[frozenset[bytes], ...], now: float) -> int:
         """Classify one block and commit its findings with the cursor; returns the values
-        its extrinsics and events decoded into."""
+        its extrinsics and events decoded into. What the accounts in ``recovering`` sign
+        decodes ahead of other accounts' extrinsics, from the budget they share."""
         block = self._rpc("chain_getBlock", [block_hash])["block"]
         header = block["header"]
         if self._decoder is None:
             self._decoder = self._load_decoder(header["parentHash"])
         decoder = self._decoder
         before = decoder.values
-        extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, authorities))
+        extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, self._authorities),
+                                        recovering)
         findings = rules.classify_materios_block(
-            self.name, number, extrinsics, lambda: self._events(block_hash, decoder), sudo_key, authorities,
+            self.name, number, extrinsics, lambda: self._events(block_hash, decoder), sudo_key, self._authorities,
             lambda rescuers: self._dispatch_facts(header["parentHash"], block_hash, rescuers))
         if rules.runtime_upgraded(header):
             findings.append(rules.runtime_changed(self.name, number))
