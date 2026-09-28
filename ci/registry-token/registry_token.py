@@ -105,11 +105,13 @@ class Woodpecker:
     def inventory(self):
         """All repositories, and every copy of the secret with the API path that addresses it."""
         repos = self.listing("/repos")
-        orgs = sorted({r["org_id"] for r in repos})
+        # The organization listing leaves out users' organizations; only the user listing names those.
+        orgs = sorted({r["org_id"] for r in repos} | {o["id"] for o in self.listing("/orgs")}
+                      | {u["org_id"] for u in self.listing("/users") if u.get("org_id")})
         for o in orgs:
             org = self.call("GET", f"/orgs/{o}") or {}
             if org.get("id") != o or not org.get("name"):
-                raise Refused(f"a repository belongs to organization {o}, which Woodpecker does not have; "
+                raise Refused(f"Woodpecker names organization {o} but does not have it; "
                               "its secrets listing would be another scope's")
         scopes = [("global", "global", "")]
         scopes += [("org", f"org {o}", f"/orgs/{o}") for o in orgs]
@@ -136,8 +138,10 @@ def require_pinned(images):
 
 
 def current_filter(copies):
-    """The filter of the global copy, or else the one filter every repository copy shares."""
-    source = [c for c in copies if c["scope"] == "global"] or [c for c in copies if c["scope"] == "repo"]
+    """The filter of the global copy, or else the one filter the organization copies share, or else the
+    repository copies'."""
+    by_scope = {scope: [c for c in copies if c["scope"] == scope] for scope in ("global", "org", "repo")}
+    source = by_scope["global"] or by_scope["org"] or by_scope["repo"]
     shapes = {(tuple(c["images"]), tuple(c["events"])) for c in source}
     if len(shapes) != 1:
         raise Refused("no single filter to carry over: " + "; ".join(describe(c) for c in source or copies))

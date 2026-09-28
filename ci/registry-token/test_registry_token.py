@@ -51,10 +51,12 @@ class Fake:
 
     def __init__(self):
         self.global_secrets = {}
-        self.org_secrets = {1: {}, 2: {}}
+        self.orgs = dict(ORGS)
+        self.user_orgs = {1}
+        self.org_secrets = {o: {} for o in ORGS}
         self.repo_secrets = {r["id"]: {} for r in REPOS}
         self.writes = []
-        self.users = [{"login": "realdecimalist", "admin": True}]
+        self.users = [{"login": "realdecimalist", "admin": True, "org_id": 1}]
         self.stored_images = None
         self.stored_events = None
         self.ignore_deletes = False
@@ -67,12 +69,15 @@ class Fake:
         return [{"name": n, "images": s["images"], "events": sorted(s["events"])} for n, s in secrets.items()]
 
     def woodpecker(self, method, parts, query, body):
-        if parts in (["repos"], ["users"]):
+        if parts in (["repos"], ["users"], ["orgs"]):
+            # Like Woodpecker, the organization listing leaves out the organizations of users.
+            listed = {"repos": REPOS, "users": self.users,
+                      "orgs": [{"id": o, "name": n} for o, n in self.orgs.items() if o not in self.user_orgs]}
             page, per = int(query.get("page", ["1"])[0]), int(query.get("perPage", ["50"])[0])
-            return 200, (REPOS if parts == ["repos"] else self.users)[(page - 1) * per:page * per]
+            return 200, listed[parts[0]][(page - 1) * per:page * per]
         if parts[0] == "orgs" and len(parts) == 2:
             org = int(parts[1])
-            return 200, {"id": org, "name": ORGS[org]} if org in ORGS else {"name": ""}
+            return 200, {"id": org, "name": self.orgs[org]} if org in self.orgs else {"name": ""}
         if parts[0] == "secrets":
             store = self.global_secrets
             rest = parts[1:]
@@ -263,6 +268,39 @@ class RegistryTokenTest(unittest.TestCase):
             self.assertEqual(sorted(s["events"]), EVENTS)
         self.assertEqual(self.fake.global_secrets, {})
         self.assertEqual(self.fake.org_secrets[1], {})
+
+    def test_apply_deletes_copies_on_organizations_that_hold_no_repository(self):
+        self.global_state()
+        self.fake.orgs.update({3: "retired-org", 4: "former-user"})
+        self.fake.user_orgs.add(4)
+        self.fake.users.append({"login": "former-user", "admin": True, "org_id": 4})
+        for org in (3, 4):
+            self.fake.org_secrets[org] = {"gchr_token": secret(OLD_VALUE, [PLUGIN], EVENTS)}
+        code, text = self.run_tool("plan", *self.repo_args())
+        self.assertEqual(code, 0, text)
+        self.assertIn("delete gchr_token on org 3", text)
+        self.assertIn("delete gchr_token on org 4", text)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 0, text)
+        self.assertEqual((self.fake.org_secrets[3], self.fake.org_secrets[4]), ({}, {}))
+        self.assertEqual(sorted(self.holders()), sorted(CONSUMERS))
+
+    def test_apply_carries_over_the_filter_of_an_organization_copy_when_no_global_copy_exists(self):
+        self.fake.org_secrets[2]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 0, text)
+        held = self.holders()
+        self.assertEqual(sorted(held), sorted(CONSUMERS))
+        self.assertTrue(all(s["value"] == NEW_TOKEN and s["images"] == [PLUGIN] for s in held.values()))
+        self.assertEqual(self.fake.org_secrets[2], {})
+
+    def test_apply_refuses_organization_copies_that_disagree(self):
+        self.fake.org_secrets[1]["gchr_token"] = secret(OLD_VALUE, [], EVENTS)
+        self.fake.org_secrets[2]["gchr_token"] = secret(OLD_VALUE, [PLUGIN], EVENTS)
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 1, text)
+        self.assertIn("no single filter", text)
+        self.assertEqual(self.fake.writes, [])
 
     def test_apply_rotates_the_existing_copies_when_no_repository_is_named(self):
         for r in REPOS[:3]:
