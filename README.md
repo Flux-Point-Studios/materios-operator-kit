@@ -318,6 +318,67 @@ Monitor the overall committee health (all members, not just yours). Reads the **
       WATCHTOWER_THRESHOLD: "2"
 ```
 
+## Optional: Committee modules
+
+On startup the daemon prints a configuration summary listing four optional
+modules:
+
+```
+evidence_submitter:     not configured (submitter_token=missing)
+settle_claim_attestor:  not configured (kupo_url=missing)
+expire_policy_attestor: not configured (kupo_url=missing)
+slash_watcher:          not configured (kupo_url=missing)
+```
+
+**`not configured` is normal** — these modules are opt-in extras on top of
+your core attestor (`attest_availability_cert`). The base attestor runs and
+earns regardless of whether any of these are enabled. Operators turn modules
+on as they decide to participate in additional committee votes.
+
+### What each module does
+
+| Module | What it does | Env vars to enable |
+|---|---|---|
+| **`evidence_submitter`** | Pushes hardware-attestation evidence (composite_trust_score) to the blob-gateway. Only relevant if you run an attestor with a TEE / hardware-attestation source (Wave 3 Phase 2 / Witness Network). | `EVIDENCE_SUBMITTER_TOKEN` |
+| **`settle_claim_attestor`** | Votes on intent-settlement claims (perp engine + DeFi). Requires a Cardano L1 indexer to verify L1 evidence before signing. | `KUPO_URL` |
+| **`expire_policy_attestor`** | Votes on policy-mirror expiry conditions. Same L1 indexer requirement. | `KUPO_URL` |
+| **`slash_watcher`** | Watches Cardano L1 for slashable mis-attestation evidence and votes to slash. Same L1 indexer requirement. | `KUPO_URL` (and optionally `OGMIOS_URL`) |
+
+### How to enable
+
+Add the env vars to your operator-kit `.env` (or `docker-compose.yml`
+environment block) and restart the daemon:
+
+```
+# Optional. Only set if you want the extra committee modules.
+
+# Activates settle_claim_attestor, expire_policy_attestor, slash_watcher.
+# Point at a Kupo indexer pointed at Cardano mainnet (or preprod for
+# preprod attestor). Three common options:
+#   - Run your own Kupo sidecar against your Cardano node (lowest latency)
+#   - Use a Demeter.run hosted Kupo
+#   - Use an existing operator-shared Kupo if your team operates one
+KUPO_URL=https://your-kupo-host:1442
+
+# Activates evidence_submitter. Bearer token issued per-operator by FPS.
+# DM the team in #operators to request one.
+EVIDENCE_SUBMITTER_TOKEN=<token-issued-by-fps>
+```
+
+After restart you should see those lines flip to `configured` in the startup
+summary.
+
+### When to turn modules on
+
+- **Just starting out?** Leave them all off. Your core attestor earns
+  immediately and the optional modules don't gate participation in the base
+  committee.
+- **Running a TEE / Witness Network APK attestor?** Turn on
+  `evidence_submitter`.
+- **Want to participate in settle / slash committee votes?** Stand up a
+  Kupo (or point at a hosted one) and turn on the three Kupo-dependent
+  modules together — they share the same indexer.
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
