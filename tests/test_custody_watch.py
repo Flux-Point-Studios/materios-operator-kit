@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 from substrateinterface.exceptions import SubstrateRequestException
-from substrateinterface.utils.hasher import blake2_128_concat, xxh128
+from substrateinterface.utils.hasher import blake2_128_concat, two_x64_concat, xxh128
 
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
@@ -28,6 +28,7 @@ from tests.test_custody_rules import (LEG_SIGNER, NORMAL_BLOCK_LENGTH, STRANGER,
 
 FIX = Path(__file__).parent / "fixtures" / "custody"
 SUDO_KEY = "5H2M5Dbt8hSfSCXS6hfEBPR1N21yh679finzcfMEwD62i7iP"
+ALICE = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY"
 ROUTINE_BLOCK = "block_2034370_with_events.json"
 
 
@@ -596,6 +597,8 @@ def test_sources_are_polled_on_their_own_cadence(config, tmp_path):
 
 
 EVENTS_KEY = "0x26aa394eea5630e07c48ae0c9558cef780d41e5e16056765bc8461851072c9d7"
+CODE_KEY = "0x" + b":code".hex()
+SPEC_238_CODE_HASH = "0xae5e94cef78cb63c58079c46b32b11e6f8c371ea9a701feeb5a4600c0e76edb4"
 SUDO_STORAGE_KEY = "0x5c0d1176a568c1f92944340dbfed9e9c530ebca703c85910e7164cb7d1c9e47b"
 
 
@@ -618,6 +621,7 @@ class FakeChain:
         # Sudo.Key included, at one block number.
         self.storage: dict[str, str] = {}
         self.storage_at: dict[int, dict[str, str | None]] = {}
+        self.code_hash = SPEC_238_CODE_HASH
         self.metadata = _read("materios/metadata_spec238.hex.gz").decode()
         self.headers = json.loads(_read("materios/headers_spec238_upgrade.json"))
         self.calls = []
@@ -668,9 +672,6 @@ class FakeChain:
             return [self.hash_of(n) for n in numbers] if isinstance(numbers, list) else self.hash_of(numbers)
         if method == "chain_getBlock":
             return self._block(self.number_of(params[0]))
-        if method == "state_getRuntimeVersion":
-            self._state(params[0] if params else None)
-            return {"specVersion": 238}
         if method == "state_getMetadata":
             self._state(params[0] if params else None)
             return self.metadata
@@ -685,6 +686,15 @@ class FakeChain:
             keys, at = params
             self._state(at)
             return [{"block": at, "changes": [[k, self.value(k, at)] for k in keys]}]
+        if method == "state_getKeysPaged":
+            prefix, count, start, at = params
+            self._state(at)
+            return sorted(k for k in self.storage if k.startswith(prefix) and k > start)[:count]
+        if method == "state_getStorageHash":
+            key, *at = params
+            self._state(at[0] if at else None)
+            assert key == CODE_KEY
+            return self.code_hash
         raise AssertionError(f"unexpected RPC {method} {params}")
 
 
@@ -717,7 +727,7 @@ def test_the_spec_238_upgrade_authorization_and_apply_page_as_critical(config, t
 
     critical = {f.key: f for f in store.findings() if f.severity == rules.CRITICAL}
     assert set(critical) == {"materios-preprod:1829210:2", "materios-preprod:1829226:2",
-                             "materios-preprod:1829227:4"}
+                             "materios-preprod:1829227:4", "materios-preprod:1829227:runtime"}
     assert "System.authorize_upgrade" in critical["materios-preprod:1829226:2"].text
     assert "multisig account is Sudo.Key" in critical["materios-preprod:1829210:2"].text
     assert "System.apply_authorized_upgrade" in critical["materios-preprod:1829227:4"].text
@@ -826,8 +836,8 @@ def test_a_runtime_upgrade_block_reloads_metadata_for_the_blocks_after_it(config
     source = _materios(config, store, chain)
     source.start_at(1829225)
     _drain(source)
-    versions = [p for m, p in chain.calls if m == "state_getRuntimeVersion"]
-    assert versions == [[FakeChain.hash_of(1829225)], [FakeChain.hash_of(1829227)]]
+    loads = [p[1] for m, p in chain.calls if m == "state_getStorageHash" and p[1] != FakeChain.hash_of(1829228)]
+    assert loads == [FakeChain.hash_of(1829225), FakeChain.hash_of(1829227)]
 
 
 def test_a_changed_committee_alerts_and_an_unchanged_one_goes_to_the_digest(config, tmp_path):
@@ -1076,6 +1086,162 @@ def test_an_attempt_by_the_proxy_of_the_account_it_acts_as_still_pages(config, t
     source.poll(1.0)
     [finding] = store.findings()
     assert finding.severity == rules.CRITICAL and "Recovery.as_recovered" in finding.text
+
+
+SUDO = rules.account_bytes(SUDO_KEY)
+FRIENDS = [bytes([0xF1 + i]) * 32 for i in range(5)]
+RESCUER = bytes([0xE1]) * 32
+RECOVERY = xxh128(b"Recovery")
+VOUCH = bytes([24, 4, 0]) + SUDO + bytes([0]) + RESCUER
+CLAIM = bytes([24, 5, 0]) + SUDO
+
+
+@functools.lru_cache(maxsize=None)
+def _decoder_238() -> rules.RuntimeDecoder:
+    return rules.RuntimeDecoder(_read("materios/metadata_spec238.hex.gz").decode())
+
+
+def _recovery_value(item: str, value) -> str:
+    """``value`` encoded as Recovery's ``item`` holds it; scalecodec encodes a BoundedVec
+    from its one field, so each list of friends is wrapped once more."""
+    decoder = _decoder_238()
+    function = decoder._metadata.get_metadata_pallet("Recovery").get_storage_function(item)
+    return decoder._config.create_scale_object(function.get_value_type_string(),
+                                               metadata=decoder._metadata).encode(value).to_hex()
+
+
+def _recoverable_key(account: bytes) -> str:
+    return "0x" + (RECOVERY + xxh128(b"Recoverable") + two_x64_concat(account)).hex()
+
+
+def _active_key(lost: bytes, rescuer: bytes) -> str:
+    return "0x" + (RECOVERY + xxh128(b"ActiveRecoveries") + two_x64_concat(lost) + two_x64_concat(rescuer)).hex()
+
+
+def _proxy_key(rescuer: bytes) -> str:
+    return "0x" + (RECOVERY + xxh128(b"Proxy") + blake2_128_concat(rescuer)).hex()
+
+
+def _recoverable_by(chain, account: bytes, friends: list[bytes]) -> None:
+    """``account`` recoverable as Sudo.Key is on the chain: 3 of ``friends``, 100,800 blocks."""
+    chain.storage[_recoverable_key(account)] = _recovery_value("Recoverable", {
+        "delay_period": 100_800, "deposit": 1, "friends": [["0x" + f.hex() for f in sorted(friends)]],
+        "threshold": 3})
+
+
+def _recovering(chain, lost: bytes, rescuer: bytes, vouched: list[bytes]) -> None:
+    chain.storage[_active_key(lost, rescuer)] = _recovery_value("ActiveRecoveries", {
+        "created": 7000, "deposit": 1, "friends": [["0x" + f.hex() for f in sorted(vouched)]]})
+
+
+def _filler_like(call: bytes) -> str:
+    """A signed Utility.batch of remarks from STRANGER whose call is exactly as long as ``call``."""
+    empty, target = 3, len(call) - 2 - 1 - 3
+    count, extra = divmod(target, empty)
+    remark = bytes([0, 0]) + rules._compact(extra) + b"x" * extra
+    filler = UTILITY_BATCH + rules._compact(count + 1) + (bytes([0, 0]) + rules._compact(0)) * count + remark
+    assert len(filler) == len(call)
+    return signed_extrinsic(filler, STRANGER)
+
+
+@pytest.mark.parametrize("signer, call, named", [(FRIENDS[0], VOUCH, "Recovery.vouch_recovery"),
+                                                 (RESCUER, CLAIM, "Recovery.claim_recovery")],
+                         ids=["friend", "rescuer"])
+def test_what_a_friend_or_rescuer_of_sudo_key_signs_is_decoded_whatever_filler_the_block_holds(
+        config, tmp_path, signer, call, named):
+    chain = FakeChain(head=8000, blocks={}, state_at={8000})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    _recovering(chain, SUDO, RESCUER, [])
+    chain.extra[8000] = [_filler_like(call)] * 1500 + [signed_extrinsic(call, signer)]
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(7999)
+    posts = Posts()
+    _watch(config, store, [source], posts, [_at("2026-09-28T02:00:00")]).cycle()
+    [page] = [p["content"] for p in posts.payloads if named in p["content"]]
+    assert page.startswith("\U0001f6a8 **CRITICAL** @here")
+    assert SUDO_KEY in page and f"signer {rules.render_account(signer)}" in page
+
+
+def test_the_first_read_of_the_recovery_of_sudo_key_goes_to_the_digest(config, tmp_path):
+    chain = FakeChain(head=1000, blocks={}, state_at={1000})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    store = cw.Store(str(tmp_path / "state.db"))
+    _materios(config, store, chain).poll(1.0)
+    [finding] = store.findings()
+    assert finding.severity == rules.INFO
+    assert f"Recovery.Recoverable({SUDO_KEY}, Sudo.Key)" in finding.text
+    assert "threshold 3 of 5 friends, delay 100,800 blocks" in finding.text
+    assert rules.render_account(FRIENDS[0]) in finding.text
+
+
+def test_any_change_in_the_recovery_of_sudo_key_or_an_authority_pages_critical_alone(config, tmp_path):
+    authority = rules.account_bytes(ALICE)
+    config = dataclasses.replace(config, materios=dataclasses.replace(config.materios, authority_accounts=(ALICE,)))
+    chain = FakeChain(head=1000, blocks={}, state_at=set(range(1000, 1010)))
+    _recoverable_by(chain, SUDO, FRIENDS)
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.poll(1.0)
+    changes = [
+        ("Recovery.ActiveRecoveries", lambda: _recovering(chain, SUDO, RESCUER, [])),
+        ("Recovery.ActiveRecoveries", lambda: _recovering(chain, SUDO, RESCUER, FRIENDS[:1])),
+        ("Recovery.Proxy", lambda: chain.storage.__setitem__(_proxy_key(RESCUER), "0x" + SUDO.hex())),
+        ("Recovery.Recoverable", lambda: _recoverable_by(chain, authority, FRIENDS)),
+        ("Recovery.Recoverable", lambda: chain.storage.pop(_recoverable_key(SUDO))),
+    ]
+    for step, (item, change) in enumerate(changes, start=1):
+        change()
+        chain.head = 1000 + step
+        source.poll(1.0 + step)
+        [finding] = [f for f in store.findings() if f.key.endswith(f":recovery:{1000 + step}")]
+        assert finding.severity == rules.CRITICAL and finding.group is None
+        assert item in finding.text, (step, finding.text)
+    assert "rescuer " + rules.render_account(RESCUER) in store.findings()[1].text
+    assert f"vouched by {rules.render_account(FRIENDS[0])}" in store.findings()[2].text
+    assert f"- Recovery.Recoverable({SUDO_KEY}, Sudo.Key)" in store.findings()[-1].text
+    source.poll(9.0)
+    assert len(store.findings()) == 1 + len(changes)
+
+
+def test_a_recovery_entry_the_runtime_cannot_decode_still_pages_as_its_hash(config, tmp_path):
+    chain = FakeChain(head=1000, blocks={}, state_at={1000, 1001})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.poll(1.0)
+    chain.storage[_recoverable_key(SUDO)] = "0x01"
+    chain.head = 1001
+    source.poll(2.0)
+    [finding] = [f for f in store.findings() if f.severity == rules.CRITICAL]
+    assert finding.details[0].startswith(f"~ Recovery.Recoverable({SUDO_KEY}, Sudo.Key): 1 bytes blake2_256 0x")
+    assert "not decodable" in finding.details[0]
+
+
+def test_a_runtime_environment_digest_pages_critical_on_its_own(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1829227, blocks={1829227: "block_2029707.json"}, state_at={1829226, 1829227})
+    source = _materios(config, store, chain)
+    source.start_at(1829226)
+    _drain(source)
+    [finding] = [f for f in store.findings() if f.severity == rules.CRITICAL]
+    assert finding.key == "materios-preprod:1829227:runtime" and finding.group is None
+    assert "runtime environment changed" in finding.headline
+
+
+def test_runtime_code_replaced_without_an_upgrade_digest_pages_and_is_decoded_with_its_own_metadata(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    chain = FakeChain(head=1000, blocks={}, state_at=set(range(999, 1003)))
+    source = _materios(config, store, chain)
+    source.start_at(999)
+    _drain(source)
+    replaced = "0x" + "11" * 32
+    chain.code_hash, chain.head = replaced, 1002
+    _drain(source, now=2.0)
+    [finding] = [f for f in store.findings() if f.severity == rules.CRITICAL]
+    assert "runtime code changed" in finding.headline and finding.group is None
+    assert SPEC_238_CODE_HASH in finding.text and replaced in finding.text
+    assert [m for m, _ in chain.calls].count("state_getMetadata") == 2
 
 
 def _custody_outflow_pending(config, tmp_path):

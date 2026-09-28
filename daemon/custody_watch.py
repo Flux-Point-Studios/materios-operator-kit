@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Callable
 
 from substrateinterface.exceptions import SubstrateRequestException
-from substrateinterface.utils.hasher import blake2_128_concat, xxh128
+from substrateinterface.utils.hasher import blake2_128_concat, two_x64_concat, xxh128
 
 from daemon import custody_rules as rules
 from daemon import discord
@@ -519,14 +519,31 @@ class Watch:
 
 SUDO_KEY_STORAGE = "0x" + (xxh128(b"Sudo") + xxh128(b"Key")).hex()
 SYSTEM_EVENTS_STORAGE = "0x" + (xxh128(b"System") + xxh128(b"Events")).hex()
-RECOVERY_PROXY = xxh128(b"Recovery") + xxh128(b"Proxy")
+CODE_STORAGE = "0x" + b":code".hex()
+RECOVERY = xxh128(b"Recovery")
+MAX_BLOCKS_PER_POLL = 600
+BLOCK_SECONDS = 6
+KEYS_PAGE = 1000
 
 
 def recovery_proxy_key(rescuer: bytes) -> str:
-    """The storage key of Recovery.Proxy(rescuer): the account the rescuer may act as."""
-    return "0x" + (RECOVERY_PROXY + blake2_128_concat(rescuer)).hex()
-MAX_BLOCKS_PER_POLL = 600
-BLOCK_SECONDS = 6
+    """Recovery.Proxy(rescuer): the account the rescuer may act as."""
+    return "0x" + (RECOVERY + xxh128(b"Proxy") + blake2_128_concat(rescuer)).hex()
+
+
+def _recoverable_key(account: bytes) -> str:
+    """Recovery.Recoverable(account): the friends, threshold and delay that recover it."""
+    return "0x" + (RECOVERY + xxh128(b"Recoverable") + two_x64_concat(account)).hex()
+
+
+def _active_prefix(lost: bytes) -> str:
+    """Recovery.ActiveRecoveries(lost, *): every recovery of ``lost`` under way, by rescuer."""
+    return "0x" + (RECOVERY + xxh128(b"ActiveRecoveries") + two_x64_concat(lost)).hex()
+
+
+def _rescuer(active_key: str) -> bytes:
+    """The rescuer an ActiveRecoveries key ends with, after its eight-byte twox64 hash."""
+    return bytes.fromhex(active_key[-64:])
 
 
 def _account(storage_hex: str) -> str:
@@ -553,9 +570,9 @@ class MateriosSource:
         self._moved: tuple[int, float] | None = None
         self._cursor_key = f"cursor:{self.name}"
         self._authorities = frozenset(rules.account_bytes(a) for a in config.authority_accounts)
-        # Keyed by genesis and spec version: a reset chain may reuse a spec version with
-        # another pallet layout.
-        self._decoders: dict[tuple[str, int], rules.RuntimeDecoder] = {}
+        # Keyed by genesis and the runtime code's hash: a reset chain, or a runtime written
+        # without an upgrade, may reuse a spec version with another pallet layout.
+        self._decoders: dict[tuple[str, str], rules.RuntimeDecoder] = {}
         self._decoder: rules.RuntimeDecoder | None = None
         self._genesis: str | None = None
 
@@ -594,6 +611,8 @@ class MateriosSource:
         if self._reset(head, now):
             return True
         sudo_key = self._sudo_key(head_hash, head, now)
+        code = self._code(head_hash, head, now)
+        authorities = self._recovery(head_hash, head, sudo_key, code, now)
 
         cursor = self._store.get(self._cursor_key)
         if cursor is None:
@@ -609,7 +628,7 @@ class MateriosSource:
         hashes = self._rpc("chain_getBlockHash", [list(range(first, last + 1))])
         decoded = 0
         for number, block_hash in zip(range(first, last + 1), hashes):
-            decoded += self._block(number, block_hash, sudo_key, now)
+            decoded += self._block(number, block_hash, sudo_key, authorities, now)
             if decoded >= rules.DECODE_BUDGET:
                 return number == head
         return last == head
@@ -631,8 +650,8 @@ class MateriosSource:
                 rules.CRITICAL, f"{self.name}:genesis:{genesis}",
                 f"{self.name} genesis changed: the chain was reset",
                 details=(f"from {stored}", f"to   {genesis}", f"watching again from finalized #{head}")), now)
-            self._store.delete(f"sudo-key:{self.name}")
-            self._store.delete(f"committee:{self.name}")
+            for kept in ("sudo-key", "committee", "code", "recovery"):
+                self._store.delete(f"{kept}:{self.name}")
             self.start_at(head)
         self._decoder = None
         self._decoders.clear()
@@ -651,20 +670,112 @@ class MateriosSource:
             self._store.put(name, raw)
         return bytes.fromhex(raw[2:]) if raw else None
 
+    def _code(self, head_hash: str, head: int, now: float) -> str:
+        """The hash of the runtime code at the finalized head. A change pages, and the
+        blocks after it are read with the new code's metadata: a raw write of ``:code``
+        deposits no upgrade digest, so this is what notices it."""
+        code = self._rpc("state_getStorageHash", [CODE_STORAGE, head_hash])
+        name = f"code:{self.name}"
+        stored = self._store.get(name)
+        with self._store.transaction():
+            if stored is not None and stored != code:
+                self._store.add(rules.Finding(
+                    rules.CRITICAL, f"{self.name}:code:{head}",
+                    f"{self.name}: runtime code changed (seen at finalized #{head})",
+                    details=(f"from blake2_256 {stored}", f"to   blake2_256 {code}",
+                             "blocks read from here on are decoded with the new code's metadata")), now)
+                self._decoder = None
+            self._store.put(name, code)
+        return code
+
+    def _recovery(self, head_hash: str, head: int, sudo_key: bytes | None, code: str,
+                  now: float) -> frozenset[bytes]:
+        """Read at the finalized head who can recover Sudo.Key or a configured authority,
+        who is recovering one, and which rescuers may already act as one, and page any
+        change. Returns the configured authorities with those friends and rescuers, whose
+        extrinsics then decode against the reserved budget and count as an authority's."""
+        watched = sorted(rules.accountable(sudo_key, self._authorities))
+        items: dict[str, tuple[str, tuple[bytes, ...]]] = {}
+        for account in watched:
+            items[_recoverable_key(account)] = ("Recoverable", (account,))
+            for key in self._keys(_active_prefix(account), head_hash):
+                items[key] = ("ActiveRecoveries", (account, _rescuer(key)))
+        rescuers = {accounts[1] for item, accounts in items.values() if item == "ActiveRecoveries"}
+        for account in sorted({*watched, *rescuers}):
+            items[recovery_proxy_key(account)] = ("Proxy", (account,))
+        values = {k: v for k, v in self._storage_at(list(items), head_hash).items() if v}
+
+        def who(account: bytes) -> str:
+            role = ", Sudo.Key" if account == sudo_key else ", authority" if account in self._authorities else ""
+            return rules.render_account(account) + role
+
+        decoder = self._decoder_for(code, [head_hash]) if values else None
+        described, friends = {}, set(rescuers)
+        for key, value in values.items():
+            item, accounts = items[key]
+            try:
+                decoded = decoder.storage("Recovery", item, value)
+                described[key] = rules.describe_recovery(item, accounts, decoded, who)
+                if item == "Recoverable":
+                    friends.update(rules.recovery_friends(decoded))
+            except Exception as e:  # a runtime may change the layout; the entry still pages, as its hash
+                described[key] = (f"Recovery.{item}({', '.join(who(a) for a in accounts)}): "
+                                  f"{rules.hex_digest(value)}, not decodable: {type(e).__name__}: {e}"[:400])
+        self._recovery_change(values, described, items, who, head, now)
+        return self._authorities | friends
+
+    def _recovery_change(self, values: dict, described: dict, items: dict, who, head: int, now: float) -> None:
+        name = f"recovery:{self.name}"
+        stored = self._store.get(name)
+        previous = json.loads(stored) if stored is not None else None
+        with self._store.transaction():
+            self._store.put(name, json.dumps(values, sort_keys=True))
+            if previous is None:
+                if values:
+                    self._store.add(rules.Finding(
+                        rules.INFO, f"{self.name}:recovery:{head}",
+                        f"{self.name}: recovery of Sudo.Key and the authorities as first read at #{head}",
+                        details=tuple(described[k] for k in sorted(described)), kind="recovery"), now)
+                return
+            if previous == values:
+                return
+            lines = [f"+ {described[k]}" for k in sorted(values) if k not in previous]
+            lines += [f"~ {described[k]}" for k in sorted(values) if k in previous and previous[k] != values[k]]
+            for key in sorted(set(previous) - set(values)):
+                item, accounts = items.get(key, ("an entry", ()))
+                lines.append(f"- Recovery.{item}({', '.join(who(a) for a in accounts) or key})")
+            self._store.add(rules.Finding(
+                rules.CRITICAL, f"{self.name}:recovery:{head}",
+                f"{self.name}: recovery of Sudo.Key or an authority changed (seen at finalized #{head})",
+                details=tuple(lines)), now)
+
+    def _keys(self, prefix: str, at_hash: str) -> list[str]:
+        keys: list[str] = []
+        while True:
+            page = self._rpc("state_getKeysPaged", [prefix, KEYS_PAGE, keys[-1] if keys else prefix, at_hash])
+            keys += page
+            if len(page) < KEYS_PAGE:
+                return keys
+
     def _load_decoder(self, at_hash: str) -> rules.RuntimeDecoder:
         """The decoder for blocks built on ``at_hash``; the node's current runtime when that
         state is pruned, in which case an extrinsic it cannot read is still reported."""
         try:
-            version = self._rpc("state_getRuntimeVersion", [at_hash])["specVersion"]
+            code = self._rpc("state_getStorageHash", [CODE_STORAGE, at_hash])
             params = [at_hash]
         except SubstrateRequestException:
-            version = self._rpc("state_getRuntimeVersion", [])["specVersion"]
+            code = self._rpc("state_getStorageHash", [CODE_STORAGE])
             params = []
-            logger.warning("%s: state at %s is pruned; decoding with the current runtime, spec %s",
-                           self.name, at_hash, version)
-        cache = (self._genesis, version)
+            logger.warning("%s: state at %s is pruned; decoding with the current runtime, code %s",
+                           self.name, at_hash, code)
+        return self._decoder_for(code, params)
+
+    def _decoder_for(self, code: str, params: list) -> rules.RuntimeDecoder:
+        """The decoder for the runtime whose code hashes to ``code``, its metadata read
+        with ``params`` the first time."""
+        cache = (self._genesis, code)
         if cache not in self._decoders:
-            name = f"metadata:{self.name}:{self._genesis}:{version}"
+            name = f"metadata:{self.name}:{self._genesis}:{code}"
             metadata = self._store.get(name)
             if metadata is None:
                 metadata = self._rpc("state_getMetadata", params)
@@ -707,7 +818,8 @@ class MateriosSource:
         return {fact: bytes.fromhex(after[key][2:]) if after.get(key) else None
                 for fact, key in keys.items() if before.get(key) == after.get(key)}
 
-    def _block(self, number: int, block_hash: str, sudo_key: bytes | None, now: float) -> int:
+    def _block(self, number: int, block_hash: str, sudo_key: bytes | None, authorities: frozenset[bytes],
+               now: float) -> int:
         """Classify one block and commit its findings with the cursor; returns the values
         its extrinsics and events decoded into."""
         block = self._rpc("chain_getBlock", [block_hash])["block"]
@@ -716,10 +828,12 @@ class MateriosSource:
             self._decoder = self._load_decoder(header["parentHash"])
         decoder = self._decoder
         before = decoder.values
-        extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, self._authorities))
+        extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, authorities))
         findings = rules.classify_materios_block(
-            self.name, number, extrinsics, lambda: self._events(block_hash, decoder), sudo_key, self._authorities,
+            self.name, number, extrinsics, lambda: self._events(block_hash, decoder), sudo_key, authorities,
             lambda rescuers: self._dispatch_facts(header["parentHash"], block_hash, rescuers))
+        if rules.runtime_upgraded(header):
+            findings.append(rules.runtime_changed(self.name, number))
         try:
             committee = rules.committee_of(extrinsics)
         except Exception as e:  # the inherent's shape is the block author's; it must not stall the cursor

@@ -7,7 +7,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 
 | Source | CRITICAL (immediate, `@here`) | ALERT (immediate) | INFO (daily digest) |
 |---|---|---|---|
-| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, a new genesis (chain reset), an extrinsic the runtime metadata cannot decode, the block's decode budget does not reach, or the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below) |
+| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, any change in the recovery of `Sudo.Key` or an authority (below), a `RuntimeEnvironmentUpdated` header digest, the runtime code's hash changing, a new genesis (chain reset), an extrinsic the runtime metadata cannot decode, the block's decode budget does not reach, or the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below); the recovery state as first read |
 | Cardano custody addresses | any outflow, collateral a failed script consumed included | any inflow | reads as a reference input |
 | Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
 | Cardano policies | mint or burn, as configured | as configured | |
@@ -62,6 +62,18 @@ whose caller is not the proxy of the account it names, could not take effect and
 to the digest with everything it wraps. A root-gated call from an account needs no
 proof. What the state cannot rule out pages, grouped per source rather than per
 signer; an authority's attempts page alone as before.
+
+`Sudo.Key` has a recovery config on the chain, so its friends can take it over together
+with a rescuer after a delay. Each poll reads, at the finalized head, `Recovery.Recoverable`
+of `Sudo.Key` and of every configured authority, their `Recovery.ActiveRecoveries`, and
+the `Recovery.Proxy` of each of those accounts and of each rescuer: one key listing per
+account and one storage query. The first read goes to the digest; any change after it,
+an entry added, changed or removed, pages CRITICAL alone with the friends, threshold,
+delay, rescuer and vouches decoded. The friends and rescuers it names count as authority
+accounts for that poll, so their extrinsics decode against the reserved budget and
+their attempts page whatever their outcome. An authority acting as the rescuer of some
+other account is paged from its own extrinsics, and from its `Recovery.Proxy` once it
+claims.
 
 ## Paging
 
@@ -206,15 +218,16 @@ message through the webhook to prove delivery end to end.
   with one-byte elements, and scalecodec builds a Python object for each one it reads.
   A block's extrinsics, and separately its events, are decoded within a budget of
   50,000 values (`DECODE_BUDGET`), about a second of CPU and a few megabytes at most.
-  Extrinsics signed by `Sudo.Key` or a configured authority, whose signer the watcher
-  reads from the extrinsic header before decoding any call, are decoded first against a
-  budget of their own: any funded account can fill a block with extrinsics smaller than
-  a multisig leg, but none can sign as those accounts. The rest share the block's
+  Extrinsics signed by `Sudo.Key`, a configured authority, or a friend or rescuer the
+  recovery state names for one of them, whose signer the watcher reads from the
+  extrinsic header before decoding any call, are decoded first against a budget of their
+  own: any funded account can fill a block with extrinsics smaller than a multisig leg
+  or a vouch, but none can sign as those accounts. The rest share the block's
   budget, unsigned extrinsics first, the inherents among them, then signed ones
   smallest first, so a large extrinsic cannot spend what the inherents and a small
   privileged call need. What a budget does not reach pages CRITICAL with its signer
-  and the cursor moves on. Events past the
-  budget are left unread, so the block's attempts page as though they took effect. A
+  and the cursor moves on. Events past the budget are left unread, and the block's
+  state decides what its attempts could do (above). A
   Materios poll ends after the block that brings it to the budget, so the Cardano
   sources are read between expensive blocks. Every call tree is walked once, holds at
   most the 200 lines a page can show, and long arguments are rendered from a hash or
@@ -231,10 +244,13 @@ message through the webhook to prove delivery end to end.
   that stops pinging its watchdog, and `OnFailure` pages when restarts are exhausted.
 - **A runtime replaced by a raw storage write.** `System.set_storage` of the runtime
   code under `Sudo` pages CRITICAL like any root-gated call, but deposits no runtime
-  upgrade digest, so the blocks after it are decoded with the metadata of the runtime
-  it replaced until an upgrade digest, or a restart that finds a new spec version. A
-  runtime installed that way can move
-  anything without an extrinsic, so that page is the alarm for what follows it.
+  upgrade digest. Each poll reads the hash of `:code` at the finalized head, pages
+  CRITICAL when it changes, and decodes the blocks after that with the new code's
+  metadata; decoders and stored metadata are keyed by that hash, never by a spec version
+  a new runtime may reuse. Blocks read in the same poll as the write, before its head,
+  are decoded with the metadata of the runtime it replaced. Every
+  `RuntimeEnvironmentUpdated` header digest pages CRITICAL from the header alone, so no
+  undecoded extrinsic can hide a new runtime.
 
 ## Replaying history
 

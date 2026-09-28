@@ -331,6 +331,11 @@ class RuntimeDecoder:
             budgets[reserved] -= self.values - before
         return decoded
 
+    def storage(self, pallet: str, item: str, value_hex: str):
+        """A value of ``pallet``'s storage ``item``, decoded within DECODE_BUDGET."""
+        function = self._metadata.get_metadata_pallet(pallet).get_storage_function(item)
+        return self._decode(function.get_value_type_string(), value_hex, DECODE_BUDGET)
+
     def events(self, events_hex: str) -> dict[int, list[str]]:
         grouped: dict[int, list[str]] = defaultdict(list)
         for record in self._decode(self._events_type, events_hex, DECODE_BUDGET):
@@ -514,7 +519,7 @@ def _is_call(value) -> bool:
     return isinstance(value, dict) and "call_module" in value
 
 
-def _hex_digest(hex_text: str) -> str:
+def hex_digest(hex_text: str) -> str:
     """The length and blake2_256 of the bytes that 0x-prefixed ``hex_text`` spells, read a
     chunk at a time so a block-sized value costs no copy of itself."""
     digest = hashlib.blake2b(digest_size=32)
@@ -535,7 +540,7 @@ def _render_value(value) -> str:
     and its newlines stay escaped."""
     if (isinstance(value, str) and value.startswith("0x") and len(value) % 2 == 0
             and len(value) >= 2 + 2 * _LONG_HEX_BYTES and _HEX_DIGITS.fullmatch(value, 2)):
-        return f"<{_hex_digest(value)}>"
+        return f"<{hex_digest(value)}>"
     # A string's first 401 characters encode to the same first 400 as the whole of it.
     text = json.dumps(value[:401] if isinstance(value, str) else value, default=str)
     return text if len(text) <= 400 else text[:400] + "\u2026"
@@ -737,6 +742,15 @@ def runtime_upgraded(header: dict) -> bool:
     return RUNTIME_ENVIRONMENT_UPDATED in header["digest"]["logs"]
 
 
+def runtime_changed(chain: str, number: int) -> Finding:
+    """The CRITICAL for a RuntimeEnvironmentUpdated digest, read from the header alone, so
+    no extrinsic left undecoded can hide a new runtime."""
+    return Finding(CRITICAL, f"{chain}:{number}:runtime",
+                   f"{chain} #{number}: the runtime environment changed (a new runtime or heap pages)",
+                   details=("the block's header carries a RuntimeEnvironmentUpdated digest; the blocks after it "
+                            "are decoded with the new runtime's metadata",))
+
+
 def plural(n: int, word: str) -> str:
     return f"{n:,} {word}" + ("" if n == 1 else "s")
 
@@ -751,7 +765,7 @@ def unclassifiable(key: str, what: str, error: Exception, *details: str, group: 
 def _undecoded_line(index: int, ext: dict) -> str:
     signed, signer = _envelope(ext["undecodable"])
     who = f"signer {render_account(signer)}" if signer else "signer names no account" if signed else "unsigned"
-    return f"extrinsic {index}: {who}: {_hex_digest(ext['undecodable'])}: {ext['error']}"
+    return f"extrinsic {index}: {who}: {hex_digest(ext['undecodable'])}: {ext['error']}"
 
 
 def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
@@ -876,6 +890,26 @@ def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None
         group=(None if not ordinary else f"{chain} unverified" if own is None
                else f"{chain} signer {render_account(signer)}"),
     )
+
+
+def describe_recovery(item: str, accounts: tuple[bytes, ...], value, who: Callable[[bytes], str]) -> str:
+    """One line for a decoded Recovery storage entry: ``Recoverable`` (account), its
+    friends, threshold and delay; ``ActiveRecoveries`` (lost, rescuer), who has vouched;
+    ``Proxy`` (rescuer), the account it may act as."""
+    if item == "Recoverable":
+        return (f"Recovery.Recoverable({who(accounts[0])}): threshold {value['threshold']} of "
+                f"{plural(len(value['friends']), 'friend')}, delay {value['delay_period']:,} blocks: "
+                + ", ".join(value["friends"]))
+    if item == "ActiveRecoveries":
+        vouched = ", ".join(value["friends"]) or "no friend yet"
+        return (f"Recovery.ActiveRecoveries(lost {who(accounts[0])}, rescuer {who(accounts[1])}): "
+                f"started #{value['created']}, vouched by {vouched}")
+    return f"Recovery.Proxy({who(accounts[0])}): acts as {who(account_bytes(value))}"
+
+
+def recovery_friends(value) -> list[bytes]:
+    """The friends a decoded ``Recoverable`` or ``ActiveRecoveries`` entry names."""
+    return [account_bytes(f) for f in value["friends"]]
 
 
 def committee_of(extrinsics: list[dict]) -> tuple[tuple[str, ...], ...] | None:
