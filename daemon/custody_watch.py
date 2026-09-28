@@ -206,15 +206,24 @@ def _fenced(text: str, room: int) -> str:
 
 
 def page_message(findings: list[rules.Finding], headline_only: bool = False) -> dict:
-    """One Discord message for one finding, or for every pending finding of a group,
-    most severe first. Only CRITICAL may ping, so text taken from the chain can never
-    mention anyone on an ALERT."""
+    """One Discord message for one finding, for every pending finding of a group, or
+    for the pending findings of many groups, most severe first. Only CRITICAL may ping,
+    so text taken from the chain can never mention anyone on an ALERT."""
     severity = max(f.severity for f in findings)
+    groups: dict[str | None, list[rules.Finding]] = {}
+    for finding in findings:
+        groups.setdefault(finding.group, []).append(finding)
     if len(findings) == 1:
         title, body = findings[0].headline, "\n".join(findings[0].details)
-    else:
+    elif len(groups) == 1:
         title = f"{len(findings)} findings from {findings[0].group}"
         body = "\n".join(f"[{f.severity.name}] {f.headline}" for f in findings)
+    else:
+        title = f"{len(findings)} findings in {len(groups)} groups"
+        ranked = sorted(groups.items(), key=lambda g: -max(f.severity for f in g[1]))
+        body = "\n".join(f"[{max(f.severity for f in members).name}] {group}: "
+                         f"{rules.plural(len(members), 'finding')}, first: {members[0].headline}"
+                         for group, members in ranked)
     head = f"{_BADGE[severity]} custody-watch\n**{_plain(title)[:MAX_TITLE]}**\n"
     if headline_only:
         content = head + f"(the full page was rejected by the webhook {FALLBACK_AFTER} times; " \
@@ -229,6 +238,14 @@ MAX_RETRY_AFTER = 600.0
 MAX_HOLD = 60.0
 # Statuses that refuse the message itself; any other failure is the webhook's.
 PAYLOAD_REFUSED = frozenset({400, 413})
+# Every post the watcher makes, page or digest, spends a token; tokens return one per
+# PAGE_INTERVAL up to PAGE_BURST. Ten a minute, at most three at once, keeps the watcher
+# a third of Discord's 30 messages a minute per channel and under its 5 per 2 s per
+# webhook, so a watchdog sharing the webhook still gets through a flood.
+PAGE_BURST = 3
+PAGE_INTERVAL = 6.0
+# Past this many groups waiting, every group goes out in one summary message.
+MAX_GROUP_MESSAGES = 3
 
 
 def _doubling(n: int) -> float:
@@ -237,7 +254,8 @@ def _doubling(n: int) -> float:
 
 def _messages(pending: list[StoredFinding]) -> list[list[StoredFinding]]:
     """Pending pages as messages, in order: a finding alone, or its whole group at the
-    place of the group's first finding."""
+    place of the group's first finding. When more than MAX_GROUP_MESSAGES groups wait,
+    they go as one summary at the place of the first of them."""
     messages: list[list[StoredFinding]] = []
     groups: dict[str, list[StoredFinding]] = {}
     for finding in pending:
@@ -248,19 +266,32 @@ def _messages(pending: list[StoredFinding]) -> list[list[StoredFinding]]:
         else:
             groups[finding.group] = [finding]
             messages.append(groups[finding.group])
-    return messages
+    if len(groups) <= MAX_GROUP_MESSAGES:
+        return messages
+    first = next(i for i, m in enumerate(messages) if m[0].group is not None)
+    alone = [m for m in messages if m[0].group is None]
+    return alone[:first] + [[f for members in groups.values() for f in members]] + alone[first:]
+
+
+def _message_name(message: list[StoredFinding]) -> str:
+    groups = {f.group for f in message}
+    if len(groups) > 1:
+        return "summary"
+    return message[0].group or message[0].key
 
 
 class Pager:
     """Posts every message through the one webhook without hammering it.
 
-    A failure of the webhook (unreachable, a server error, a rate limit, or a refusal
-    of every post, as a revoked or deleted webhook answers) holds all posting: for a
-    rate limit's Retry-After, otherwise for a delay that doubles with each consecutive
-    failure up to MAX_HOLD. A refusal of one message's content holds only that message,
-    on its own doubling delay. A webhook that refuses everything is then asked about
-    once a minute rather than once per page per cycle, since Discord's edge bans an
-    address that sends it thousands of refused requests, and the pages wait intact.
+    Posts are paced by a token bucket (PAGE_BURST, PAGE_INTERVAL), most severe first, so
+    no flood of findings can hold the webhook at Discord's rate limit. A failure of the
+    webhook (unreachable, a server error, a rate limit, or a refusal of every post, as a
+    revoked or deleted webhook answers) holds all posting: for a rate limit's
+    Retry-After, otherwise for a delay that doubles with each consecutive failure up to
+    MAX_HOLD. A refusal of one message's content holds only that message, on its own
+    doubling delay. A webhook that refuses everything is then asked about once a minute
+    rather than once per page per cycle, since Discord's edge bans an address that sends
+    it thousands of refused requests, and the pages wait intact.
     """
 
     def __init__(self, post: Callable[[dict], None]):
@@ -269,13 +300,23 @@ class Pager:
         self._failures = 0
         # message name -> (consecutive refusals, not before)
         self._refused: dict[str, tuple[int, float]] = {}
+        self._tokens = float(PAGE_BURST)
+        self._counted_at: float | None = None
+
+    def _available(self, now: float) -> float:
+        if self._counted_at is not None:
+            self._tokens = min(float(PAGE_BURST), self._tokens + max(0.0, now - self._counted_at) / PAGE_INTERVAL)
+        self._counted_at = now
+        return self._tokens
 
     def ready(self, name: str, now: float) -> bool:
-        return now >= max(self._resume_at, self._refused.get(name, (0, 0.0))[1])
+        """Whether the message ``name`` is off hold and a token is left for it."""
+        return now >= max(self._resume_at, self._refused.get(name, (0, 0.0))[1]) and self._available(now) >= 1
 
     def post(self, name: str, payload: dict, now: float) -> None:
-        """Post ``payload`` as the message ``name``, or raise DiscordError after holding
-        what the failure calls for."""
+        """Post ``payload`` as the message ``name``, spending a token, or raise
+        DiscordError after holding what the failure calls for."""
+        self._tokens = self._available(now) - 1
         try:
             self._post(payload)
         except discord.DiscordError as e:
@@ -290,14 +331,17 @@ class Pager:
         self._failures = 0
         self._refused.pop(name, None)
 
-    def flush(self, store: Store, now: float) -> int:
-        """Page every unsent ALERT and CRITICAL that is not on hold; returns how many
-        findings went out. Undelivered pages stay pending, in order, and a message
-        refused FALLBACK_AFTER times goes out as its headline alone."""
+    def flush(self, store: Store, now: float, keep: int = 0) -> int:
+        """Page unsent ALERTs and CRITICALs, most severe first, while tokens beyond
+        ``keep`` remain; returns how many findings went out. Undelivered pages stay
+        pending, in order, and a message refused FALLBACK_AFTER times goes out as its
+        headline alone."""
         delivered = 0
         for message in _messages(store.unsent_pages()):
+            if self._available(now) < keep + 1:
+                break
             keys = [f.key for f in message]
-            name = message[0].group or keys[0]
+            name = _message_name(message)
             if not self.ready(name, now):
                 continue
             headline_only = max(f.failures for f in message) >= FALLBACK_AFTER
@@ -335,18 +379,28 @@ class Watch:
 
     def cycle(self) -> None:
         """Poll each source that is due, paging what it found and pinging the systemd
-        watchdog before the next, so one slow source never holds back another's pages."""
+        watchdog before the next, so one slow source never holds back another's pages.
+        A digest that is due goes out before any further page."""
         for source in self._sources:
             now = self._clock()
             if now < self._due[source.name]:
                 continue
             self._poll(source, now)
-            self._pager.flush(self._store, self._clock())
+            self._flush(self._clock())
             self._notify("WATCHDOG=1")
         now = self._clock()
         self._check_stale(now)
-        self._pager.flush(self._store, now)
         self._digest(now)
+        self._flush(now)
+
+    def _flush(self, now: float) -> None:
+        """Page what waits, keeping a token back for a digest that is due."""
+        self._pager.flush(self._store, now, keep=1 if self._digest_due(now) else 0)
+
+    def _digest_due(self, now: float) -> bool:
+        moment = datetime.fromtimestamp(now, timezone.utc)
+        return (moment.hour >= self._config.digest_hour_utc
+                and self._store.get("digest:last-day") != moment.date().isoformat())
 
     def _poll(self, source, now: float) -> None:
         try:
@@ -400,12 +454,9 @@ class Watch:
                 store.put(f"health:{name}:stale-since", str(int(last_ok)))
 
     def _digest(self, now: float) -> None:
-        moment = datetime.fromtimestamp(now, timezone.utc)
-        day = moment.date().isoformat()
-        if moment.hour < self._config.digest_hour_utc or self._store.get("digest:last-day") == day:
+        if not self._digest_due(now) or not self._pager.ready("digest", now):
             return
-        if not self._pager.ready("digest", now):
-            return
+        day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
         routine = self._store.unsent_routine()
         try:
             self._pager.post("digest", self.digest_message(routine, now), now)
@@ -922,6 +973,14 @@ def _backtest(config: rules.WatchConfig, days: int, state: str, materios_rpc: st
     return 0
 
 
+def _webhook(config: rules.WatchConfig | None) -> str:
+    """The webhook the watcher pages: its own channel's, when the config names a file
+    holding one, otherwise DISCORD_WEBHOOK_URL."""
+    if config is not None and config.discord_webhook_file:
+        return Path(config.discord_webhook_file).read_text().strip()
+    return os.environ.get("DISCORD_WEBHOOK_URL", "")
+
+
 def _load_config(path: str) -> rules.WatchConfig:
     config_path = Path(path)
     return rules.parse_config(json.loads(config_path.read_text()), base_dir=config_path.parent)
@@ -937,9 +996,10 @@ def main(argv: list[str] | None = None) -> int:
     replay.add_argument("--days", type=int, default=30)
     replay.add_argument("--state", required=True, help="a fresh SQLite file, never the live state")
     replay.add_argument("--materios-rpc", help="read Materios from this node instead of the configured one")
-    commands.add_parser("test-page", help="send one test message through the webhook")
-    # Neither page reads the config, so a config that stops the watcher cannot also
-    # silence the page saying it stopped.
+    test = commands.add_parser("test-page", help="send one test message through the webhook")
+    test.add_argument("--config", help="through the webhook this config's watcher pages")
+    # The failure page reads no config, so a config that stops the watcher cannot also
+    # silence the page saying it stopped; it goes through DISCORD_WEBHOOK_URL.
     failed = commands.add_parser("page-failure", help="page that a systemd unit failed (OnFailure hook)")
     failed.add_argument("--unit", required=True)
     args = parser.parse_args(argv)
@@ -948,13 +1008,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "backtest":
         return _backtest(_load_config(args.config), args.days, args.state, args.materios_rpc)
 
-    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
-    if not webhook:
-        print("custody_watch: DISCORD_WEBHOOK_URL is not set; refusing to watch without a way to page",
-              file=sys.stderr)
+    config = _load_config(args.config) if getattr(args, "config", None) else None
+    webhook = _webhook(config)
+    if not webhook.startswith("https://"):
+        print("custody_watch: neither the config's discord_webhook_file nor DISCORD_WEBHOOK_URL holds an https "
+              "webhook; refusing to watch without a way to page", file=sys.stderr)
         return 2
     if args.command == "run":
-        return _run(_load_config(args.config), webhook)
+        return _run(config, webhook)
     if args.command == "test-page":
         message = {"content": f"\u2139\ufe0f custody-watch test page from {socket.gethostname()}",
                    "allowed_mentions": {"parse": []}}

@@ -59,8 +59,18 @@ Pages go out most severe first, and within a severity a finding that pages alone
 before a group. Findings that anyone can cause cheaply are grouped: Materios findings
 by signer (unless an authority is involved), Cardano payments into, or contract
 spends from, one address, and anything unclassifiable that anyone could have sent, per
-source. Every pending finding of a group goes out as one message.
-Custody outflows, surrender-pool spends and watched-policy mints always page alone.
+source. Every pending finding of a group goes out as one message, and when more than
+three groups are waiting they all go out in one summary that names each group, its
+count and its first headline. Custody outflows, surrender-pool spends and
+watched-policy mints always page alone.
+
+Every post, page or digest, spends a token from a bucket that holds three and refills
+one every 6 seconds: ten messages a minute at most, a third of Discord's 30 a minute
+per channel and inside its 5 per 2 seconds per webhook. However many accounts flood a
+block, the watcher never holds the webhook at its rate limit, so a watchdog that shares
+it still gets through. Once the digest is due, one token is kept back for it, so a
+flood cannot starve the watcher's liveness signal. `discord_webhook_file` gives the
+watcher its own channel (below); without it, it pages through `DISCORD_WEBHOOK_URL`.
 
 A failing webhook holds every post, the digest included: for its `Retry-After` when
 it rate-limits, otherwise for a delay that doubles with each consecutive failure, up
@@ -86,6 +96,7 @@ The configuration lives on the host that runs the watcher, never in this reposit
   "state_db": "/var/lib/custody-watch/state.db",
   "digest_hour_utc": 13,
   "source_stale_seconds": 900,
+  "discord_webhook_file": "discord-webhook",
   "materios": {"name": "materios-preprod", "rpc_url": "ws://<node>:9945", "poll_seconds": 6},
   "cardano": [
     {
@@ -112,8 +123,12 @@ count read only when that asset's supply moves, and every count once an hour.
 address's own `severity`, a payment in as an ALERT). `materios.authority_accounts` lists
 the SS58 accounts besides `Sudo.Key` whose moves are authority moves, such as the sudo
 multisig's signatories. A relative `project_id_file` is read from the config file's
-directory. The webhook comes from `DISCORD_WEBHOOK_URL` in the environment; `run`
-refuses to start without it.
+directory. `discord_webhook_file` names a file, read the same way, that holds the
+webhook of a channel of the watcher's own; without it the webhook comes from
+`DISCORD_WEBHOOK_URL` in the environment. `run` refuses to start without an https
+webhook from one or the other, and `test-page --config <config>` posts through the one
+`run` would use. The failure page of `custody-watch-failed.service` reads no config and
+always goes through `DISCORD_WEBHOOK_URL`.
 
 ## Running it
 
@@ -134,6 +149,7 @@ DynamicUser=yes
 EnvironmentFile=/etc/custody-watch/discord.env
 LoadCredential=config.json:/etc/custody-watch/config.json
 LoadCredential=blockfrost-mainnet.key:/etc/custody-watch/blockfrost-mainnet.key
+LoadCredential=discord-webhook:/etc/custody-watch/discord-webhook
 Environment=PYTHONDONTWRITEBYTECODE=1
 WorkingDirectory=/opt/custody-watch/src
 ExecStart=/opt/custody-watch/venv/bin/python -m daemon.custody_watch run --config %d/config.json

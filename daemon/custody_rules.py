@@ -138,6 +138,9 @@ class WatchConfig:
     source_stale_seconds: int
     materios: MateriosConfig | None
     cardano: tuple[CardanoNetwork, ...]
+    # A file holding the webhook of the watcher's own channel; without one it pages
+    # through DISCORD_WEBHOOK_URL.
+    discord_webhook_file: str | None = None
 
 
 ADDRESS_ROLES = ("custody", "contract")
@@ -147,6 +150,7 @@ def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
     """``base_dir`` anchors relative key paths, so a config handed over by systemd
     ``LoadCredential`` can name its sibling key files."""
     materios = doc.get("materios")
+    webhook_file = doc.get("discord_webhook_file")
     return WatchConfig(
         state_db=doc["state_db"],
         digest_hour_utc=int(doc.get("digest_hour_utc", 13)),
@@ -160,7 +164,12 @@ def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
             authority_accounts=tuple(materios.get("authority_accounts", ())),
         ) if materios else None,
         cardano=tuple(_parse_network(n, base_dir) for n in doc.get("cardano", [])),
+        discord_webhook_file=_relative(webhook_file, base_dir) if webhook_file else None,
     )
+
+
+def _relative(path: str, base_dir: Path | None) -> str:
+    return str(base_dir / path) if base_dir else path
 
 
 def _parse_network(doc: dict, base_dir: Path | None) -> CardanoNetwork:
@@ -174,7 +183,7 @@ def _parse_network(doc: dict, base_dir: Path | None) -> CardanoNetwork:
     return CardanoNetwork(
         name=doc["name"],
         blockfrost_url=doc["blockfrost_url"].rstrip("/"),
-        project_id_file=str(base_dir / doc["project_id_file"]) if base_dir else doc["project_id_file"],
+        project_id_file=_relative(doc["project_id_file"], base_dir),
         poll_seconds=int(doc.get("poll_seconds", 60)),
         reorg_depth_blocks=int(doc.get("reorg_depth_blocks", 30)),
         addresses=tuple(addresses),

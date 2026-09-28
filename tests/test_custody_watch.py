@@ -92,8 +92,8 @@ def test_a_rejected_page_stays_pending_and_is_retried_in_order(tmp_path):
     posts = Posts(fail={2})
     pager = cw.Pager(posts)
     assert pager.flush(store, now=2.0) == 1
-    assert pager.flush(store, now=3.0) == 2
-    assert pager.flush(store, now=4.0) == 0
+    assert pager.flush(store, now=2.0 + 2 * cw.PAGE_INTERVAL) == 2
+    assert pager.flush(store, now=2.0 + 4 * cw.PAGE_INTERVAL) == 0
     assert [p["content"].split("headline ")[1][0] for p in posts.payloads] == ["a", "b", "c"]
 
 
@@ -147,9 +147,9 @@ def test_a_page_the_webhook_refuses_does_not_hold_back_the_rest_and_goes_out_as_
     pager = cw.Pager(posts)
     assert pager.flush(store, now=3.0) == 1
     assert _headlines(posts) == ["**headline next**"]
-    pager.flush(store, now=4.0)
-    pager.flush(store, now=6.0)
-    assert pager.flush(store, now=10.0) == 1
+    pager.flush(store, now=3.0 + cw.PAGE_INTERVAL)
+    pager.flush(store, now=3.0 + 3 * cw.PAGE_INTERVAL)
+    assert pager.flush(store, now=3.0 + 5 * cw.PAGE_INTERVAL) == 1
     fallback = posts.payloads[-1]["content"]
     assert "headline refused" in fallback and "rejected" in fallback and "```" not in fallback
     assert store.unsent_pages() == []
@@ -187,7 +187,7 @@ def test_a_webhook_that_refuses_every_post_is_asked_on_a_doubling_delay_and_lose
     assert posts.attempts <= 16
 
     posts.fail = set()
-    for _ in range(61):
+    for _ in range(int(50 * cw.PAGE_INTERVAL) + 61):
         watch.cycle()
         clock[0] += 1.0
     pages = [p["content"] for p in posts.payloads if "daily digest" not in p["content"]]
@@ -288,6 +288,129 @@ class StubSource:
 
 def _watch(config, store, sources, posts, clock):
     return cw.Watch(config, store, sources, posts, clock=lambda: clock[0])
+
+
+class DiscordModel:
+    """One webhook shared by custody-watch and a co-tenant watchdog, under Discord's
+    documented limit of 5 posts per 2 s per webhook and its 30 messages a minute per
+    channel: a post past either is answered 429 with the wait."""
+
+    def __init__(self, clock):
+        self.clock = clock
+        self.sent = []
+        self.refused = []
+        self.recent = []
+
+    def __call__(self, payload, poster="custody-watch"):
+        t = self.clock[0]
+        self.recent = [s for s in self.recent if s > t - 60]
+        last_two = [s for s in self.recent if s > t - 2]
+        if len(last_two) >= 5 or len(self.recent) >= 30:
+            self.refused.append((t, poster))
+            wait = last_two[0] + 2 - t if len(last_two) >= 5 else self.recent[0] + 60 - t
+            raise discord.DiscordError("webhook answered HTTP 429", 429, max(wait, 0.1))
+        self.recent.append(t)
+        self.sent.append((t, poster, payload))
+
+
+class FloodSource(StubSource):
+    """A block every 6 s carrying one ALERT from each of ``signers`` ordinary signers,
+    grouped per signer as Materios findings are: what any funded accounts can send."""
+
+    def __init__(self, name, store, signers):
+        super().__init__(name)
+        self.poll_seconds = 6
+        self.store, self.signers, self.block = store, signers, 0
+
+    def poll(self, now):
+        self.block += 1
+        for signer in range(self.signers):
+            self.store.add(rules.Finding(
+                rules.ALERT, f"{self.name}:{self.block}:{signer}",
+                f"{self.name} #{self.block} extrinsic {signer}: Recovery.create_recovery",
+                group=f"{self.name} signer {signer}"), now)
+        return True
+
+
+def _flood(config, tmp_path, signers, start, minutes):
+    """Run the watcher through a flood, the co-tenant posting once every 2 minutes."""
+    store = cw.Store(str(tmp_path / "state.db"))
+    clock = [_at(start)]
+    hook = DiscordModel(clock)
+    watch = _watch(config, store, [FloodSource("materios-preprod", store, signers)], hook, clock)
+    cotenant = []
+    for second in range(minutes * 60):
+        watch.cycle()
+        if second % 120 == 60:
+            try:
+                hook({"content": "Finality Gap CRITICAL"}, poster="finality-watchdog")
+                cotenant.append("delivered")
+            except discord.DiscordError:
+                cotenant.append("refused")
+        clock[0] += 1
+    return hook, cotenant
+
+
+@pytest.mark.parametrize("signers", [5, 30])
+def test_a_flood_of_grouped_pages_stays_under_discords_limits_and_the_cotenant_is_delivered(config, tmp_path,
+                                                                                            signers):
+    hook, cotenant = _flood(config, tmp_path, signers, "2026-09-28T02:00:00", minutes=20)
+    ours = [t for t, poster, _ in hook.sent if poster == "custody-watch"]
+    assert cotenant == ["delivered"] * 10
+    assert hook.refused == []
+    assert max(sum(1 for s in ours if t <= s < t + 60) for t in ours) <= cw.PAGE_BURST + 60 / cw.PAGE_INTERVAL
+    pages = [p for _, poster, p in hook.sent if poster == "custody-watch"]
+    assert pages and all("findings in" in p["content"] for p in pages)
+
+
+def test_the_daily_digest_goes_out_through_a_flood(config, tmp_path):
+    hook, _ = _flood(config, tmp_path, 5, "2026-09-28T12:55:00", minutes=30)
+    digests = [p for _, _, p in hook.sent if "daily digest" in p["content"]]
+    assert len(digests) == 1
+
+
+def test_a_new_critical_page_goes_out_ahead_of_alerts_already_waiting(tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    for i in range(6):
+        store.add(_finding(f"alert-{i}", severity=rules.ALERT), now=1.0)
+    posts = Posts()
+    pager = cw.Pager(posts)
+    assert pager.flush(store, now=2.0) < 6
+    store.add(_finding("custody"), now=3.0)
+    waiting = len(posts.payloads)
+    assert pager.flush(store, now=12.0) >= 1
+    assert _headlines(posts)[waiting] == "**headline custody**"
+
+
+def test_many_pending_groups_go_out_as_one_summary(tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    for group in range(5):
+        for i in range(3):
+            severity = rules.CRITICAL if (group, i) == (3, 1) else rules.ALERT
+            store.add(rules.Finding(severity, f"g{group}-{i}", f"headline {group}.{i}",
+                                    group=f"materios-preprod signer {group}"), now=1.0)
+    posts = Posts()
+    assert cw.Pager(posts).flush(store, now=2.0) == 15
+    [summary] = posts.payloads
+    assert summary["content"].startswith("\U0001f6a8 **CRITICAL** @here")
+    assert "**15 findings in 5 groups**" in summary["content"]
+    assert summary["content"].index("signer 3") < summary["content"].index("signer 0")
+    assert store.unsent_pages() == []
+
+
+def test_a_dedicated_webhook_is_read_from_the_file_the_config_names(tmp_path, monkeypatch):
+    monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
+    (tmp_path / "custody-webhook").write_text("https://discord.test/api/webhooks/2/dedicated\n")
+    doc = json.loads((FIX / "config.json").read_text())
+    doc["discord_webhook_file"] = "custody-webhook"
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(doc))
+    ran, posted = [], []
+    monkeypatch.setattr(cw, "_run", lambda config, webhook: ran.append(webhook) or 0)
+    monkeypatch.setattr(cw.discord, "post_json", lambda url, payload: posted.append(url))
+    assert cw.main(["run", "--config", str(path)]) == 0
+    assert cw.main(["test-page", "--config", str(path)]) == 0
+    assert ran == posted == ["https://discord.test/api/webhooks/2/dedicated"]
 
 
 def test_the_digest_posts_once_a_day_after_its_hour_and_proves_the_watcher_alive(config, tmp_path):
