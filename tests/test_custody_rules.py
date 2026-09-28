@@ -1084,6 +1084,24 @@ def test_legacy_units_that_leave_a_surrender_for_a_third_wallet_are_critical(net
     assert "legacy units left this surrender for a wallet that did not give them up" in finding.render()
 
 
+def test_a_payout_sent_into_the_quarantine_lockbox_is_critical(networks):
+    # Nothing can spend from the quarantine address, so cMATRA paid into it is lost to
+    # every holder still to surrender, though the total paid matches the entitlement.
+    def lockbox(utxos):
+        _, claimant = _outputs(utxos)
+        paid = next(a for a in claimant["amount"] if a["unit"] == CMATRA_UNIT)
+        half = int(paid["quantity"]) // 2
+        paid["quantity"] = str(int(paid["quantity"]) - half)
+        quarantine = next(o for o in utxos["outputs"] if o["address"].startswith("addr1wy5g"))
+        quarantine["amount"].append({"unit": CMATRA_UNIT, "quantity": str(half)})
+
+    tx = _tampered_surrender(lockbox)
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL and finding.kind != "surrender"
+    assert "cMATRA paid into the quarantine address, where nothing can spend it: 528.389248 cMATRA" in finding.render()
+    assert "unrecognized asset" not in finding.render()
+
+
 def test_a_depositors_own_cmatra_returned_as_change_is_not_a_payout(networks):
     def holds_cmatra(utxos):
         utxos["inputs"][0]["amount"].append({"unit": CMATRA_UNIT, "quantity": "7000000"})

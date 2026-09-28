@@ -1237,6 +1237,10 @@ def _classify_pool(network: CardanoNetwork, spent: list[dict], produced: list[di
     if pool.quarantine_address:
         deposited = _delta(_value([u for u in produced if u["address"] == pool.quarantine_address]),
                            _value([u for u in spent if u["address"] == pool.quarantine_address]))
+    locked = deposited.pop(pool.cmatra_unit, 0)
+    if locked > 0:
+        lines.append((CRITICAL, f"cMATRA paid into the quarantine address, where nothing can spend it: "
+                                f"{names.quantity(pool.cmatra_unit, locked)}"))
     entitlement, counts, unknown, unpinned = _entitlement(deposited, pool.redemptions)
     if unknown:
         lines.append((ALERT, f"unrecognized asset surrendered: {names.value(unknown)}"))
