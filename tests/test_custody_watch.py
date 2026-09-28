@@ -1177,7 +1177,12 @@ def test_the_first_read_of_the_recovery_of_sudo_key_goes_to_the_digest(config, t
     assert rules.render_account(FRIENDS[0]) in finding.text
 
 
-def test_any_change_in_the_recovery_of_sudo_key_or_an_authority_pages_critical_alone(config, tmp_path):
+STARTED = "materios-preprod recovery started"
+
+
+def test_any_change_in_the_recovery_of_sudo_key_or_an_authority_pages_critical(config, tmp_path):
+    # Only a recovery started with no friend's vouch yet, which any funded account can
+    # start, pages in a group; every other change pages alone.
     authority = rules.account_bytes(ALICE)
     config = dataclasses.replace(config, materios=dataclasses.replace(config.materios, authority_accounts=(ALICE,)))
     chain = FakeChain(head=1000, blocks={}, state_at=set(range(1000, 1010)))
@@ -1186,24 +1191,47 @@ def test_any_change_in_the_recovery_of_sudo_key_or_an_authority_pages_critical_a
     source = _materios(config, store, chain)
     source.poll(1.0)
     changes = [
-        ("Recovery.ActiveRecoveries", lambda: _recovering(chain, SUDO, RESCUER, [])),
-        ("Recovery.ActiveRecoveries", lambda: _recovering(chain, SUDO, RESCUER, FRIENDS[:1])),
-        ("Recovery.Proxy", lambda: chain.storage.__setitem__(_proxy_key(RESCUER), "0x" + SUDO.hex())),
-        ("Recovery.Recoverable", lambda: _recoverable_by(chain, authority, FRIENDS)),
-        ("Recovery.Recoverable", lambda: chain.storage.pop(_recoverable_key(SUDO))),
+        ("Recovery.ActiveRecoveries", STARTED, lambda: _recovering(chain, SUDO, RESCUER, [])),
+        ("Recovery.ActiveRecoveries", None, lambda: _recovering(chain, SUDO, RESCUER, FRIENDS[:1])),
+        ("Recovery.Proxy", None, lambda: chain.storage.__setitem__(_proxy_key(RESCUER), "0x" + SUDO.hex())),
+        ("Recovery.Recoverable", None, lambda: _recoverable_by(chain, authority, FRIENDS)),
+        ("Recovery.Recoverable", None, lambda: chain.storage.pop(_recoverable_key(SUDO))),
     ]
-    for step, (item, change) in enumerate(changes, start=1):
+    for step, (item, group, change) in enumerate(changes, start=1):
         change()
         chain.head = 1000 + step
         source.poll(1.0 + step)
         [finding] = [f for f in store.findings() if f.key.endswith(f":recovery:{1000 + step}")]
-        assert finding.severity == rules.CRITICAL and finding.group is None
+        assert finding.severity == rules.CRITICAL and finding.group == group, (step, finding.group)
         assert item in finding.text, (step, finding.text)
     assert "rescuer " + rules.render_account(RESCUER) in store.findings()[1].text
     assert f"vouched by {rules.render_account(FRIENDS[0])}" in store.findings()[2].text
     assert f"- Recovery.Recoverable({SUDO_KEY}, Sudo.Key)" in store.findings()[-1].text
     source.poll(9.0)
     assert len(store.findings()) == 1 + len(changes)
+
+
+def test_recoveries_strangers_start_page_as_one_message_behind_the_pages_that_go_alone(config, tmp_path):
+    # Starting a recovery of Sudo.Key costs any funded account a deposit, once a poll.
+    chain = FakeChain(head=1000, blocks={}, state_at=set(range(1000, 1010)))
+    _recoverable_by(chain, SUDO, FRIENDS)
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.poll(1.0)
+    for step, stranger in enumerate(ATTEMPTERS[:4], start=1):
+        _recovering(chain, SUDO, stranger, [])
+        chain.head = 1000 + step
+        source.poll(1.0 + step)
+    _recovering(chain, SUDO, ATTEMPTERS[0], FRIENDS[:1])
+    chain.head = 1005
+    source.poll(6.0)
+    started = [f for f in store.findings() if f.group == STARTED]
+    assert len(started) == 4 and all(f.severity == rules.CRITICAL for f in started)
+    posts = Posts()
+    cw.Pager(posts).flush(store, 10.0)
+    vouched, grouped = posts.payloads
+    assert f"vouched by {rules.render_account(FRIENDS[0])}" in vouched["content"]
+    assert f"**4 findings from {STARTED}**" in grouped["content"]
 
 
 ATT = bytes([0xC7]) * 32

@@ -72,7 +72,11 @@ account and one of the whole `Proxy` map, then their values in storage queries o
 one Root's `set_recovered` made, one kept after its recovery was closed, or one older
 than the watcher. The first read goes to the digest; any change after it, an entry
 added, changed or removed, pages CRITICAL alone with the friends, threshold, delay,
-rescuer and vouches decoded, a removed entry as it last stood. Entries are decoded only
+rescuer and vouches decoded, a removed entry as it last stood. The one exception is a
+poll whose only changes are recoveries started with no friend's vouch yet: any funded
+account can start one each poll, and it can do nothing until friends vouch, so those
+page CRITICAL in the group `<source> recovery started`, all pending ones in one message
+behind the pages that go alone. Entries are decoded only
 when they change, so each recovery of `Sudo.Key` a stranger starts costs a poll one
 more key to read and nothing to decode. What the friends and rescuers it names sign
 decodes ahead of other accounts' extrinsics (below), but none of them counts as an

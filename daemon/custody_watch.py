@@ -793,13 +793,23 @@ class MateriosSource:
                         f"{self.name}: recovery of Sudo.Key and the authorities as first read at #{head}",
                         details=tuple(read(entries[k])[0] for k in sorted(entries)), kind="recovery"), now)
                 return
-            lines = [f"+ {read(entries[k])[0]}" for k in sorted(entries) if k not in previous]
-            lines += [f"~ {read(entries[k])[0]}" for k in sorted(entries) if k in previous and previous[k] != entries[k]]
-            lines += [f"- {read(previous[k])[0]}" for k in sorted(set(previous) - set(entries))]
+            added = [k for k in sorted(entries) if k not in previous]
+            changed = [k for k in sorted(entries) if k in previous and previous[k] != entries[k]]
+            removed = sorted(set(previous) - set(entries))
+            current = {k: read(entries[k]) for k in added + changed}
+            lines = ([f"+ {current[k][0]}" for k in added] + [f"~ {current[k][0]}" for k in changed]
+                     + [f"- {read(previous[k])[0]}" for k in removed])
+            # Any funded account can start a recovery of Sudo.Key, once a poll; until a
+            # friend vouches it can do nothing, so such starts page grouped, behind what
+            # pages alone.
+            started = not changed and not removed and all(
+                entries[k][0] == "ActiveRecoveries" and current[k][1] is not None and not current[k][1]["friends"]
+                for k in added)
             self._store.add(rules.Finding(
                 rules.CRITICAL, f"{self.name}:recovery:{head}",
-                f"{self.name}: recovery of Sudo.Key or an authority changed (seen at finalized #{head})",
-                details=tuple(lines)), now)
+                f"{self.name}: a recovery of Sudo.Key or an authority started (seen at finalized #{head})" if started
+                else f"{self.name}: recovery of Sudo.Key or an authority changed (seen at finalized #{head})",
+                details=tuple(lines), group=f"{self.name} recovery started" if started else None), now)
 
     def _keys(self, prefix: str, at_hash: str) -> list[str]:
         keys: list[str] = []
