@@ -41,7 +41,9 @@ from daemon.substrate_client import SubstrateClient
 
 logger = logging.getLogger("custody_watch")
 
-DISCORD_LIMIT = 2000
+# Discord's limit is 2000 characters, and it does not say whether an emoji outside the
+# Basic Multilingual Plane counts as one or two; every message stays well inside it.
+MESSAGE_LIMIT = 1900
 # Leaves room for the badge, the fallback note and a useful part of the body.
 MAX_TITLE = 400
 HOUR = 3600
@@ -218,12 +220,19 @@ def page_message(findings: list[rules.Finding], headline_only: bool = False) -> 
         content = head + f"(the full page was rejected by the webhook {FALLBACK_AFTER} times; " \
                          "its details are in the watcher's state database)"
     else:
-        content = head + _fenced(body, DISCORD_LIMIT - len(head) - 8)
+        content = head + _fenced(body, MESSAGE_LIMIT - len(head) - 8)
     return {"content": content, "allowed_mentions": {"parse": ["everyone"] if severity == rules.CRITICAL else []}}
 
 
 FALLBACK_AFTER = 3
 MAX_RETRY_AFTER = 600.0
+MAX_HOLD = 60.0
+# Statuses that refuse the message itself; any other failure is the webhook's.
+PAYLOAD_REFUSED = frozenset({400, 413})
+
+
+def _doubling(n: int) -> float:
+    return min(2.0 ** (n - 1), MAX_HOLD)
 
 
 def _messages(pending: list[StoredFinding]) -> list[list[StoredFinding]]:
@@ -243,33 +252,61 @@ def _messages(pending: list[StoredFinding]) -> list[list[StoredFinding]]:
 
 
 class Pager:
+    """Posts every message through the one webhook without hammering it.
+
+    A failure of the webhook (unreachable, a server error, a rate limit, or a refusal
+    of every post, as a revoked or deleted webhook answers) holds all posting: for a
+    rate limit's Retry-After, otherwise for a delay that doubles with each consecutive
+    failure up to MAX_HOLD. A refusal of one message's content holds only that message,
+    on its own doubling delay. A webhook that refuses everything is then asked about
+    once a minute rather than once per page per cycle, since Discord's edge bans an
+    address that sends it thousands of refused requests, and the pages wait intact.
+    """
+
     def __init__(self, post: Callable[[dict], None]):
         self._post = post
         self._resume_at = 0.0
+        self._failures = 0
+        # message name -> (consecutive refusals, not before)
+        self._refused: dict[str, tuple[int, float]] = {}
+
+    def ready(self, name: str, now: float) -> bool:
+        return now >= max(self._resume_at, self._refused.get(name, (0, 0.0))[1])
+
+    def post(self, name: str, payload: dict, now: float) -> None:
+        """Post ``payload`` as the message ``name``, or raise DiscordError after holding
+        what the failure calls for."""
+        try:
+            self._post(payload)
+        except discord.DiscordError as e:
+            if e.status in PAYLOAD_REFUSED:
+                refusals = self._refused.get(name, (0, 0.0))[0] + 1
+                self._refused[name] = (refusals, now + _doubling(refusals))
+            else:
+                self._failures += 1
+                wait = e.retry_after if e.status == 429 and e.retry_after else _doubling(self._failures)
+                self._resume_at = now + min(wait, MAX_RETRY_AFTER)
+            raise
+        self._failures = 0
+        self._refused.pop(name, None)
 
     def flush(self, store: Store, now: float) -> int:
-        """Page every unsent ALERT and CRITICAL; returns how many findings went out.
-
-        A rate limit holds all paging until Discord's Retry-After has passed, and an
-        unreachable webhook or a server error ends the flush; either way the rest are
-        retried, in order, on a later flush. A message the webhook refuses outright is
-        skipped so it cannot hold back the rest, and after FALLBACK_AFTER refusals goes
-        out as its headline alone."""
-        if now < self._resume_at:
-            return 0
+        """Page every unsent ALERT and CRITICAL that is not on hold; returns how many
+        findings went out. Undelivered pages stay pending, in order, and a message
+        refused FALLBACK_AFTER times goes out as its headline alone."""
         delivered = 0
         for message in _messages(store.unsent_pages()):
             keys = [f.key for f in message]
+            name = message[0].group or keys[0]
+            if not self.ready(name, now):
+                continue
+            headline_only = max(f.failures for f in message) >= FALLBACK_AFTER
             try:
-                self._post(page_message(message, headline_only=max(f.failures for f in message) >= FALLBACK_AFTER))
+                self.post(name, page_message(message, headline_only), now)
             except discord.DiscordError as e:
-                if e.status == 429:
-                    self._resume_at = now + min(e.retry_after or 1.0, MAX_RETRY_AFTER)
-                if e.status is None or e.status == 429 or e.status >= 500:
-                    logger.warning("pages not delivered, retrying later: %s", e)
-                    return delivered
-                logger.warning("page for %s refused: %s", keys[0], e)
-                store.reject(keys)
+                if e.status in PAYLOAD_REFUSED:
+                    store.reject(keys)
+                logger.warning("page for %s not delivered: %s", keys[0], e)
                 continue
             store.mark_sent(keys, now)
             delivered += len(keys)
@@ -293,7 +330,6 @@ class Watch:
         self._config = config
         self._store = store
         self._sources = sources
-        self._post = post
         self._pager = Pager(post)
         self._clock = clock
         self._notify = notify
@@ -365,11 +401,13 @@ class Watch:
         day = moment.date().isoformat()
         if moment.hour < self._config.digest_hour_utc or self._store.get("digest:last-day") == day:
             return
+        if not self._pager.ready("digest", now):
+            return
         routine = self._store.unsent_routine()
         try:
-            self._post(self.digest_message(routine, now))
+            self._pager.post("digest", self.digest_message(routine, now), now)
         except discord.DiscordError as e:
-            logger.warning("daily digest not delivered, retrying next cycle: %s", e)
+            logger.warning("daily digest not delivered, retrying: %s", e)
             return
         with self._store.transaction():
             self._store.mark_sent([f.key for f in routine], now)
@@ -416,8 +454,8 @@ class Watch:
             lines.append(f"  {_plural(len(other), 'other routine finding')}:")
             lines.extend(f"    {f.headline}" for f in other[:10])
         content = "\n".join(lines)
-        if len(content) > DISCORD_LIMIT:
-            content = content[:DISCORD_LIMIT - 12] + "\n(truncated)"
+        if len(content) > MESSAGE_LIMIT:
+            content = content[:MESSAGE_LIMIT - 12] + "\n(truncated)"
         return {"content": content, "allowed_mentions": {"parse": []}}
 
 

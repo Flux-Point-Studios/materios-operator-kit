@@ -44,10 +44,16 @@ by signer (unless an authority is involved), Cardano payments into, or contract
 spends from, one address, and anything unclassifiable, per source. Every pending finding of a group goes out as one message.
 Custody outflows, surrender-pool spends and watched-policy mints always page alone.
 
-A rate-limited webhook is left alone for its `Retry-After`; an unreachable webhook or a
-server error leaves every page pending, in order, for the next cycle. A page the webhook
-refuses outright is skipped so it cannot hold back the rest, and after three refusals
-goes out as its headline alone. The digest counts the pages still waiting. Pages go
+A failing webhook holds every post, the digest included: for its `Retry-After` when
+it rate-limits, otherwise for a delay that doubles with each consecutive failure, up
+to a minute. That covers an unreachable webhook, a server error, and a revoked or
+deleted one that answers 401, 403 or 404 to every post. Such a webhook is asked about
+once a minute rather than once per page per cycle, since Discord's edge bans an address
+that sends it thousands of refused requests, and the pages wait intact until it takes
+them again. A page whose own content is refused (400 or 413) is retried on its own
+doubling delay without holding back the rest, and after three refusals goes out as its
+headline alone. Every message stays under 1900 characters, inside Discord's 2000
+however it counts an emoji. The digest counts the pages still waiting. Pages go
 out, and the systemd watchdog is pinged, after each source is polled, and a Cardano poll
 classifies at most 200 transactions, so a flood at one address delays neither the other
 sources nor their pages.

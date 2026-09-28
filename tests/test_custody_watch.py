@@ -146,16 +146,57 @@ def test_a_page_the_webhook_refuses_does_not_hold_back_the_rest_and_goes_out_as_
     assert pager.flush(store, now=3.0) == 1
     assert _headlines(posts) == ["**headline next**"]
     pager.flush(store, now=4.0)
-    pager.flush(store, now=5.0)
-    assert pager.flush(store, now=6.0) == 1
+    pager.flush(store, now=6.0)
+    assert pager.flush(store, now=10.0) == 1
     fallback = posts.payloads[-1]["content"]
     assert "headline refused" in fallback and "rejected" in fallback and "```" not in fallback
     assert store.unsent_pages() == []
 
 
+def test_a_refused_page_is_retried_on_a_doubling_delay_not_every_flush(tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    store.add(_finding("refused"), now=1.0)
+    posts = Posts(fail=set(range(1, 100)), error=discord.DiscordError("webhook answered HTTP 400", status=400))
+    pager = cw.Pager(posts)
+    attempts = []
+    for second in range(64):
+        before = posts.attempts
+        pager.flush(store, now=100.0 + second)
+        if posts.attempts > before:
+            attempts.append(second)
+    assert attempts == [0, 1, 3, 7, 15, 31, 63]
+
+
+def test_a_webhook_that_refuses_every_post_is_asked_on_a_doubling_delay_and_loses_nothing(config, tmp_path):
+    """A revoked or deleted webhook answers 401, 403 or 404 to every post. Asking it once per
+    page per cycle would get the host's address banned by Discord's edge, silencing every
+    watchdog that shares it; the pages themselves are not at fault and go out in full once
+    the webhook is back."""
+    store = cw.Store(str(tmp_path / "state.db"))
+    for i in range(50):
+        store.add(_finding(f"k{i}"), now=1.0)
+    posts = Posts(fail=set(range(1, 10_000)), error=discord.DiscordError("webhook answered HTTP 401", status=401))
+    clock = [_at("2026-09-27T12:55:00")]
+    sources = [StubSource("materios-preprod"), StubSource("cardano-mainnet"), StubSource("cardano-preprod")]
+    watch = _watch(config, store, sources, posts, clock)
+    for _ in range(600):
+        watch.cycle()
+        clock[0] += 1.0
+    assert posts.attempts <= 16
+
+    posts.fail = set()
+    for _ in range(61):
+        watch.cycle()
+        clock[0] += 1.0
+    pages = [p["content"] for p in posts.payloads if "daily digest" not in p["content"]]
+    assert len(pages) == 50 and not [p for p in pages if "rejected" in p]
+    assert store.unsent_pages() == []
+    assert any("daily digest" in p["content"] for p in posts.payloads)
+
+
 def test_the_digest_counts_pages_still_waiting_for_delivery(config, tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
-    posts = Posts(fail={1}, error=discord.DiscordError("webhook answered HTTP 429", status=429, retry_after=600))
+    posts = Posts(fail={1}, error=discord.DiscordError("webhook answered HTTP 400", status=400))
     clock = [_at("2026-09-27T13:00:00")]
     store.add(_finding("waiting"), now=clock[0])
     _watch(config, store, [StubSource("cardano-mainnet")], posts, clock).cycle()
@@ -179,6 +220,24 @@ def test_a_critical_page_mentions_here_and_fits_one_discord_message():
     assert "@here" not in alert["content"]
     assert alert["allowed_mentions"] == {"parse": []}
     assert critical["allowed_mentions"] == {"parse": ["everyone"]}
+
+
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def test_a_page_and_the_digest_fit_discords_limit_however_it_counts_an_emoji(config, tmp_path):
+    """Discord does not say whether an emoji outside the Basic Multilingual Plane counts as
+    one character or two; cut to exactly 2000 code points, a page with one is refused if
+    it counts two."""
+    page = cw.page_message([_finding(details=tuple("x" * 300 for _ in range(40)))])["content"]
+    assert _utf16_units(page) <= 2000
+    store = cw.Store(str(tmp_path / "state.db"))
+    for i in range(10):
+        store.add(_finding(f"{i}" + "x" * 300, severity=rules.INFO), now=1.0)
+    watch = _watch(config, store, [StubSource("cardano-mainnet")], Posts(), [1.0])
+    digest = watch.digest_message(store.unsent_routine(), 1.0)["content"]
+    assert "(truncated)" in digest and _utf16_units(digest) <= 2000
 
 
 def test_a_deeply_nested_call_still_pages_within_discords_limit_naming_the_inner_call():
