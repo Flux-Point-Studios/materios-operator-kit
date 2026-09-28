@@ -187,13 +187,21 @@ message through the webhook to prove delivery end to end.
   most the 200 lines a page can show, and long arguments are rendered from a hash or
   their first characters, so rendering never copies a block-sized value.
 - **Its own death is visible.** The daily digest is also the liveness signal, and it
-  names every stale source instead of reporting the watcher alive. A source that
-  cannot be read for `source_stale_seconds` is paged CRITICAL, again every hour it
-  stays unreadable, and once more (ALERT) when it recovers. A node answering with a
+  names every stale source instead of reporting the watcher alive. A source that has
+  not been read up to its head for `source_stale_seconds` is paged CRITICAL, again
+  every hour it stays that way, and once more (ALERT) when it recovers. That covers a
+  source whose reads fail and one read without error that stays behind, as when its
+  blocks take longer to read than the chain takes to make them. A node answering with a
   finalized head that has not moved for `source_stale_seconds`, or a Cardano tip older
   than that, counts as unreadable, since a node that has stopped following its chain
   still answers every read. systemd restarts a loop
   that stops pinging its watchdog, and `OnFailure` pages when restarts are exhausted.
+- **A runtime replaced by a raw storage write.** `System.set_storage` of the runtime
+  code under `Sudo` pages CRITICAL like any root-gated call, but deposits no runtime
+  upgrade digest, so the blocks after it are decoded with the metadata of the runtime
+  it replaced until an upgrade digest, or a restart that finds a new spec version. A
+  runtime installed that way can move
+  anything without an extrinsic, so that page is the alarm for what follows it.
 
 ## Replaying history
 

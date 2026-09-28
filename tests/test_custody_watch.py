@@ -271,18 +271,19 @@ def test_text_from_the_chain_cannot_close_the_code_block(fence):
 
 
 class StubSource:
-    def __init__(self, name, fail=False):
+    def __init__(self, name, fail=False, behind=False):
         self.name = name
         self.poll_seconds = 60
         self.position = "height 100"
         self.fail = fail
+        self.behind = behind
         self.polls = 0
 
     def poll(self, now):
         self.polls += 1
         if self.fail:
             raise cw.SourceError(f"{self.name} unreachable")
-        return True
+        return not self.behind
 
 
 def _watch(config, store, sources, posts, clock):
@@ -378,6 +379,28 @@ def test_a_source_that_stays_stale_is_paged_critical_every_hour(config, tmp_path
     assert len(posts.payloads) == 2
     assert all(p["content"].startswith("\U0001f6a8 **CRITICAL** @here") for p in posts.payloads)
     assert "materios-preprod stale for 12" in posts.payloads[1]["content"]
+
+
+def test_a_source_read_without_error_that_never_reaches_its_head_is_paged_stale_then_recovered(config, tmp_path):
+    # Blocks that take longer to read than the chain takes to make them keep every poll
+    # successful and leave the cursor further behind each time.
+    store = cw.Store(str(tmp_path / "state.db"))
+    posts = Posts()
+    clock = [_at("2026-09-27T01:00:00")]
+    source = StubSource("materios-preprod", behind=True)
+    watch = _watch(config, store, [source], posts, clock)
+    for _ in range(config.source_stale_seconds // 60 + 2):
+        watch.cycle()
+        clock[0] += 60
+    [page] = posts.payloads
+    assert page["content"].startswith("\U0001f6a8 **CRITICAL** @here")
+    assert "materios-preprod stale for 1" in page["content"]
+    assert "behind its head at height 100" in page["content"]
+    assert "last caught up 2026-09-27 01:00:00Z" in page["content"]
+
+    source.behind = False
+    watch.cycle()
+    assert "materios-preprod recovered" in posts.payloads[1]["content"]
 
 
 def test_the_digest_names_a_stale_source_instead_of_calling_the_watcher_alive(config, tmp_path):

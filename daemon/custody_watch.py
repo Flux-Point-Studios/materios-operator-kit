@@ -5,8 +5,8 @@ its findings are committed in the same SQLite transaction as the source cursor, 
 a restart resumes after the last committed item and never classifies one twice.
 ALERT and CRITICAL findings are paged at once and marked sent only after Discord
 accepts them; INFO findings wait for the daily digest, whose arrival is also the
-proof that the watcher is alive. A source that cannot be read for longer than
-``source_stale_seconds`` is itself paged.
+proof that the watcher is alive. A source that cannot be read up to its head for
+longer than ``source_stale_seconds`` is itself paged.
 
     python -m daemon.custody_watch run --config /etc/custody-watch/config.json
 """
@@ -357,7 +357,14 @@ class Watch:
             self._due[source.name] = now + source.poll_seconds
             return
         self._due[source.name] = now if not caught_up else now + source.poll_seconds
-        self._healthy(source, now)
+        if caught_up:
+            self._healthy(source, now)
+            return
+        # Read without error but still behind: blocks that take longer to read than the
+        # chain takes to make them leave the cursor further back on every poll.
+        with self._store.transaction():
+            self._store.put(f"health:{source.name}:position", source.position)
+            self._store.put(f"health:{source.name}:error", f"behind its head at {source.position}")
 
     def _healthy(self, source, now: float) -> None:
         store, name = self._store, source.name
@@ -374,8 +381,8 @@ class Watch:
                 store.delete(f"health:{name}:stale-since")
 
     def _check_stale(self, now: float) -> None:
-        """Page a source that has not been read for ``source_stale_seconds``, and page it
-        again every hour it stays that way."""
+        """Page a source that has not been read up to its head for ``source_stale_seconds``,
+        and page it again every hour it stays that way."""
         store = self._store
         for source in self._sources:
             name = source.name
@@ -389,7 +396,7 @@ class Watch:
                     rules.CRITICAL, f"custody-watch:{name}:stale:{int(last_ok)}:{int(overdue // HOUR)}",
                     f"custody-watch: {name} stale for {int(now - last_ok) // 60} min; "
                     f"moves on it are not being watched",
-                    details=(f"last successful poll {_utc(last_ok)}", f"last error: {error}"), kind="watcher"), now)
+                    details=(f"last caught up {_utc(last_ok)}", f"last error: {error}"), kind="watcher"), now)
                 store.put(f"health:{name}:stale-since", str(int(last_ok)))
 
     def _digest(self, now: float) -> None:
