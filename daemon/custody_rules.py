@@ -484,8 +484,17 @@ class _Tree:
     sudo_key: bytes | None
     authority: frozenset[bytes]
     lines: list[str] = field(default_factory=list)
+    hidden: int = 0
     sites: list[_Site] = field(default_factory=list)
     involved: bool = False
+
+    def line(self, text: str) -> None:
+        """Add a line of the call tree, or count it once MAX_TREE_LINES are held, so a
+        batch of a block's worth of calls keeps only what a page can show."""
+        if len(self.lines) < MAX_TREE_LINES:
+            self.lines.append(text)
+        else:
+            self.hidden += 1
 
 
 def _multisig_origin(function: str, args: dict, origin) -> bytes | None:
@@ -530,7 +539,7 @@ def _inner_origin(module: str, function: str, args: dict, origin, tree: _Tree, d
         account = _multisig_origin(function, args, origin)
         if account is not None:
             label = "is Sudo.Key " if account == tree.sudo_key else ""
-            tree.lines.append(f"{_indent(depth + 1)}multisig account {label}{render_account(account)}")
+            tree.line(f"{_indent(depth + 1)}multisig account {label}{render_account(account)}")
         return account
     return None
 
@@ -573,7 +582,7 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     args = _args(call)
     path = (*parents, f"{module}.{function}")
     rendered = ", ".join(f"{k}={_render_value(v)}" for k, v in args.items() if not _holds_calls(v))
-    tree.lines.append(f"{_indent(depth)}{module}.{function}({rendered})")
+    tree.line(f"{_indent(depth)}{module}.{function}({rendered})")
     if isinstance(origin, bytes):
         inert = inert or (module == "Sudo" and origin != tree.sudo_key) or (module, function) in _ROOT_GATED
     inner = _inner_origin(module, function, args, origin, tree, depth)
@@ -686,9 +695,7 @@ def _classify_extrinsic(chain: str, number: int, index: int, ext: dict, events: 
     sites = [s.line(id(s) in live) for s in ranked[:MAX_SITE_LINES]]
     if len(ranked) > MAX_SITE_LINES:
         sites.append(f"... {len(ranked) - MAX_SITE_LINES:,} more privileged calls")
-    lines = tree.lines[:MAX_TREE_LINES]
-    if len(tree.lines) > MAX_TREE_LINES:
-        lines.append(f"... {len(tree.lines) - MAX_TREE_LINES:,} more calls in the tree")
+    lines = tree.lines + ([f"... {tree.hidden:,} more lines of the call tree"] if tree.hidden else [])
     return Finding(
         severity=severity,
         key=f"{chain}:{number}:{index}",

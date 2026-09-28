@@ -573,7 +573,17 @@ def test_a_batch_of_thousands_of_calls_keeps_a_bounded_finding():
     [finding] = _classify_extrinsics([_signed(ALICE, "Utility", "batch", calls=calls)])
     assert len(finding.details) < 250
     assert "4,980 more privileged calls" in finding.render()
-    assert "more calls in the tree" in finding.render()
+    assert "more lines of the call tree" in finding.render()
+
+
+def test_the_call_tree_stops_growing_at_its_line_limit_while_it_is_walked():
+    calls = [_call("System", "remark", remark="0x00") for _ in range(5000)]
+    batch = _call("Utility", "batch", calls=calls)
+    tree = rules._Tree(None, frozenset())
+    rules._walk(batch, None, tree, 0, (), False, True)
+    assert len(tree.lines) == rules.MAX_TREE_LINES
+    [finding] = _classify_extrinsics([_signed(ALICE, "Sudo", "sudo", call=batch)])
+    assert finding.details[-1] == "... 4,802 more lines of the call tree"
 
 
 def test_a_batch_as_large_as_a_block_allows_is_classified_in_linear_time():
