@@ -11,6 +11,7 @@ synthetic block position, and the outflow synthetic amounts.
 import copy
 import gzip
 import json
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ from daemon import custody_rules as rules
 FIX = Path(__file__).parent / "fixtures" / "custody"
 SUDO_KEY = "5H2M5Dbt8hSfSCXS6hfEBPR1N21yh679finzcfMEwD62i7iP"
 SPEC_238_CODE_HASH = "0xae5e94cef78cb63c58079c46b32b11e6f8c371ea9a701feeb5a4600c0e76edb4"
+# The runtime's RuntimeBlockLength: 5 MiB, of which 75% is open to normal extrinsics.
+NORMAL_BLOCK_LENGTH = 5 * 1024 * 1024 * 3 // 4
 
 
 def _read(name: str) -> bytes:
@@ -270,6 +273,24 @@ TEXT_THAT_LOOKS_LIKE_HEX = "0x" + "a" * 199 + "z"
 def _classify_extrinsics(extrinsics, events=None, sudo_key=SUDO_KEY):
     return rules.classify_materios_block("materios-preprod", 9, extrinsics, events=events,
                                          sudo_key=rules.account_bytes(sudo_key) if sudo_key else None)
+
+
+def _peak_memory(work):
+    """``work()`` and the most memory it held at once."""
+    tracemalloc.start()
+    try:
+        result = work()
+        return result, tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_a_block_sized_byte_argument_is_shown_as_its_hash_in_memory_near_its_own_size():
+    blob = "0x" + "ab" * NORMAL_BLOCK_LENGTH
+    shown, peak = _peak_memory(lambda: rules._render_value(blob))
+    assert shown.startswith(f"<{NORMAL_BLOCK_LENGTH} bytes blake2_256 0x")
+    assert peak < 2 * NORMAL_BLOCK_LENGTH
+    assert rules._render_value(blob[:-1] + "z").startswith('"0xabab')
 
 
 def test_a_remark_of_text_that_looks_like_hex_is_classified(decoder):

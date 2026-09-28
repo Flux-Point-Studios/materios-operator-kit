@@ -411,16 +411,28 @@ def _is_call(value) -> bool:
     return isinstance(value, dict) and "call_module" in value
 
 
-_LONG_HEX = re.compile(r"0x(?:[0-9a-fA-F]{2}){65,}")
+def hex_digest(hex_text: str) -> str:
+    """The length and blake2_256 of the bytes that 0x-prefixed ``hex_text`` spells, read a
+    chunk at a time so a block-sized value costs no copy of itself."""
+    digest = hashlib.blake2b(digest_size=32)
+    for start in range(2, len(hex_text), 1 << 16):
+        digest.update(bytes.fromhex(hex_text[start:start + (1 << 16)]))
+    return f"{(len(hex_text) - 2) // 2} bytes blake2_256 0x{digest.hexdigest()}"
+
+
+# One character class repeated: a repeated group would keep a backtracking mark per
+# repetition, over 100 bytes of memory for each byte of a block-sized argument.
+_HEX_DIGITS = re.compile(r"[0-9a-fA-F]*")
+_LONG_HEX_BYTES = 65
 
 
 def _render_value(value) -> str:
     """A decoded argument as one line. Byte strings too long to read are shown as their
     hash; everything else goes through JSON, so text from the chain keeps its quotes
     and its newlines stay escaped."""
-    if isinstance(value, str) and _LONG_HEX.fullmatch(value):
-        raw = bytes.fromhex(value[2:])
-        return f"<{len(raw)} bytes blake2_256 0x{hashlib.blake2b(raw, digest_size=32).hexdigest()}>"
+    if (isinstance(value, str) and value.startswith("0x") and len(value) % 2 == 0
+            and len(value) >= 2 + 2 * _LONG_HEX_BYTES and _HEX_DIGITS.fullmatch(value, 2)):
+        return f"<{hex_digest(value)}>"
     text = json.dumps(value, default=str)
     return text if len(text) <= 400 else text[:400] + "\u2026"
 
@@ -608,13 +620,11 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     for index, ext in enumerate(extrinsics):
         key = f"{chain}:{number}:{index}"
         if "undecodable" in ext:
-            raw = bytes.fromhex(ext["undecodable"][2:])
             findings.append(Finding(
                 severity=CRITICAL,
                 key=key,
                 headline=f"{chain} #{number} extrinsic {index} could not be decoded against the runtime metadata",
-                details=(f"{len(raw)} bytes blake2_256 0x{hashlib.blake2b(raw, digest_size=32).hexdigest()}",
-                         ext["error"]),
+                details=(hex_digest(ext["undecodable"]), ext["error"]),
                 group=unreadable,
             ))
             continue
