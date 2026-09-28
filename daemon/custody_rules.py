@@ -10,9 +10,9 @@ treasury spends, finality overrides and committee-gate levers are CRITICAL.
 Cardano: a transaction is classified by what it spends and produces at watched
 addresses and what it mints under watched policies. A surrender-pool spend is
 INFO only when it has every mark of a surrender (the surrender redeemer, the
-pool's continuing output keeping its inline datum, cMATRA leaving the pool only
-to the wallets that funded the transaction, and a payout equal to the rate-table
-entitlement for the legacy assets deposited at the quarantine address). An
+pool's continuing output keeping its inline datum, a payout equal to the rate-table
+entitlement for the legacy assets deposited at the quarantine address, and each
+wallet that gave up those assets paid exactly the entitlement of its own). An
 underpayment or an asset outside the rate table is an ALERT; any other departure
 is CRITICAL.
 """
@@ -959,6 +959,46 @@ def _redeemer_name(pool: SurrenderPool, json_value) -> str:
     return f"unrecognized redeemer {json.dumps(json_value, default=str)[:80]}"
 
 
+def _misdirected(pool: SurrenderPool, spent: list[dict], produced: list[dict], names: _Names) -> list[str]:
+    """What keeps a pool spend from paying each wallet exactly the entitlement of the
+    legacy units that wallet gave up: cMATRA to a wallet that gave up none, more cMATRA
+    than a wallet's own units are entitled to, and legacy units reaching a wallet rather
+    than the quarantine address. A wallet is a payment credential, since that alone
+    decides who can spend what it is paid; every movement is net of the wallet's change."""
+    moved: dict[tuple, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    shown: dict[tuple, str] = {}
+    for rows, sign in ((spent, -1), (produced, 1)):
+        for u in rows:
+            if u["address"] in (pool.address, pool.quarantine_address):
+                continue
+            wallet = _payment_credential(u["address"]) or (None, u["address"])
+            shown.setdefault(wallet, u["address"])
+            for a in u["amount"]:
+                moved[wallet][a["unit"]] += sign * int(a["quantity"])
+    strangers, beyond, diverted = {}, [], {}
+    for wallet, units in moved.items():
+        received = units.get(pool.cmatra_unit, 0)
+        given = {u: -q for u, q in units.items() if q < 0 and _redemption_of(u, pool.redemptions)}
+        taken = {u: q for u, q in units.items() if q > 0 and _redemption_of(u, pool.redemptions)}
+        entitled = _entitlement(given, pool.redemptions)[0] if wallet[0] is False else 0
+        if taken:
+            diverted[shown[wallet]] = taken
+        if received > 0 and entitled == 0:
+            strangers[shown[wallet]] = received
+        elif received > entitled:
+            beyond.append(f"cMATRA paid to {shown[wallet][:24]}…: {names.quantity(pool.cmatra_unit, received)} "
+                          f"against the {names.quantity(pool.cmatra_unit, entitled)} its own deposit is entitled to")
+    lines = []
+    if strangers:
+        recipients = ", ".join(f"{a[:24]}… {names.quantity(pool.cmatra_unit, q)}" for a, q in strangers.items())
+        lines.append(f"cMATRA paid to a non-claimant: {recipients}")
+    lines.extend(beyond)
+    if diverted:
+        lines.append("legacy units left this surrender for a wallet that did not give them up: " +
+                     ", ".join(f"{a[:24]}… {names.value(units)}" for a, units in diverted.items()))
+    return lines
+
+
 def _classify_pool(network: CardanoNetwork, spent: list[dict], produced: list[dict], redeemers: list[dict],
                    minted: dict[str, int], names: _Names) -> tuple[Severity, list[str], int]:
     pool = network.pool
@@ -987,26 +1027,11 @@ def _classify_pool(network: CardanoNetwork, spent: list[dict], produced: list[di
         if not out.get("inline_datum"):
             lines.append((CRITICAL, f"{pool.label} output left without an inline datum (unspendable)"))
 
-    claimants = set()
-    for u in spent:
-        credential = _payment_credential(u["address"]) if u["address"] != pool.address else None
-        if credential and not credential[0]:
-            claimants.add(credential[1])
-    custody = {c[1] for c in (_payment_credential(w.address) for w in network.addresses if w.role == "custody") if c}
-    if claimants & custody:
+    funders = {_payment_credential(u["address"]) for u in spent if u["address"] != pool.address}
+    custody = {_payment_credential(w.address) for w in network.addresses if w.role == "custody"}
+    if funders & custody - {None}:
         lines.append((CRITICAL, "a custody wallet funded this pool spend as the claimant"))
-
-    to_others: dict[str, int] = defaultdict(int)
-    for out in produced:
-        if out["address"] == pool.address:
-            continue
-        quantity = _value([out]).get(pool.cmatra_unit, 0)
-        credential = _payment_credential(out["address"])
-        if quantity and not (credential and not credential[0] and credential[1] in claimants):
-            to_others[out["address"]] += quantity
-    if to_others:
-        recipients = ", ".join(f"{a[:24]}\u2026 {names.quantity(pool.cmatra_unit, q)}" for a, q in to_others.items())
-        lines.append((CRITICAL, f"cMATRA paid to a non-claimant: {recipients}"))
+    lines.extend((CRITICAL, line) for line in _misdirected(pool, spent, produced, names))
 
     deposited: dict[str, int] = {}
     if pool.quarantine_address:

@@ -11,7 +11,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 | Cardano custody addresses | any outflow, collateral a failed script consumed included | any inflow | reads as a reference input |
 | Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
 | Cardano policies | mint or burn, as configured | as configured | |
-| Surrender pool | a spend that is not exactly a surrender: another redeemer, cMATRA to a non-claimant, an overpayment, non-cMATRA value moved, a continuing output without its datum, a custody wallet as claimant, any mint or burn in the spend, a surrendered unit outside its redemption's pinned asset names | an underpayment, an asset outside the rate table, a payout above `max_payout`, value arriving outside a pool spend, the quarantine address holding more of a redemption than its rate-table supply | a surrender paid exactly its rate-table entitlement |
+| Surrender pool | a spend that is not exactly a surrender: another redeemer, cMATRA to a wallet that gave up no legacy units or beyond the entitlement of the units it gave up, legacy units reaching a wallet instead of the quarantine address, an overpayment, non-cMATRA value moved, a continuing output without its datum, a custody wallet as claimant, any mint or burn in the spend, a surrendered unit outside its redemption's pinned asset names | an underpayment, an asset outside the rate table, a payout above `max_payout`, value arriving outside a pool spend, the quarantine address holding more of a redemption than its rate-table supply | a surrender paid exactly its rate-table entitlement |
 
 Each Materios page carries the decoded call tree, the signer, the derived multisig
 account and, while the node still holds the block's state, the dispatch result. Its
@@ -27,6 +27,13 @@ pinned runtime is in the severity table or the routine list, and a test holds it
 a call a runtime upgrade adds pages as an ALERT until it is classified. Text from the
 chain is rendered as JSON with every backtick replaced, so it can never close the
 page's code block or format itself outside it.
+
+A surrender's payout is checked per wallet. Each payment credential is credited with the
+legacy units it gave up net of its change, and must be paid, net of its own cMATRA
+coming back as change, exactly the rate-table entitlement of those units. A wallet that
+adds an input to someone else's surrender, whether it carries only ADA or a legacy unit
+of its own, cannot take that surrender's payout without a CRITICAL page. The payment
+credential decides who can spend a payout, so a stake credential never joins two wallets.
 
 A Cardano transaction whose script fails phase 2 consumes its collateral in place of its
 inputs and produces its collateral return in place of its outputs, so a custody key can

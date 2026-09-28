@@ -998,6 +998,87 @@ def test_a_surrender_that_pays_someone_else_is_critical(networks):
     assert "non-claimant" in finding.render()
 
 
+def _joined_by(utxos, address: str, units: dict[str, int], at: int = 0):
+    """``address`` adds one input carrying 2 ADA and ``units``, and takes the 2 ADA back."""
+    amount = [{"unit": "lovelace", "quantity": "2000000"}, *({"unit": u, "quantity": str(q)} for u, q in units.items())]
+    utxos["inputs"].append({"address": address, "tx_hash": "ab" * 32, "output_index": at, "amount": amount,
+                            "collateral": False, "reference": False})
+    utxos["outputs"].append({"address": address, "output_index": 90 + at, "collateral": False,
+                             "amount": [{"unit": "lovelace", "quantity": "2000000"}]})
+
+
+AGENT_UNIT = "97bbb7db0baef89caefce61b8107ac74c7a7340166b39d906f174bec54616c6f73"
+
+
+def _redirected_to_a_second_wallet(carrying: dict[str, int]):
+    """The real AGENT surrender with its payout sent to a second wallet, which adds one
+    input carrying ``carrying``; what that input carries goes to the quarantine address."""
+    stranger = _outputs(_tx("surrender_t2_pass")["utxos"])[1]["address"]
+
+    def mutate(utxos):
+        _, claimant = _outputs(utxos)
+        claimant["address"] = stranger
+        _joined_by(utxos, stranger, carrying)
+        quarantine = next(o for o in utxos["outputs"] if o["address"].startswith("addr1wy5g"))
+        for unit, quantity in carrying.items():
+            row = next((a for a in quarantine["amount"] if a["unit"] == unit), None)
+            if row is None:
+                quarantine["amount"].append({"unit": unit, "quantity": str(quantity)})
+            else:
+                row["quantity"] = str(int(row["quantity"]) + quantity)
+
+    return _tampered_surrender(mutate), stranger
+
+
+def test_a_payout_sent_to_a_wallet_that_only_added_ada_is_critical(networks):
+    tx, stranger = _redirected_to_a_second_wallet({})
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL and finding.kind != "surrender"
+    assert f"cMATRA paid to a non-claimant: {stranger[:24]}… 1,056.778496 cMATRA" in finding.render()
+
+
+def test_a_payout_to_a_wallet_beyond_what_its_own_deposit_is_entitled_to_is_critical(networks):
+    # The second wallet surrenders one AGENT of its own and takes the whole payout: the
+    # total still matches the entitlement, but the first wallet's share went to it.
+    tx, stranger = _redirected_to_a_second_wallet({AGENT_UNIT: 1})
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    text = finding.render()
+    assert finding.severity == rules.CRITICAL and finding.kind != "surrender"
+    assert "overpaid" not in text
+    assert (f"cMATRA paid to {stranger[:24]}…: 1,056.778496 cMATRA against the 0.462890 cMATRA "
+            f"its own deposit is entitled to") in text
+
+
+def test_legacy_units_that_leave_a_surrender_for_a_third_wallet_are_critical(networks):
+    # Units given up by the depositor that reach neither the quarantine address nor the
+    # depositor's own change are not a surrender's.
+    third = _outputs(_tx("surrender_t2_pass")["utxos"])[1]["address"]
+
+    def diverted(utxos):
+        depositor = utxos["inputs"][0]
+        next(a for a in depositor["amount"] if a["unit"] == AGENT_UNIT)["quantity"] = "673"
+        utxos["outputs"].append({"address": third, "output_index": 9, "collateral": False,
+                                 "amount": [{"unit": "lovelace", "quantity": "1200000"},
+                                            {"unit": AGENT_UNIT, "quantity": "5"}]})
+
+    tx = _tampered_surrender(diverted)
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.CRITICAL and finding.kind != "surrender"
+    assert "legacy units left this surrender for a wallet that did not give them up" in finding.render()
+
+
+def test_a_depositors_own_cmatra_returned_as_change_is_not_a_payout(networks):
+    def holds_cmatra(utxos):
+        utxos["inputs"][0]["amount"].append({"unit": CMATRA_UNIT, "quantity": "7000000"})
+        _, claimant = _outputs(utxos)
+        paid = next(a for a in claimant["amount"] if a["unit"] == CMATRA_UNIT)
+        paid["quantity"] = str(int(paid["quantity"]) + 7_000_000)
+
+    tx = _tampered_surrender(holds_cmatra)
+    finding = rules.classify_cardano_tx(networks["cardano-mainnet"], tx["tx"], tx["utxos"], tx["redeemers"])
+    assert finding.severity == rules.INFO and finding.kind == "surrender" and finding.amount == 1056778496
+
+
 def test_a_surrender_that_leaves_the_pool_without_its_datum_is_critical(networks):
     def strip_datum(utxos):
         pool, _ = _outputs(utxos)
