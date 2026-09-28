@@ -1085,7 +1085,8 @@ def test_an_attempt_by_the_proxy_of_the_account_it_acts_as_still_pages(config, t
     source = _materios(config, store, chain)
     source.start_at(OVERFLOW_AT - 1)
     source.poll(1.0)
-    [finding] = store.findings()
+    first_read, finding = store.findings()
+    assert f"Recovery.Proxy({rules.render_account(signer)}): acts as {SUDO_KEY}, Sudo.Key" in first_read.text
     assert finding.severity == rules.CRITICAL and "Recovery.as_recovered" in finding.text
 
 
@@ -1266,6 +1267,73 @@ def test_what_a_friend_of_sudo_key_signs_is_decoded_ahead_of_filler_from_a_stran
     _drain(source)
     [vouch] = [f for f in store.findings() if "Recovery.vouch_recovery" in f.text]
     assert vouch.severity == rules.CRITICAL and f"signer {rules.render_account(FRIENDS[0])}" in vouch.text
+
+
+def test_a_proxy_acting_as_sudo_key_stays_watched_after_its_recovery_is_closed(config, tmp_path):
+    chain = FakeChain(head=1000, blocks={}, state_at=set(range(1000, 1010)))
+    _recoverable_by(chain, SUDO, FRIENDS)
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.poll(1.0)
+    _recovering(chain, SUDO, RESCUER, FRIENDS[:3])
+    chain.storage[_proxy_key(RESCUER)] = "0x" + SUDO.hex()
+    chain.head = 1001
+    source.poll(2.0)
+    # as_recovered(Sudo.Key, close_recovery(RESCUER)) ends the recovery; the proxy stays.
+    chain.storage.pop(_active_key(SUDO, RESCUER))
+    chain.head = 1002
+    source.poll(3.0)
+    [closed] = [f for f in store.findings() if f.key.endswith(":recovery:1002")]
+    rescuer = rules.render_account(RESCUER)
+    assert len(closed.details) == 1
+    assert closed.details[0].startswith(f"- Recovery.ActiveRecoveries(lost {SUDO_KEY}, Sudo.Key, rescuer {rescuer})")
+    chain.storage.pop(_proxy_key(RESCUER))
+    chain.head = 1003
+    source.poll(4.0)
+    [cancelled] = [f for f in store.findings() if f.key.endswith(":recovery:1003")]
+    assert cancelled.details == (f"- Recovery.Proxy({rescuer}): acts as {SUDO_KEY}, Sudo.Key",)
+
+
+def test_every_proxy_that_acts_as_sudo_key_is_watched_whatever_made_it(config, tmp_path):
+    # Root's set_recovered, or a recovery older than the watcher, leaves a proxy with no
+    # recovery under way.
+    other = bytes([0xD1]) * 32
+    chain = FakeChain(head=1000, blocks={}, state_at={1000, 1001})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    chain.storage[_proxy_key(RESCUER)] = "0x" + SUDO.hex()
+    chain.storage[_proxy_key(ATT)] = "0x" + other.hex()
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.poll(1.0)
+    [first] = store.findings()
+    assert f"Recovery.Proxy({rules.render_account(RESCUER)}): acts as {SUDO_KEY}, Sudo.Key" in first.text
+    assert rules.render_account(ATT) not in first.text
+    chain.storage[_proxy_key(RESCUER)] = "0x" + other.hex()
+    chain.head = 1001
+    source.poll(2.0)
+    [moved] = [f for f in store.findings() if f.severity == rules.CRITICAL]
+    assert moved.details == (f"- Recovery.Proxy({rules.render_account(RESCUER)}): acts as {SUDO_KEY}, Sudo.Key",)
+
+
+def test_recovery_state_is_read_in_bounded_requests_and_decoded_only_when_it_changes(config, tmp_path, monkeypatch):
+    chain = FakeChain(head=1000, blocks={}, state_at={1000, 1001})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    _recovering(chain, SUDO, RESCUER, [])
+    started = chain.storage[_active_key(SUDO, RESCUER)]
+    for n in range(2500):
+        chain.storage[_active_key(SUDO, n.to_bytes(4, "big") * 8)] = started
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.poll(1.0)
+    decoded = []
+    real = rules.RuntimeDecoder.storage
+    monkeypatch.setattr(rules.RuntimeDecoder, "storage", lambda self, *a: decoded.append(a) or real(self, *a))
+    chain.calls.clear()
+    chain.head = 1001
+    source.poll(2.0)
+    reads = [len(params[0]) for method, params in chain.calls if method == "state_queryStorageAt"]
+    assert sum(reads) >= 2502 and max(reads) <= cw.KEYS_PAGE
+    assert decoded == []
 
 
 def test_a_recovery_entry_the_runtime_cannot_decode_still_pages_as_its_hash(config, tmp_path):

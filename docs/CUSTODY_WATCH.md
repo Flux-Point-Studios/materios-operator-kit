@@ -56,8 +56,8 @@ Any funded account can push a block's events past the decode budget, so a block'
 events are not what decides whether an ordinary account's attempt could have taken
 effect. When an extrinsic's events cannot be read, the watcher reads `Sudo.Key`, and
 `Recovery.Proxy` of every account that calls `as_recovered`, at the block's parent and
-at the block, in one storage query each. A value that is the same at both held
-throughout the block, so a `Sudo` call from any other account, and an `as_recovered`
+at the block, in storage queries of at most 1,000 keys. A value that is the same at
+both held throughout the block, so a `Sudo` call from any other account, and an `as_recovered`
 whose caller is not the proxy of the account it names, could not take effect and goes
 to the digest with everything it wraps. A root-gated call from an account needs no
 proof. What the state cannot rule out pages, grouped per source rather than per
@@ -66,17 +66,21 @@ signer; an authority's attempts always page alone.
 `Sudo.Key` has a recovery config on the chain, so its friends can take it over together
 with a rescuer after a delay. Each poll reads, at the finalized head, `Recovery.Recoverable`
 of `Sudo.Key` and of every configured authority, their `Recovery.ActiveRecoveries`, and
-the `Recovery.Proxy` of each of those accounts and of each rescuer: one key listing per
-account and one storage query. The first read goes to the digest; any change after it,
-an entry added, changed or removed, pages CRITICAL alone with the friends, threshold,
-delay, rescuer and vouches decoded. What the friends and rescuers it names sign decodes
-ahead of other accounts' extrinsics (below), but none of them counts as an authority:
-any funded account becomes a rescuer of `Sudo.Key` by starting a recovery of it for a
-deposit. Their attempts are judged by their outcome like any other account's, and a
-vouch, claim or `as_recovered` naming `Sudo.Key` or an authority pages CRITICAL once it
-can have taken effect. An authority acting as the rescuer of some
-other account is paged from its own extrinsics, and from its `Recovery.Proxy` once it
-claims.
+every `Recovery.Proxy` that acts as one of those accounts or for one: a key listing per
+account and one of the whole `Proxy` map, then their values in storage queries of at most
+1,000 keys each. Reading the whole map finds a proxy that no recovery under way names:
+one Root's `set_recovered` made, one kept after its recovery was closed, or one older
+than the watcher. The first read goes to the digest; any change after it, an entry
+added, changed or removed, pages CRITICAL alone with the friends, threshold, delay,
+rescuer and vouches decoded, a removed entry as it last stood. Entries are decoded only
+when they change, so each recovery of `Sudo.Key` a stranger starts costs a poll one
+more key to read and nothing to decode. What the friends and rescuers it names sign
+decodes ahead of other accounts' extrinsics (below), but none of them counts as an
+authority: any funded account becomes a rescuer of `Sudo.Key` by starting a recovery of
+it for a deposit. Their attempts are judged by their outcome like any other account's,
+and a vouch, claim or `as_recovered` naming `Sudo.Key` or an authority pages CRITICAL
+once it can have taken effect. An authority acting as the rescuer of some other account
+is paged from its own extrinsics, and from its `Recovery.Proxy` once it claims.
 
 ## Surrender-pool coverage
 

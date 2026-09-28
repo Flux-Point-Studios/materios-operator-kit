@@ -551,9 +551,12 @@ BLOCK_SECONDS = 6
 KEYS_PAGE = 1000
 
 
+PROXY_PREFIX = "0x" + (RECOVERY + xxh128(b"Proxy")).hex()
+
+
 def recovery_proxy_key(rescuer: bytes) -> str:
     """Recovery.Proxy(rescuer): the account the rescuer may act as."""
-    return "0x" + (RECOVERY + xxh128(b"Proxy") + blake2_128_concat(rescuer)).hex()
+    return PROXY_PREFIX + blake2_128_concat(rescuer).hex()
 
 
 def _recoverable_key(account: bytes) -> str:
@@ -566,9 +569,9 @@ def _active_prefix(lost: bytes) -> str:
     return "0x" + (RECOVERY + xxh128(b"ActiveRecoveries") + two_x64_concat(lost)).hex()
 
 
-def _rescuer(active_key: str) -> bytes:
-    """The rescuer an ActiveRecoveries key ends with, after its eight-byte twox64 hash."""
-    return bytes.fromhex(active_key[-64:])
+def _trailing_account(key: str) -> bytes:
+    """The account an ActiveRecoveries or Proxy key ends with, after its twox64 or blake2_128 hash."""
+    return bytes.fromhex(key[-64:])
 
 
 def _account(storage_hex: str) -> str:
@@ -600,6 +603,8 @@ class MateriosSource:
         self._decoders: dict[tuple[str, str], rules.RuntimeDecoder] = {}
         self._decoder: rules.RuntimeDecoder | None = None
         self._genesis: str | None = None
+        # The recovery entries last read, with the friends and the rescuers they name.
+        self._recovering: tuple[dict[str, list], tuple[frozenset[bytes], frozenset[bytes]]] | None = None
 
     @property
     def position(self) -> str:
@@ -680,6 +685,7 @@ class MateriosSource:
             self.start_at(head)
         self._decoder = None
         self._decoders.clear()
+        self._recovering = None
         return True
 
     def _sudo_key(self, head_hash: str, head: int, now: float) -> bytes | None:
@@ -716,60 +722,80 @@ class MateriosSource:
     def _recovery(self, head_hash: str, head: int, sudo_key: bytes | None, code: str,
                   now: float) -> tuple[frozenset[bytes], frozenset[bytes]]:
         """Read at the finalized head who can recover Sudo.Key or a configured authority,
-        who is recovering one, and which rescuers may already act as one, and page any
-        change. Returns those friends, then those rescuers, whose extrinsics decode ahead
-        of other accounts' but count as nobody's authority: any funded account can start
-        a recovery of Sudo.Key."""
-        watched = sorted(rules.accountable(sudo_key, self._authorities))
-        items: dict[str, tuple[str, tuple[bytes, ...]]] = {}
-        for account in watched:
-            items[_recoverable_key(account)] = ("Recoverable", (account,))
-            for key in self._keys(_active_prefix(account), head_hash):
-                items[key] = ("ActiveRecoveries", (account, _rescuer(key)))
-        rescuers = {accounts[1] for item, accounts in items.values() if item == "ActiveRecoveries"}
-        for account in sorted({*watched, *rescuers}):
-            items[recovery_proxy_key(account)] = ("Proxy", (account,))
-        values = {k: v for k, v in self._storage_at(list(items), head_hash).items() if v}
+        who is recovering one, and who may already act as one or as whom one may act, and
+        page any change. Returns those friends, then those rescuers, whose extrinsics
+        decode ahead of other accounts' but count as nobody's authority: any funded
+        account can start a recovery of Sudo.Key. Entries are decoded only when they change."""
+        entries = self._recovery_entries(rules.accountable(sudo_key, self._authorities), head_hash)
+        if self._recovering is not None and self._recovering[0] == entries:
+            return self._recovering[1]
 
         def who(account: bytes) -> str:
             role = ", Sudo.Key" if account == sudo_key else ", authority" if account in self._authorities else ""
             return rules.render_account(account) + role
 
-        decoder = self._decoder_for(code, [head_hash]) if values else None
-        described, friends = {}, set()
-        for key, value in values.items():
-            item, accounts = items[key]
+        def read(entry: list) -> tuple[str, object]:
+            """An entry's line, and its value decoded, or None when it does not decode."""
+            item, accounts, value = entry[0], tuple(bytes.fromhex(a) for a in entry[1]), entry[2]
+            decoder = self._decoder_for(code, [head_hash])
             try:
                 decoded = decoder.storage("Recovery", item, value)
-                described[key] = rules.describe_recovery(item, accounts, decoded, who)
-                if item == "Recoverable":
-                    friends.update(rules.recovery_friends(decoded))
             except Exception as e:  # a runtime may change the layout; the entry still pages, as its hash
-                described[key] = (f"Recovery.{item}({', '.join(who(a) for a in accounts)}): "
-                                  f"{rules.hex_digest(value)}, not decodable: {type(e).__name__}: {e}"[:400])
-        self._recovery_change(values, described, items, who, head, now)
-        return frozenset(friends), frozenset(rescuers)
+                return (f"Recovery.{item}({', '.join(who(a) for a in accounts)}): "
+                        f"{rules.hex_digest(value)}, not decodable: {type(e).__name__}: {e}"[:400]), None
+            return rules.describe_recovery(item, accounts, decoded, who), decoded
 
-    def _recovery_change(self, values: dict, described: dict, items: dict, who, head: int, now: float) -> None:
+        self._recovery_change(entries, read, head, now)
+        friends: set[bytes] = set()
+        for entry in entries.values():
+            decoded = read(entry)[1] if entry[0] == "Recoverable" else None
+            if decoded is not None:
+                friends.update(rules.recovery_friends(decoded))
+        rescuers = frozenset(bytes.fromhex(entry[1][-1]) for entry in entries.values() if entry[0] != "Recoverable")
+        self._recovering = (entries, (frozenset(friends), rescuers))
+        return self._recovering[1]
+
+    def _recovery_entries(self, watched: frozenset[bytes], at_hash: str) -> dict[str, list]:
+        """Every Recovery entry naming a watched account, by storage key, as [item, the
+        accounts its key names in hex, its value]: Recoverable(account),
+        ActiveRecoveries(account, rescuer), and each Proxy that acts as or for one. The
+        whole Proxy map is read, since Root's set_recovered, and a recovery closed or
+        older than the watcher, leave a proxy that no recovery under way names."""
+        keyed: dict[str, tuple[str, tuple[bytes, ...]]] = {}
+        for account in sorted(watched):
+            keyed[_recoverable_key(account)] = ("Recoverable", (account,))
+            for key in self._keys(_active_prefix(account), at_hash):
+                keyed[key] = ("ActiveRecoveries", (account, _trailing_account(key)))
+        proxies = self._keys(PROXY_PREFIX, at_hash)
+        values = self._storage_at([*keyed, *proxies], at_hash)
+        for key in proxies:
+            value, rescuer = values.get(key), _trailing_account(key)
+            if value and (rescuer in watched or bytes.fromhex(value[2:]) in watched):
+                keyed[key] = ("Proxy", (rescuer,))
+        return {key: [item, [a.hex() for a in accounts], values[key]]
+                for key, (item, accounts) in keyed.items() if values.get(key)}
+
+    def _recovery_change(self, entries: dict[str, list], read: Callable[[list], tuple[str, object]], head: int,
+                         now: float) -> None:
+        """Keep ``entries`` as the recovery state; its first read goes to the digest, and
+        any entry added, changed or removed after it pages."""
         name = f"recovery:{self.name}"
         stored = self._store.get(name)
         previous = json.loads(stored) if stored is not None else None
+        if previous == entries:
+            return
         with self._store.transaction():
-            self._store.put(name, json.dumps(values, sort_keys=True))
+            self._store.put(name, json.dumps(entries, sort_keys=True))
             if previous is None:
-                if values:
+                if entries:
                     self._store.add(rules.Finding(
                         rules.INFO, f"{self.name}:recovery:{head}",
                         f"{self.name}: recovery of Sudo.Key and the authorities as first read at #{head}",
-                        details=tuple(described[k] for k in sorted(described)), kind="recovery"), now)
+                        details=tuple(read(entries[k])[0] for k in sorted(entries)), kind="recovery"), now)
                 return
-            if previous == values:
-                return
-            lines = [f"+ {described[k]}" for k in sorted(values) if k not in previous]
-            lines += [f"~ {described[k]}" for k in sorted(values) if k in previous and previous[k] != values[k]]
-            for key in sorted(set(previous) - set(values)):
-                item, accounts = items.get(key, ("an entry", ()))
-                lines.append(f"- Recovery.{item}({', '.join(who(a) for a in accounts) or key})")
+            lines = [f"+ {read(entries[k])[0]}" for k in sorted(entries) if k not in previous]
+            lines += [f"~ {read(entries[k])[0]}" for k in sorted(entries) if k in previous and previous[k] != entries[k]]
+            lines += [f"- {read(previous[k])[0]}" for k in sorted(set(previous) - set(entries))]
             self._store.add(rules.Finding(
                 rules.CRITICAL, f"{self.name}:recovery:{head}",
                 f"{self.name}: recovery of Sudo.Key or an authority changed (seen at finalized #{head})",
@@ -827,9 +853,14 @@ class MateriosSource:
             return None
 
     def _storage_at(self, keys: list[str], at_hash: str) -> dict[str, str | None]:
-        """Each of ``keys`` at ``at_hash``, None for one that holds nothing, in one read."""
-        [changes] = self._rpc("state_queryStorageAt", [keys, at_hash])
-        return {key: value for key, value in changes["changes"]}
+        """Each of ``keys`` at ``at_hash``, None for one that holds nothing, KEYS_PAGE keys
+        a read, so no answer outgrows the node's response limit however many recoveries
+        of Sudo.Key strangers start."""
+        values: dict[str, str | None] = {}
+        for start in range(0, len(keys), KEYS_PAGE):
+            [changes] = self._rpc("state_queryStorageAt", [keys[start:start + KEYS_PAGE], at_hash])
+            values.update(changes["changes"])
+        return values
 
     def _dispatch_facts(self, parent_hash: str, block_hash: str, rescuers: frozenset[bytes]) -> dict | None:
         """Sudo.Key and each rescuer's Recovery.Proxy, for those that held one value at
