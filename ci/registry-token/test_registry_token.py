@@ -46,6 +46,14 @@ def secret(value, images, events):
     return {"value": value, "images": list(images), "events": list(events)}
 
 
+def page_of(items, query):
+    """One page of a listing as Woodpecker cuts it: a perPage above 50, below 1 or absent reads as 50."""
+    page = int(query.get("page", ["1"])[0])
+    per = int(query.get("perPage", ["0"])[0])
+    per = per if 1 <= per <= 50 else 50
+    return items[(page - 1) * per:page * per]
+
+
 class Fake:
     """In-memory Woodpecker secrets API plus the two GitHub endpoints the token check reads."""
 
@@ -66,15 +74,14 @@ class Fake:
         self.uploads = {}
 
     def listing(self, secrets):
-        return [{"name": n, "images": s["images"], "events": sorted(s["events"])} for n, s in secrets.items()]
+        return [{"name": n, "images": s["images"], "events": sorted(s["events"])} for n, s in sorted(secrets.items())]
 
     def woodpecker(self, method, parts, query, body):
         if parts in (["repos"], ["users"], ["orgs"]):
             # Like Woodpecker, the organization listing leaves out the organizations of users.
             listed = {"repos": REPOS, "users": self.users,
                       "orgs": [{"id": o, "name": n} for o, n in self.orgs.items() if o not in self.user_orgs]}
-            page, per = int(query.get("page", ["1"])[0]), int(query.get("perPage", ["50"])[0])
-            return 200, listed[parts[0]][(page - 1) * per:page * per]
+            return 200, page_of(listed[parts[0]], query)
         if parts[0] == "orgs" and len(parts) == 2:
             org = int(parts[1])
             return 200, {"id": org, "name": self.orgs[org]} if org in self.orgs else {"name": ""}
@@ -91,7 +98,7 @@ class Fake:
         else:
             return 404, "not found"
         if method == "GET" and not rest:
-            return 200, self.listing(store)
+            return 200, page_of(self.listing(store), query)
         if method != "GET":
             self.writes.append((method, "/" + "/".join(parts)))
         if method == "POST" and not rest:
@@ -283,6 +290,17 @@ class RegistryTokenTest(unittest.TestCase):
         code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
         self.assertEqual(code, 0, text)
         self.assertEqual((self.fake.org_secrets[3], self.fake.org_secrets[4]), ({}, {}))
+        self.assertEqual(sorted(self.holders()), sorted(CONSUMERS))
+
+    def test_apply_deletes_a_copy_listed_after_the_first_page_of_secrets(self):
+        self.global_state()
+        # Woodpecker lists secrets by name, 50 to a page.
+        others = {f"a{i:02d}": secret("x", [], EVENTS) for i in range(50)}
+        self.fake.org_secrets[2] = {**copy.deepcopy(others), "gchr_token": secret(OLD_VALUE, [], EVENTS)}
+        code, text = self.run_tool("apply", "--token-file", self.token_file(NEW_TOKEN), *self.repo_args())
+        self.assertEqual(code, 0, text)
+        self.assertIn("delete gchr_token on org 2", text)
+        self.assertEqual(self.fake.org_secrets[2], others)
         self.assertEqual(sorted(self.holders()), sorted(CONSUMERS))
 
     def test_apply_carries_over_the_filter_of_an_organization_copy_when_no_global_copy_exists(self):

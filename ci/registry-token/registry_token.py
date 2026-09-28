@@ -118,7 +118,7 @@ class Woodpecker:
         scopes += [("repo", r["full_name"], f"/repos/{r['id']}") for r in repos]
         copies = []
         for scope, where, prefix in scopes:
-            for s in self.call("GET", f"{prefix}/secrets") or []:
+            for s in self.listing(f"{prefix}/secrets"):
                 if s["name"] == SECRET:
                     copies.append({"scope": scope, "where": where, "path": f"{prefix}/secrets/{SECRET}",
                                    "images": list(s.get("images") or []), "events": sorted(s.get("events") or [])})
