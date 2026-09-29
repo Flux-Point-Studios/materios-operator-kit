@@ -1900,6 +1900,8 @@ class FakeBlockfrost:
         if path.endswith("/transactions") and value is not None:
             start = int(params.get("from", 0))
             value = [row for row in value if row["block_height"] >= start]
+            if params.get("order") == "desc":
+                value = sorted(value, key=lambda row: (row["block_height"], row["tx_index"]), reverse=True)
         if isinstance(value, list) and "page" in params:
             first = (params["page"] - 1) * params["count"]
             value = value[first:first + params["count"]]
@@ -2164,6 +2166,28 @@ def test_a_pool_below_its_floor_pages_an_alert_once_a_day_and_the_digest_still_g
     assert "daily digest" in digest["content"] and "87.13% covered" in digest["content"]
     assert page["content"].startswith("⚠️ **ALERT**") and page["allowed_mentions"] == {"parse": []}
     assert "covers 87.13% of what is outstanding, below the 90% floor" in page["content"]
+
+
+def test_the_weeks_pace_is_read_from_the_pools_newest_transactions(covered, tmp_path):
+    # Anyone can pay dust into the pool. Read oldest first, 250 such payments early in the
+    # week left the week's surrenders unread and the pace at nearly nothing.
+    store, api, source = _covered_source(covered, tmp_path, TODAYS_POOL)
+    pool = _mainnet(covered).pool
+    now = _at("2026-09-28T13:00:05")
+    listing = api.routes[f"/addresses/{pool.address}/transactions"]
+
+    def paid(tx_hash: str, height: int, when: float, cmatra: int) -> None:
+        listing.append({"tx_hash": tx_hash, "tx_index": 0, "block_height": height, "block_time": when})
+        held = [{"address": pool.address, "amount": [{"unit": pool.cmatra_unit, "quantity": str(10 ** 15)}]}]
+        api.routes[f"/txs/{tx_hash}/utxos"] = {"inputs": held if cmatra else [], "outputs": [
+            {"address": pool.address, "amount": [{"unit": pool.cmatra_unit, "quantity": str(10 ** 15 - cmatra)}]}]}
+
+    for i in range(250):
+        paid(f"d{i:063x}", 13_960_000 + i, now - 6 * cw.DAY + i, 0)
+    for i in range(6):
+        paid(f"e{i:063x}", 13_989_300 + i, now - cw.DAY + i, 3_400_000_000_000)
+    lines, _ = source.coverage(now)
+    assert "redeemed in the last 7 days: at least 20,401,056.778496 cMATRA (57 transactions left unread)" in lines[1]
 
 
 class FailingPoolRead(FakeBlockfrost):

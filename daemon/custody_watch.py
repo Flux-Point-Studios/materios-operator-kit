@@ -1211,14 +1211,15 @@ class CardanoSource:
         return rules.pool_coverage(self._network, balance, held, week, unread, now)
 
     def _paid_since(self, since: float) -> tuple[int, int]:
-        """The cMATRA the pool paid out since ``since``, read from at most MAX_TX_PER_POLL
-        of its transactions, and how many more there were."""
+        """The cMATRA the pool paid out since ``since``, read from its newest
+        MAX_TX_PER_POLL transactions, and how many older ones went unread. Anyone can pay
+        dust into the pool, so the figure is a lower bound once any are left unread."""
         pool = self._network.pool
         tip = self._api.get("/blocks/latest")
         if tip is None:
             raise SourceError(f"{self.name}: blockfrost served no chain tip")
         start = tip["height"] - int(tip["time"] - since) // CARDANO_BLOCK_SECONDS - WINDOW_MARGIN_BLOCKS
-        rows = [row for row in self._pages(f"/addresses/{pool.address}/transactions", order="asc",
+        rows = [row for row in self._pages(f"/addresses/{pool.address}/transactions", order="desc",
                                            **{"from": str(max(start, 0))})
                 if row["block_time"] >= since]
         paid = 0

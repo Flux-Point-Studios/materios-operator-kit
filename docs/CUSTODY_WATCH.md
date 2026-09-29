@@ -116,8 +116,9 @@ denominator), as the merger's `compute_redemption` prices a surrender, and a tes
 the result equal to the merger's own figure at the pin. The digest gives:
 
 - the pool's cMATRA balance and what is outstanding, with the coverage and any shortfall;
-- the cMATRA the pool paid out in the last 7 days, read from each of its transactions
-  (at most 200; beyond that the figure is a lower bound and says so);
+- the cMATRA the pool paid out in the last 7 days, read from each of its transactions,
+  newest first (at most 200; beyond that the figure is a lower bound and says so, since
+  anyone can pay dust into the pool);
 - the days to the deadline, and how long the pool lasts at the last 7 days' pace.
 
 Before the deadline, a pool that covers less than `floor_percent` (default 90) of what is
