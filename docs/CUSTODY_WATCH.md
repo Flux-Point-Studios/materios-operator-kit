@@ -176,8 +176,9 @@ per channel and inside its 5 per 2 seconds per webhook. However many accounts fl
 block, the watcher never holds the webhook at its rate limit, so a watchdog that shares
 it still gets through. Only a page of the first lane may spend the bucket's last token,
 so it goes out the moment it is found whatever else is paging. Once the digest is due,
-one more token is kept back for it, so a flood cannot starve the watcher's liveness
-signal. `discord_webhook_file` gives the watcher its own channel (below); without it, it
+every page, the first lane's included, leaves one more token for it, and the digest may
+spend the last, so no flood, even of the first lane, starves the watcher's liveness
+signal; once a day that can hold a first-lane page back by one refill. `discord_webhook_file` gives the watcher its own channel (below); without it, it
 pages through `DISCORD_WEBHOOK_URL`.
 
 A failing webhook holds every post, the digest included: for its `Retry-After` when

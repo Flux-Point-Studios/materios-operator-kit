@@ -529,6 +529,35 @@ def test_the_daily_digest_goes_out_through_a_flood(config, tmp_path):
     assert len(digests) == 1
 
 
+class SudoKeyFlood(StubSource):
+    """A move of Sudo.Key's every two seconds, which only its holder can cause."""
+
+    def __init__(self, store):
+        super().__init__("materios-preprod")
+        self.poll_seconds = 2
+        self.store, self.moves = store, 0
+
+    def poll(self, now):
+        self.moves += 1
+        self.store.add(rules.Finding(rules.CRITICAL, f"materios-preprod:{self.moves}:1",
+                                     f"materios-preprod #{self.moves} extrinsic 1: Sudo.sudo", authority=True), now)
+        return True
+
+
+def test_the_digest_goes_out_through_a_flood_of_pages_only_an_authority_can_cause(config, tmp_path):
+    store = cw.Store(str(tmp_path / "state.db"))
+    clock = [_at("2026-09-28T12:58:00")]
+    hook = DiscordModel(clock)
+    watch = _watch(config, store, [SudoKeyFlood(store)], hook, clock)
+    for _ in range(10 * 60):
+        watch.cycle()
+        clock[0] += 1
+    digests = [t for t, _, p in hook.sent if "daily digest" in p["content"]]
+    assert len(digests) == 1 and digests[0] <= _at("2026-09-28T13:00:00") + cw.PAGE_INTERVAL
+    paged = sorted(f.sent_at for f in store.findings() if f.sent_at is not None)
+    assert max(later - earlier for earlier, later in zip(paged, paged[1:])) <= 2 * cw.PAGE_INTERVAL
+
+
 def test_a_new_critical_page_goes_out_ahead_of_alerts_already_waiting(tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     for i in range(6):

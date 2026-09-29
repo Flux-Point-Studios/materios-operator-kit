@@ -254,7 +254,9 @@ PAYLOAD_REFUSED = frozenset({400, 413})
 PAGE_BURST = 3
 PAGE_INTERVAL = 6.0
 # Only an authority's page may spend the bucket's last token, so it goes out the moment
-# it is found whatever else is paging.
+# it is found whatever else is paging. Once the digest is due, every page leaves one more
+# token for it, and the digest may spend the last: once a day it can hold an authority's
+# page back by one refill.
 AUTHORITY_RESERVE = 1
 # A group is what any funded account can cause. It pages its first finding at once and
 # then what it has gathered once per GROUP_WINDOW, and all groups together take at most
@@ -295,7 +297,7 @@ class Pager:
 
     Posts are paced by a token bucket (PAGE_BURST, PAGE_INTERVAL), so no flood of findings
     can hold the webhook at Discord's rate limit. An authority's pages go first and may
-    spend the last token; the rest that page alone go next; groups go last, each at most
+    spend the last token but one kept for a due digest; the rest that page alone go next; groups go last, each at most
     once per GROUP_WINDOW and all of them at most once per GROUPED_INTERVAL. A failure of the
     webhook (unreachable, a server error, a rate limit, or a refusal of every post, as a
     revoked or deleted webhook answers) holds all posting: for a rate limit's
@@ -347,13 +349,13 @@ class Pager:
 
     def flush(self, store: Store, now: float, keep: int = 0) -> int:
         """Page unsent ALERTs and CRITICALs in turn while tokens remain: an authority's
-        page may spend the last one, any other leaves AUTHORITY_RESERVE and ``keep`` more.
+        page leaves ``keep``, any other AUTHORITY_RESERVE and ``keep`` more.
         Returns how many findings went out. Undelivered pages stay pending, in order, and a
         message refused FALLBACK_AFTER times goes out as its headline alone."""
         delivered = 0
         for message in _messages(store.unsent_pages(held_since=now - GROUP_WINDOW)):
             grouped = message[0].group is not None
-            floor = 0 if message[0].authority else AUTHORITY_RESERVE + keep
+            floor = keep if message[0].authority else AUTHORITY_RESERVE + keep
             if self._available(now) < floor + 1 or (grouped and now - self._grouped_at < GROUPED_INTERVAL):
                 break
             keys = [f.key for f in message]
@@ -472,7 +474,7 @@ class Watch:
                 store.put(f"health:{name}:stale-since", str(int(last_ok)))
 
     def _digest(self, now: float) -> None:
-        if not self._digest_due(now) or not self._pager.ready("digest", now, AUTHORITY_RESERVE):
+        if not self._digest_due(now) or not self._pager.ready("digest", now):
             return
         day = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
         routine = self._store.unsent_routine()
