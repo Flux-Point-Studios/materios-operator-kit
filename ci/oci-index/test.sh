@@ -124,15 +124,24 @@ else
   ok "a missing target fails"
 fi
 
-# With the token present the plugin only runs where a pipeline cannot choose its own
-# environment: those limits come from OCI_INDEX_* and CI_* variables that a
-# secret-holding plugin step cannot set, and the tests set them here.
+# With the token the plugin runs only on the first run of a push pipeline of the default
+# branch, and only toward the registry and prefix fixed in the script. The token tests run
+# a copy whose two fixed values name the local registry instead.
+LOCAL=/tmp/oci-index-local.sh
+sed -e "s|^REGISTRY=ghcr.io\$|REGISTRY=$REG|" -e "s|^PREFIX=ghcr.io/flux-point-studios/\$|PREFIX=$REG/fps/|" \
+  "$HERE/oci-index.sh" >"$LOCAL"
+changed=$(diff -U0 "$HERE/oci-index.sh" "$LOCAL" | awk '/^(---|\+\+\+|@@)/ { next } /^[-+]/ { n++ } END { print n + 0 }')
+if [ "$changed" -eq 4 ]; then
+  ok "the plugin fixes its registry and prefix, one line each"
+else
+  echo "the local copy changed $changed lines, not 4" >/tmp/plugin.out
+  bad "the plugin does not fix its registry and prefix, one line each"
+fi
 authorized() {
-  CI_PIPELINE_EVENT=push CI_COMMIT_BRANCH=main CI_REPO_DEFAULT_BRANCH=main \
-  OCI_INDEX_REGISTRY=$REG OCI_INDEX_PREFIX=$REG/fps/ \
+  CI_PIPELINE_EVENT=push CI_COMMIT_BRANCH=main CI_REPO_DEFAULT_BRANCH=main CI_PIPELINE_PARENT=0 \
   PLUGIN_REGISTRY=$REG PLUGIN_USERNAME=ci PLUGIN_PASSWORD=s3cret-token "$@"
 }
-env_run() { env "$@" /busybox/sh "$HERE/oci-index.sh" >/tmp/plugin.out 2>&1; }
+env_run() { env "$@" /busybox/sh "$LOCAL" >/tmp/plugin.out 2>&1; }
 # token_rejects NAME PATTERN VAR=VALUE...: an authorized run with those overrides must
 # fail for PATTERN and write nothing.
 denied=0
@@ -166,13 +175,39 @@ else
   bad "the authorized login path exited non-zero"
 fi
 
-token_rejects "the token is refused on a pull request" "push or manual pipeline of the default branch" CI_PIPELINE_EVENT=pull_request
-token_rejects "the token is refused off the default branch" "push or manual pipeline of the default branch" CI_COMMIT_BRANCH=feature
-token_rejects "the token is refused without branch metadata" "push or manual pipeline of the default branch" CI_COMMIT_BRANCH= CI_REPO_DEFAULT_BRANCH=
+token_rejects "the token is refused on a pull request" "push pipeline of the default branch" CI_PIPELINE_EVENT=pull_request
+# A manual run, like a restart, carries variables chosen by whoever starts it.
+token_rejects "the token is refused on a manual pipeline" "push pipeline of the default branch" CI_PIPELINE_EVENT=manual
+token_rejects "the token is refused off the default branch" "push pipeline of the default branch" CI_COMMIT_BRANCH=feature
+token_rejects "the token is refused without branch metadata" "push pipeline of the default branch" CI_COMMIT_BRANCH= CI_REPO_DEFAULT_BRANCH=
 token_rejects "the token is only sent to the allowed registry" "may only be sent to $REG" PLUGIN_REGISTRY=evil.example
 token_rejects "the target must be under the allowed prefix" "outside $REG/fps/" PLUGIN_TARGET="$REG/elsewhere:abc"
 token_rejects "a source must be under the allowed prefix" "outside $REG/fps/" PLUGIN_SOURCES="/tmp/layout-amd64=$REG/elsewhere:abc"
+# A workspace directory can be named like a ref under the prefix, so a sources item holding
+# two words passes a check that reads it as one ref unless it is refused as a whole.
+mkdir -p "/tmp/ws/$REG/fps" && cp -r /tmp/layout-amd64 "/tmp/ws/$REG/fps/lay"
+# two_refs NAME SEPARATOR: the item must be refused and nothing pushed outside the prefix.
+two_refs() {
+  token_rejects "a sources item holding two refs split by a $1 is refused" "must not contain whitespace" \
+    PLUGIN_SOURCES="/tmp/layout-amd64=$REG/fps/two:abc$2$REG/fps/lay=$REG/elsewhere:$1"
+  if exists "$REG/elsewhere:$1"; then bad "a sources item holding two refs split by a $1 pushed outside the prefix"; fi
+}
+cd /tmp/ws
+two_refs space ' '
+two_refs tab "$(printf '\t')"
+cd "$HERE"
 token_rejects "a password without a username fails" "password needs registry and username" PLUGIN_USERNAME=
+# A restart runs its stored configuration with the restart's variables, however old it is.
+token_rejects "the token is refused on a restarted pipeline" "not used on a restarted pipeline" CI_PIPELINE_PARENT=4
+token_rejects "the token is refused without the parent metadata" "not used on a restarted pipeline" CI_PIPELINE_PARENT=
+
+# The plugin as shipped refuses the local registry even when variables name it.
+if authorized env OCI_INDEX_REGISTRY=$REG OCI_INDEX_PREFIX=$REG/fps/ PLUGIN_SOURCES="/tmp/layout-amd64=$REG/fps/shipped:abc" \
+  PLUGIN_PLATFORMS=linux/amd64 PLUGIN_TARGET="$REG/fps/shipped:abc" PLUGIN_TAGS=latest \
+  /busybox/sh "$HERE/oci-index.sh" >/tmp/plugin.out 2>&1; then bad "variables moved the registry: accepted"
+elif exists "$REG/fps/shipped:abc"; then bad "variables moved the registry: wrote the target"
+elif ! says "may only be sent to ghcr.io"; then bad "variables moved the registry: failed for another reason"
+else ok "variables cannot move the registry or prefix"; fi
 
 # A manifest that cannot be read is reported as such, not as an index.
 cat > /tmp/shim/crane <<EOF

@@ -26,14 +26,44 @@ variables:
   # The plugin already on GHCR, which pushes the plugin image built here. A plugin change
   # moves publish-index to the new digest first; this pin follows once that is on GHCR.
   - &oci_index_in_service ghcr.io/flux-point-studios/materios-operator-kit@sha256:d3178aaf4dc548dda5bd2d15a09f7c650ac1325fa7bc9215a861a3f34774c84b
+  # ci/npm-publish's base image, where its test runs.
+  - &npm_publish_base node:24-alpine@sha256:ebfe2f90462722a7a4de65e91990e97fe0d401c70e0e762c5b53302f905ec1c1
   # The crane debug image ships busybox under /busybox and has no /bin/sh.
   - &busybox_entrypoint ["/busybox/sh", "-c", "echo $$CI_SCRIPT | base64 -d | /busybox/sh -e"]
-  # --reproducible makes the plugin's digest a function of its sources alone, which is
-  # what lets check-oci-index-pin compare a rebuild against the pinned digest.
-  - &oci_index_build
-    dockerfile: ci/oci-index/Dockerfile
-    context: ci/oci-index
-    extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/oci-index.digest --oci-layout-path=/woodpecker/oci/oci-index
+  # Every setting the pinned kaniko plugin reads (ci/registry-token/kaniko-plugin-inputs).
+  # Woodpecker fills a setting a step leaves undeclared from a run's variables (a manual
+  # run's, or a restart's query), and publish-index pushes what these builds produce, so
+  # each is declared. "" keeps the plugin's default.
+  - &kaniko_inputs
+    dockerfile: Dockerfile
+    context: ""
+    dry_run: true
+    extra_opts: ""
+    auto_tag: ""
+    build_args: ""
+    build_args_from_env: ""
+    cache: ""
+    cache_repo: ""
+    cache_ttl: ""
+    cleanup: ""
+    destinations: ""
+    docker_config_json: ""
+    env_file: ""
+    ignore_var_run: ""
+    insecure: ""
+    insecure_pull: ""
+    insecure_registry: ""
+    json_key: ""
+    log_level: ""
+    mirrors: ""
+    password: ""
+    registry: ""
+    repo: ""
+    single_snapshot: ""
+    skip_tls_verify: ""
+    tags: ""
+    target: ""
+    username: ""
   - &on_pr
     - event: pull_request
   - &on_main
@@ -47,17 +77,37 @@ steps:
       - pip install --no-cache-dir --root-user-action=ignore -r requirements.txt pytest
       - python -B -m pytest -q -p no:cacheprovider
 
+  - name: test-registry-token
+    image: python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
+    commands:
+      - python3 -m unittest discover -s ci/registry-token -v
+
+  # The pinned plugin's own script decides which settings it reads; this fails once
+  # kaniko-plugin-inputs no longer lists exactly those, as after a kaniko upgrade.
+  - name: check-kaniko-inputs
+    image: *kaniko
+    commands:
+      # The image has no /tmp.
+      - mkdir -p /tmp
+      - grep -o 'PLUGIN_[A-Z_]*' /kaniko/plugin.sh | sed 's/^PLUGIN_//' | tr A-Z a-z | sort -u > /tmp/read
+      - grep -v '^#' ci/registry-token/kaniko-plugin-inputs > /tmp/listed
+      - diff /tmp/listed /tmp/read
+
   - name: test-oci-index
     image: *crane
     entrypoint: *busybox_entrypoint
     commands:
       - /busybox/sh ci/oci-index/test.sh
 
+  # --reproducible makes the plugin's digest a function of its sources alone, which is
+  # what lets check-oci-index-pin compare a rebuild against the pinned digest.
   - name: build-oci-index
     image: *kaniko
     settings:
-      <<: *oci_index_build
-      dry_run: true
+      <<: *kaniko_inputs
+      dockerfile: ci/oci-index/Dockerfile
+      context: ci/oci-index
+      extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/oci-index.digest --oci-layout-path=/woodpecker/oci/oci-index
 
   - name: push-oci-index
     image: *oci_index_in_service
@@ -71,6 +121,9 @@ steps:
       platforms:
         - linux/amd64
       target: ghcr.io/flux-point-studios/materios-operator-kit:ci-oci-index
+      # Declared empty so a run variable cannot supply tags: this target shares the operator
+      # image's repository, and a :latest moved here would reach every operator.
+      tags: ""
     when: *on_main
 
   # publish-index runs the plugin by digest, and the gchr_token secret's image filter
@@ -81,18 +134,55 @@ steps:
     commands:
       - D=$$(cat /woodpecker/oci-index.digest)
       - 'P=$$(sed -n "/^  - name: publish-index$$/,/^  - name: /s/^    image: //p" .woodpecker.yaml)'
-      - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index and the gchr_token image filter to the new digest"; exit 1; }'
+      - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index to the new digest and add it to every gchr_token copy with ci/registry-token pin --add"; exit 1; }'
+
+  # The test replaces npm and the plugin's busybox inside this step's own container.
+  - name: test-npm-publish
+    image: *npm_publish_base
+    commands:
+      - sh ci/npm-publish/test.sh
+
+  - name: build-npm-publish
+    image: *kaniko
+    settings:
+      <<: *kaniko_inputs
+      dockerfile: ci/npm-publish/Dockerfile
+      context: ci/npm-publish
+      extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/npm-publish.digest --oci-layout-path=/woodpecker/oci/npm-publish
+
+  # A consumer pins this digest in its publish step and in its npm token's image filter.
+  - name: show-npm-publish-digest
+    image: *crane
+    entrypoint: *busybox_entrypoint
+    commands:
+      - echo "ci/npm-publish builds ghcr.io/flux-point-studios/materios-operator-kit@$$(cat /woodpecker/npm-publish.digest)"
+
+  - name: push-npm-publish
+    image: *oci_index_in_service
+    settings:
+      registry: ghcr.io
+      username: realdecimalist
+      password:
+        from_secret: gchr_token
+      sources:
+        - /woodpecker/oci/npm-publish=ghcr.io/flux-point-studios/materios-operator-kit:ci-npm-publish
+      platforms:
+        - linux/amd64
+      target: ghcr.io/flux-point-studios/materios-operator-kit:ci-npm-publish
+      # Declared empty for the reason push-oci-index gives.
+      tags: ""
+    when: *on_main
 
   - name: build-amd64
     image: *kaniko
     settings:
-      dry_run: true
+      <<: *kaniko_inputs
       extra_opts: --custom-platform=linux/amd64 --oci-layout-path=/woodpecker/oci/amd64
 
   - name: build-arm64
     image: *kaniko
     settings:
-      dry_run: true
+      <<: *kaniko_inputs
       extra_opts: --custom-platform=linux/arm64 --oci-layout-path=/woodpecker/oci/arm64
 
   # Runs publish-index's exact logic against the real layouts and a throwaway registry,
@@ -119,7 +209,7 @@ steps:
   # Moves :latest only once the index is verified to carry both platforms, so a failed
   # leg never leaves :latest single-arch.
   - name: publish-index
-    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:d3178aaf4dc548dda5bd2d15a09f7c650ac1325fa7bc9215a861a3f34774c84b
+    image: ghcr.io/flux-point-studios/materios-operator-kit@sha256:2e707c814c14ece8934e8036a901001a4ef4de191af5ba0f97e05d0dd9a6b59a
     settings:
       registry: ghcr.io
       username: realdecimalist

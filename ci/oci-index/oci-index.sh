@@ -12,16 +12,27 @@
 #   tags       extra tags moved to target only after it verifies (optional)
 #   registry, username, password   login, when password is set (optional)
 #
-# With a password, the plugin runs only on a push or manual pipeline of the default
-# branch, logs in only to OCI_INDEX_REGISTRY and writes only under OCI_INDEX_PREFIX.
-# Those come from the environment, not from settings: Woodpecker refuses a secret to
-# any step that sets its own environment, so no pipeline can widen them.
+# With a password, the plugin runs only on the first run of a push pipeline of the default
+# branch, logs in only to REGISTRY and writes only under PREFIX. Woodpecker sets the CI_*
+# values checked here over a run's variables. A manual run and a restart (CI_PIPELINE_PARENT
+# other than 0) are refused: both carry variables chosen by whoever starts them, which fill
+# any setting a step leaves undeclared, and a restart runs its stored configuration however
+# old. REGISTRY and PREFIX are fixed here because a run's variables reach a plugin step's
+# environment.
 set -euf
+
+REGISTRY=ghcr.io
+PREFIX=ghcr.io/flux-point-studios/
 
 die() { echo "oci-index: $*" >&2; exit 1; }
 list() { echo "$1" | tr ',' '\n' | sed '/^$/d'; }
 words() { sort | tr '\n' ' '; }
 
+# The prefix check and the push loop must read the same refs: the check reads each sources
+# item as one ref, the loop splits the list into words.
+case "${PLUGIN_SOURCES:-}${PLUGIN_PLATFORMS:-}${PLUGIN_TARGET:-}${PLUGIN_TAGS:-}" in
+  *[[:space:]]*) die "sources, platforms, target and tags must not contain whitespace" ;;
+esac
 SOURCES=$(list "${PLUGIN_SOURCES:-}")
 PLATFORMS=$(list "${PLUGIN_PLATFORMS:-}")
 TARGET=${PLUGIN_TARGET:-}
@@ -33,16 +44,15 @@ if [ -n "${PLUGIN_PASSWORD:-}" ]; then
   [ -n "${PLUGIN_REGISTRY:-}" ] && [ -n "${PLUGIN_USERNAME:-}" ] || die "password needs registry and username"
   default=${CI_REPO_DEFAULT_BRANCH:-}
   case "${CI_PIPELINE_EVENT:-}:${CI_COMMIT_BRANCH:-}" in
-    push:"$default" | manual:"$default") [ -n "$default" ] ;;
+    push:"$default") [ -n "$default" ] ;;
     *) false ;;
-  esac || die "the token is only used on a push or manual pipeline of the default branch"
-  registry=${OCI_INDEX_REGISTRY:-ghcr.io}
-  prefix=${OCI_INDEX_PREFIX:-ghcr.io/flux-point-studios/}
-  [ "$PLUGIN_REGISTRY" = "$registry" ] || die "the token may only be sent to $registry"
+  esac || die "the token is only used on a push pipeline of the default branch"
+  [ "${CI_PIPELINE_PARENT:-}" = 0 ] || die "the token is not used on a restarted pipeline"
+  [ "$PLUGIN_REGISTRY" = "$REGISTRY" ] || die "the token may only be sent to $REGISTRY"
   for ref in $TARGET $(echo "$SOURCES" | sed 's/^[^=]*=//'); do
-    case "$ref" in "$prefix"*) ;; *) die "$ref is outside $prefix" ;; esac
+    case "$ref" in "$PREFIX"*) ;; *) die "$ref is outside $PREFIX" ;; esac
   done
-  printf '%s' "$PLUGIN_PASSWORD" | crane auth login "$registry" -u "$PLUGIN_USERNAME" --password-stdin >/dev/null
+  printf '%s' "$PLUGIN_PASSWORD" | crane auth login "$REGISTRY" -u "$PLUGIN_USERNAME" --password-stdin >/dev/null
 fi
 
 set --

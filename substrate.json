@@ -129,7 +129,7 @@
     {
       "id": "oci-index-plugin",
       "name": "OCI multi-arch index plugin",
-      "desc": "Woodpecker plugin (crane + jq), the only image the org GHCR token (gchr_token) is released to. It pushes credential-less kaniko OCI layouts, and publishes one platform as a plain image or several as a verified multi-arch index, moving extra tags only after verification. With the token it runs only on a push or manual pipeline of the default branch, against ghcr.io/flux-point-studios. Publishes operator-kit, materios-gateway, anchor-worker, anchor-worker-materios and saturnswap-backend.",
+      "desc": "Woodpecker plugin (crane + jq), the only image the org GHCR token (gchr_token) is released to. It pushes credential-less kaniko OCI layouts, and publishes one platform as a plain image or several as a verified multi-arch index, moving extra tags only after verification. With the token it runs only on the first run of a push pipeline of the default branch (Woodpecker sets those CI_ values, the parent included, over a run's variables; manual runs and restarts carry variables chosen by whoever starts them, and a restart replays its stored configuration, so both are refused), and only toward ghcr.io/flux-point-studios/, fixed in the script; a setting holding whitespace is refused, so every ref it writes is one the prefix check read. A run's variables still fill any setting a step leaves undeclared, so every step that publishes, or builds what is published, declares every input (tested in operator-kit). Publishes operator-kit, materios-gateway, anchor-worker, anchor-worker-materios and saturnswap-backend.",
       "kind": "toolkit",
       "paths": [
         "ci/oci-index"
@@ -156,6 +156,30 @@
       ],
       "status": "experimental",
       "terminal": true
+    },
+    {
+      "id": "registry-token-scope",
+      "name": "Registry token scope",
+      "desc": "Keeps the GHCR publish token (gchr_token) as repository-level Woodpecker secrets on exactly the repositories that publish through the OCI index plugin, each copy admitting only the plugin's pinned digests. plan lists every copy and the change; apply accepts only a classic write:packages token of the plugin's login that the registry lets open an upload in the plugin's package, stores it, checks what Woodpecker stored, then deletes every global, organization and stray copy (run it again to rotate); pin adds or drops a digest of the plugin image, and only of it, on every copy during a plugin upgrade. Any Woodpecker user with push on a holder can edit its copy, so plan and apply name every Woodpecker user who is not an admin.",
+      "kind": "toolkit",
+      "paths": [
+        "ci/registry-token"
+      ],
+      "consumes": [
+        "oci-index-plugin"
+      ],
+      "status": "experimental"
+    },
+    {
+      "id": "npm-publish-plugin",
+      "name": "npm publish plugin",
+      "desc": "Woodpecker plugin that publishes npm tarballs an earlier step packed without the token, so no install, build or package script runs beside the npm token. With the token it runs only on the first run of a push pipeline of the default branch and refuses manual runs and restarts before any program starts, in a statically linked busybox that LD_PRELOAD cannot load code into. It copies every tarball where only its own container reaches and checks each copy before publishing any, reading the manifest with npm's own pacote as npm publish does: scope @orynq or @fluxpointstudios, a release version, and a publishConfig holding only access public and registry keys that name https://registry.npmjs.org. It then runs npm from a directory of its own under /tmp, with an environment it sets, --ignore-scripts, and the token bound to registry.npmjs.org. Publishes orynq-sdk.",
+      "kind": "toolkit",
+      "paths": [
+        "ci/npm-publish"
+      ],
+      "consumes": [],
+      "status": "experimental"
     }
   ]
 }
