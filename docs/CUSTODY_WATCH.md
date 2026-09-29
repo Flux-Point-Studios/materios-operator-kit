@@ -10,7 +10,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 | Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, any `Recovery` call from `Sudo.Key` or an authority account, a vouch, claim, `cancel_recovered` or `as_recovered` that names one and could take effect (below), `Sudo.Key` changing, any change in the recovery of `Sudo.Key` or an authority other than a recovery started (below), a `RuntimeEnvironmentUpdated` header digest, the runtime code's hash changing, a new genesis (chain reset), an extrinsic the classifier cannot read, and one the runtime metadata cannot decode, or the block's decode budget does not reach, that is unsigned or signed by `Sudo.Key`, an authority, or a friend, proxy or vouched rescuer in the recovery of one | any other `Recovery` call, a recovery of `Sudo.Key` or an authority started with no friend's vouch, an extrinsic that cannot be decoded from any other account, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below); the recovery state as first read |
 | Cardano custody addresses | any outflow, collateral a failed script consumed included | any inflow | reads as a reference input |
 | Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
-| Cardano policies | mint or burn, as configured | as configured | |
+| Cardano policies | a mint, as configured | a mint, as configured; a burn, grouped per policy and never above ALERT | |
 | Surrender pool | a spend that is not exactly a surrender: another redeemer, cMATRA to a wallet that gave up no legacy units or beyond the entitlement of the units it gave up, legacy units reaching a wallet instead of the quarantine address, cMATRA paid into the quarantine address, an overpayment, non-cMATRA value moved, a continuing output without its datum, a custody wallet as claimant, any mint or burn in the spend, a surrendered unit outside its redemption's pinned asset names | an underpayment, an asset outside the rate table, a payout above `max_payout`, value arriving outside a pool spend, the quarantine address holding more of a redemption than its rate-table supply | a surrender paid exactly its rate-table entitlement |
 
 Each Materios page carries the decoded call tree, the signer, the derived multisig
@@ -151,14 +151,17 @@ Pages go out in three lanes, most severe first within each:
    its friends have vouched for does in the recovery of one; a change of `Sudo.Key`, of the runtime
    code or of the genesis; a runtime environment digest; a change in the recovery of
    `Sudo.Key` or an authority other than a recovery started; a custody outflow; a
-   surrender-pool spend that is not a surrender; a mint or burn under a watched policy.
+   surrender-pool spend that is not a surrender; a mint under a watched policy.
 2. Every other finding that pages alone, such as a coverage page, a committee change or
    a stale source.
 3. Groups. Only what an account anyone can be causes is grouped, per source: Materios
    findings by signer, those whose dispatch result could not be verified and anything
    unclassifiable per chain, and on Cardano payments into, or contract spends from, one
    address, and a surrender whose claimant made it underpay or pay above `max_payout`,
-   per address.
+   per address, and burns under one watched policy, per policy. A burn destroys only
+   what its own inputs held, and the cMATRA policy lets any holder burn without a
+   signature, so a burn is at most an ALERT; one that takes from a custody address or
+   the pool pages alone from there.
 
 A group pages its first finding at once. After that it waits ten minutes
 (`GROUP_WINDOW`) and pages everything it gathered in one message, so an account that

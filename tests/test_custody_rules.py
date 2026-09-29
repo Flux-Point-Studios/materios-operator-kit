@@ -1358,6 +1358,44 @@ def test_custody_and_pool_findings_are_never_grouped(networks):
     assert _classify(networks, "cardano-mainnet", "mint_v2").group is None
 
 
+# A wallet holding cMATRA paid out by its own surrender.
+HOLDER = _outputs(_tx("surrender_t2_pass")["utxos"])[1]["address"]
+
+
+def burn(network, holder: str, tx_hash: str = "cc" * 32, height: int = 1,
+         when: int = 1_790_000_000) -> tuple[dict, dict]:
+    """``holder`` burning one base unit of the cMATRA it holds, as the cMATRA policy lets
+    anyone holding cMATRA do without a signature: the transaction and its UTxOs."""
+    unit = network.pool.cmatra_unit
+    tx = {"hash": tx_hash, "block_height": height, "block_time": when, "valid_contract": True}
+    utxos = {"inputs": [{"address": holder, "tx_hash": "dd" * 32, "output_index": 0, "collateral": False,
+                         "reference": False, "amount": [{"unit": "lovelace", "quantity": "2000000"},
+                                                        {"unit": unit, "quantity": "5"}]}],
+             "outputs": [{"address": holder, "output_index": 0, "collateral": False,
+                          "amount": [{"unit": "lovelace", "quantity": "1800000"}, {"unit": unit, "quantity": "4"}]}]}
+    return tx, utxos
+
+
+def test_a_burn_any_holder_can_make_is_an_alert_grouped_under_its_policy(networks):
+    network = networks["cardano-mainnet"]
+    finding = rules.classify_cardano_tx(network, *burn(network, HOLDER), [])
+    assert (finding.severity, finding.group, finding.authority) == (rules.ALERT, "cardano-mainnet cMATRA", False)
+    assert "burned 0.000001 cMATRA under cMATRA" in finding.render()
+
+
+def test_a_burn_of_what_a_custody_wallet_held_pages_as_its_outflow(networks):
+    network = networks["cardano-mainnet"]
+    custody = next(a for a in network.addresses if a.label == "custody-a").address
+    finding = rules.classify_cardano_tx(network, *burn(network, custody), [])
+    assert (finding.severity, finding.group, finding.authority) == (rules.CRITICAL, None, True)
+    assert "outflow from custody-a" in finding.render()
+
+
+def test_a_mint_under_a_watched_policy_is_the_keys_and_pages_alone(networks):
+    finding = _classify(networks, "cardano-mainnet", "mint_v2")
+    assert (finding.severity, finding.group, finding.authority) == (rules.CRITICAL, None, True)
+
+
 def test_a_pool_redeemer_whose_constructor_is_not_a_number_is_critical(networks):
     tx = _tx("surrender_agent")
     for redeemer in tx["redeemers"]:

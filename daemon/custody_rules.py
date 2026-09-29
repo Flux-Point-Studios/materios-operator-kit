@@ -1390,10 +1390,11 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
     names = _Names(network)
     lines: list[tuple[Severity, str]] = []
     kind, amount = "event", 0
-    # Anyone may pay into an address, or surrender a legacy unit, so a transaction that only
-    # pays in, only spends from a contract, or makes a surrender do what its claimant chose,
-    # is grouped with the others at that address; one that moves custody, spends the pool
-    # other than as a surrender, or mints under a watched policy is the keys' and pages alone.
+    # Anyone may pay into an address, surrender a legacy unit, or burn a token it holds, so a
+    # transaction that only pays in, only spends from a contract, makes a surrender do what
+    # its claimant chose, or burns, is grouped with the others at that address or policy;
+    # one that moves custody, spends the pool other than as a surrender, or mints under a
+    # watched policy is the keys' and pages alone.
     authority, label = False, None
 
     for watched in network.addresses:
@@ -1416,10 +1417,17 @@ def classify_cardano_tx(network: CardanoNetwork, tx: dict, utxos: dict, redeemer
     minted.pop("lovelace", None)
     for policy in network.policies:
         for unit, quantity in sorted(minted.items()):
-            if unit.startswith(policy.policy_id):
-                verb = "minted" if quantity > 0 else "burned"
-                lines.append((policy.severity, f"{verb} {names.quantity(unit, abs(quantity))} under {policy.label}"))
+            if not unit.startswith(policy.policy_id):
+                continue
+            if quantity > 0:
+                lines.append((policy.severity, f"minted {names.quantity(unit, quantity)} under {policy.label}"))
                 authority = True
+            else:
+                # A burn destroys only what its own inputs held; one from custody or the pool
+                # pages there. The cMATRA policy lets any holder burn without a signature.
+                lines.append((min(policy.severity, ALERT), f"burned {names.quantity(unit, -quantity)} under "
+                                                           f"{policy.label}"))
+                label = label or policy.label
 
     pool = network.pool
     if pool and any(u["address"] == pool.address for u in spent):

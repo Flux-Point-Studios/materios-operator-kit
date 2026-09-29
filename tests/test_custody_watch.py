@@ -23,8 +23,8 @@ from substrateinterface.utils.hasher import blake2_128_concat, two_x64_concat, x
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
 from daemon import discord
-from tests.test_custody_rules import (LEG_SIGNER, NORMAL_BLOCK_LENGTH, STRANGER, TODAYS_POOL, _count_walks,
-                                      coverage_doc, filler_call, fillers_past_the_budget, nested_sudo_leg,
+from tests.test_custody_rules import (HOLDER, LEG_SIGNER, NORMAL_BLOCK_LENGTH, STRANGER, TODAYS_POOL, _count_walks,
+                                      burn, coverage_doc, filler_call, fillers_past_the_budget, nested_sudo_leg,
                                       signed_extrinsic)
 
 FIX = Path(__file__).parent / "fixtures" / "custody"
@@ -1996,6 +1996,81 @@ def test_a_mint_under_a_watched_policy_pages_critical(config, tmp_path):
     [finding] = store.findings()
     assert finding.severity == rules.CRITICAL and "minted" in finding.text
     assert store.get(f"cursor:cardano-mainnet:asset:{unit}") == "2"
+
+
+class BurningHolder(cw.CardanoSource):
+    """cardano-mainnet while a holder burns ``per_minute`` base units of cMATRA a minute,
+    one transaction each."""
+
+    def __init__(self, network, store, clock, per_minute):
+        api = FakeBlockfrost(tip=13_600_000, time=int(clock[0]))
+        super().__init__(network, api, store, stale_seconds=900)
+        self.api, self.per_minute, self.polls, self.burned = api, per_minute, 0, 0
+        self.unit = network.pool.cmatra_unit
+        api.routes[f"/assets/policy/{self.unit[:56]}"] = [{"asset": self.unit, "quantity": str(10 ** 15)}]
+        api.routes[f"/assets/{self.unit}/history"] = [{"tx_hash": "0" * 64, "action": "minted"}]
+        api.routes[f"/assets/{self.unit}"] = {"mint_or_burn_count": 1}
+
+    def poll(self, now):
+        tip = self.api.routes["/blocks/latest"]
+        tip["time"] = int(now) - 5
+        if self.polls:
+            tip["height"] += 3
+            history = self.api.routes[f"/assets/{self.unit}/history"]
+            for _ in range(self.per_minute):
+                self.burned += 1
+                tx, utxos = burn(self._network, HOLDER, f"{self.burned:064x}", tip["height"], int(now) - 30)
+                self.api.routes[f"/txs/{tx['hash']}"] = tx
+                self.api.routes[f"/txs/{tx['hash']}/utxos"] = utxos
+                history.append({"tx_hash": tx["hash"], "action": "burned"})
+            self.api.routes[f"/assets/{self.unit}"] = {"mint_or_burn_count": len(history)}
+        self.polls += 1
+        return super().poll(now)
+
+
+class Genuine(StubSource):
+    """What pages alone for real: a committee change every two minutes, and one custody
+    outflow at ``custody_at``."""
+
+    def __init__(self, store, network, custody_at):
+        super().__init__("materios-preprod")
+        self.poll_seconds = 6
+        self.store, self.network, self.custody_at, self.next_alert, self.custody = store, network, custody_at, 0, None
+
+    def poll(self, now):
+        if now >= self.next_alert:
+            self.store.add(rules.Finding(rules.ALERT, f"materios-preprod:{int(now)}:committee",
+                                         f"materios-preprod committee changed at {int(now)}", kind="committee"), now)
+            self.next_alert = now + 120
+        if self.custody is None and now >= self.custody_at:
+            doc = _tx("custody_outflow")
+            self.custody = rules.classify_cardano_tx(self.network, doc["tx"], doc["utxos"], doc["redeemers"])
+            self.store.add(self.custody, now)
+        return super().poll(now)
+
+
+@pytest.mark.parametrize("per_minute", [1, 20])
+def test_burns_any_holder_makes_ping_no_one_and_hold_back_no_page_or_digest(config, tmp_path, per_minute):
+    network = _mainnet(config)
+    store = cw.Store(str(tmp_path / "state.db"))
+    clock = [_at("2026-09-28T12:50:00")]
+    hook = DiscordModel(clock)
+    holder = BurningHolder(network, store, clock, per_minute)
+    genuine = Genuine(store, network, custody_at=_at("2026-09-28T12:55:00"))
+    watch = _watch(config, store, [holder, genuine], hook, clock)
+    for _ in range(20 * 60):
+        watch.cycle()
+        clock[0] += 1
+    posts = [p["content"] for _, _, p in hook.sent]
+    rows = {f.key: f for f in store.findings()}
+    custody = rows[genuine.custody.key]
+    alone = [f for f in rows.values() if f.kind == "committee"]
+    assert holder.burned == 19 * per_minute
+    assert [p for p in posts if "@here" in p] == [p for p in posts if custody.headline in p]
+    assert custody.sent_at == custody.found_at
+    assert len(alone) == 10 and [f.sent_at for f in alone] == [f.found_at for f in alone]
+    assert sum("daily digest" in p for p in posts) == 1
+    assert 1 <= sum("burned" in p or "from cardano-mainnet cMATRA" in p for p in posts) <= 3
 
 
 def _large_policy_watch(config, tmp_path):
