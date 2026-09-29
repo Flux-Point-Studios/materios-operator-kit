@@ -1129,6 +1129,19 @@ SUDO_REMARK = bytes([6, 0]) + REMARK_X
 AS_SUDO_KEY_REMARK = bytes([24, 0, 0]) + rules.account_bytes(SUDO_KEY) + REMARK_X
 ATTEMPTERS = [bytes([0xB0 + i]) * 32 for i in range(6)]
 OVERFLOW_AT = 7000
+SUDO = rules.account_bytes(SUDO_KEY)
+NOBODY = bytes([0x55]) * 32
+# What an account can ask for on Sudo.Key's behalf, or to carry out what Root approved:
+# Recovery.vouch_recovery(Sudo.Key, NOBODY), claim_recovery(Sudo.Key) and
+# cancel_recovered(Sudo.Key), System.apply_authorized_upgrade(0x00), Treasury.payout(0).
+VOUCH_FOR_NOBODY = bytes([24, 4, 0]) + SUDO + bytes([0]) + NOBODY
+CLAIM_SUDO_KEY = bytes([24, 5, 0]) + SUDO
+CANCEL_SUDO_KEY = bytes([24, 8, 0]) + SUDO
+APPLY_UPGRADE = bytes([0, 11]) + rules._compact(1) + b"\x00"
+PAYOUT_0 = bytes([9, 6]) + bytes(4)
+OUTSIDER_ATTEMPTS = {"sudo": SUDO_REMARK, "as_recovered": AS_SUDO_KEY_REMARK, "vouch": VOUCH_FOR_NOBODY,
+                     "claim": CLAIM_SUDO_KEY, "cancel": CANCEL_SUDO_KEY, "apply_authorized_upgrade": APPLY_UPGRADE,
+                     "payout": PAYOUT_0}
 
 
 def _events_overflow(chain, attempts, items=3200):
@@ -1141,27 +1154,39 @@ def _events_overflow(chain, attempts, items=3200):
     chain.events_hex = _batch_events(items, len(attempts))
 
 
+DISPATCH_INFO = {"weight": {"ref_time": 1, "proof_size": 0}, "class": "Normal", "pays_fee": "Yes"}
+SUCCESS = {"System": {"ExtrinsicSuccess": {"dispatch_info": DISPATCH_INFO}}}
+
+
+def _record(index: int, event: dict) -> dict:
+    return {"phase": {"ApplyExtrinsic": index}, "event": event, "topics": []}
+
+
+def _encoded_events(records: list[dict]) -> str:
+    decoder = rules.RuntimeDecoder(_read("materios/metadata_spec238.hex.gz").decode())
+    return decoder._config.create_scale_object(decoder._events_type, metadata=decoder._metadata).encode(
+        records).to_hex()
+
+
 @functools.lru_cache(maxsize=None)
 def _batch_events(items: int, failed: int) -> str:
     """System.Events of the routine block's three inherents, a batch of ``items``
     remark_with_event, then ``failed`` extrinsics that failed with Sudo's RequireSudo."""
-    decoder = rules.RuntimeDecoder(_read("materios/metadata_spec238.hex.gz").decode())
-    info = {"weight": {"ref_time": 1, "proof_size": 0}, "class": "Normal", "pays_fee": "Yes"}
-
-    def record(index, event):
-        return {"phase": {"ApplyExtrinsic": index}, "event": event, "topics": []}
-
-    success = {"System": {"ExtrinsicSuccess": {"dispatch_info": info}}}
-    records = [record(i, success) for i in range(3)]
+    records = [_record(i, SUCCESS) for i in range(3)]
     for _ in range(items):
-        records += [record(3, {"System": {"Remarked": {"sender": "0x" + "a0" * 32, "hash": "0x" + "00" * 32}}}),
-                    record(3, {"Utility": "ItemCompleted"})]
-    records += [record(3, {"Utility": "BatchCompleted"}), record(3, success)]
-    records += [record(4 + i, {"System": {"ExtrinsicFailed": {
-        "dispatch_error": {"Module": {"index": 6, "error": "0x00000000"}}, "dispatch_info": info}}})
+        records += [_record(3, {"System": {"Remarked": {"sender": "0x" + "a0" * 32, "hash": "0x" + "00" * 32}}}),
+                    _record(3, {"Utility": "ItemCompleted"})]
+    records += [_record(3, {"Utility": "BatchCompleted"}), _record(3, SUCCESS)]
+    records += [_record(4 + i, {"System": {"ExtrinsicFailed": {
+        "dispatch_error": {"Module": {"index": 6, "error": "0x00000000"}}, "dispatch_info": DISPATCH_INFO}}})
         for i in range(failed)]
-    events = decoder._config.create_scale_object(decoder._events_type, metadata=decoder._metadata)
-    return events.encode(records).to_hex()
+    return _encoded_events(records)
+
+
+@functools.lru_cache(maxsize=None)
+def _succeeded(count: int) -> str:
+    """System.Events in which each of a block's first ``count`` extrinsics succeeded."""
+    return _encoded_events([_record(i, SUCCESS) for i in range(count)])
 
 
 def _watch_overflow(config, tmp_path, attempts, state_at=(OVERFLOW_AT - 1, OVERFLOW_AT), items=3200):
@@ -1175,7 +1200,7 @@ def _watch_overflow(config, tmp_path, attempts, state_at=(OVERFLOW_AT - 1, OVERF
     return store, posts, chain
 
 
-@pytest.mark.parametrize("call", [SUDO_REMARK, AS_SUDO_KEY_REMARK], ids=["sudo", "as_recovered"])
+@pytest.mark.parametrize("call", list(OUTSIDER_ATTEMPTS.values()), ids=list(OUTSIDER_ATTEMPTS))
 def test_failed_attempts_in_a_block_whose_events_overflow_are_proven_inert_from_its_state(config, tmp_path, call):
     store, posts, _ = _watch_overflow(config, tmp_path, [(call, signer) for signer in ATTEMPTERS])
     findings = store.findings()
@@ -1229,7 +1254,6 @@ def test_an_attempt_by_the_proxy_of_the_account_it_acts_as_still_pages(config, t
     assert finding.severity == rules.CRITICAL and "Recovery.as_recovered" in finding.text
 
 
-SUDO = rules.account_bytes(SUDO_KEY)
 FRIENDS = [bytes([0xF1 + i]) * 32 for i in range(5)]
 RESCUER = bytes([0xE1]) * 32
 RECOVERY = xxh128(b"Recovery")
@@ -1325,7 +1349,8 @@ STARTED = "materios-preprod recovery started"
 
 def test_any_change_in_the_recovery_of_sudo_key_or_an_authority_pages_critical(config, tmp_path):
     # Only a recovery started with no friend's vouch yet, which any funded account can
-    # start, pages in a group; every other change pages alone.
+    # start and which can do nothing until friends vouch, pages as an ALERT in a group;
+    # every other change pages CRITICAL alone.
     authority = rules.account_bytes(ALICE)
     config = dataclasses.replace(config, materios=dataclasses.replace(config.materios, authority_accounts=(ALICE,)))
     chain = FakeChain(head=1000, blocks={}, state_at=set(range(1000, 1010)))
@@ -1345,7 +1370,8 @@ def test_any_change_in_the_recovery_of_sudo_key_or_an_authority_pages_critical(c
         chain.head = 1000 + step
         source.poll(1.0 + step)
         [finding] = [f for f in store.findings() if f.key.endswith(f":recovery:{1000 + step}")]
-        assert finding.severity == rules.CRITICAL and finding.group == group, (step, finding.group)
+        severity = rules.ALERT if group else rules.CRITICAL
+        assert finding.severity == severity and finding.group == group, (step, finding.group)
         assert item in finding.text, (step, finding.text)
     assert "rescuer " + rules.render_account(RESCUER) in store.findings()[1].text
     assert f"vouched by {rules.render_account(FRIENDS[0])}" in store.findings()[2].text
@@ -1354,7 +1380,8 @@ def test_any_change_in_the_recovery_of_sudo_key_or_an_authority_pages_critical(c
     assert len(store.findings()) == 1 + len(changes)
 
 
-def test_recoveries_strangers_start_page_as_one_message_behind_the_pages_that_go_alone(config, tmp_path):
+def test_recoveries_strangers_start_page_without_here_as_one_message_behind_the_pages_that_go_alone(config,
+                                                                                                    tmp_path):
     # Starting a recovery of Sudo.Key costs any funded account a deposit, once a poll.
     chain = FakeChain(head=1000, blocks={}, state_at=set(range(1000, 1010)))
     _recoverable_by(chain, SUDO, FRIENDS)
@@ -1369,11 +1396,12 @@ def test_recoveries_strangers_start_page_as_one_message_behind_the_pages_that_go
     chain.head = 1005
     source.poll(6.0)
     started = [f for f in store.findings() if f.group == STARTED]
-    assert len(started) == 4 and all(f.severity == rules.CRITICAL for f in started)
+    assert len(started) == 4 and all(f.severity == rules.ALERT for f in started)
     posts = Posts()
     cw.Pager(posts).flush(store, 10.0)
     vouched, grouped = posts.payloads
     assert f"vouched by {rules.render_account(FRIENDS[0])}" in vouched["content"]
+    assert grouped["content"].startswith("\u26a0\ufe0f **ALERT**")
     assert f"**4 findings from {STARTED}**" in grouped["content"]
 
 
@@ -1438,6 +1466,111 @@ def test_what_a_friend_of_sudo_key_signs_is_decoded_ahead_of_filler_from_a_stran
     _drain(source)
     [vouch] = [f for f in store.findings() if "Recovery.vouch_recovery" in f.text]
     assert vouch.severity == rules.CRITICAL and f"signer {rules.render_account(FRIENDS[0])}" in vouch.text
+
+
+def _force_batch(call: bytes) -> bytes:
+    """Utility.force_batch([call]), which succeeds whether or not ``call`` does."""
+    return bytes([8, 4]) + rules._compact(1) + call
+
+
+def _as_proxy_of_sudo_key(chain, signer):
+    chain.storage[_proxy_key(signer)] = "0x" + SUDO.hex()
+
+
+AUTHORIZED_UPGRADE_KEY = "0x" + (xxh128(b"System") + xxh128(b"AuthorizedUpgrade")).hex()
+SPEND_0_KEY = "0x" + (xxh128(b"Treasury") + xxh128(b"Spends") + two_x64_concat(bytes(4))).hex()
+# Each call an outsider can ask for, and the state that lets it take effect: only Sudo.Key's
+# recovery config, its friends' vouches, or Root's own approval can put it there.
+ALLOWED_BY = {
+    "vouch": (VOUCH_FOR_NOBODY, lambda chain, signer: _recoverable_by(chain, SUDO, [*FRIENDS[:4], signer])),
+    "claim": (CLAIM_SUDO_KEY, lambda chain, signer: _recovering(chain, SUDO, signer, FRIENDS[:3])),
+    "cancel": (CANCEL_SUDO_KEY, _as_proxy_of_sudo_key),
+    "as_recovered": (AS_SUDO_KEY_REMARK, _as_proxy_of_sudo_key),
+    "apply_authorized_upgrade": (APPLY_UPGRADE, lambda chain, signer: chain.storage.__setitem__(
+        AUTHORIZED_UPGRADE_KEY, "0x" + "11" * 33)),
+    "payout": (PAYOUT_0, lambda chain, signer: chain.storage.__setitem__(SPEND_0_KEY, "0x01")),
+}
+
+
+@pytest.mark.parametrize("allowed", [False, True], ids=["refused by the state", "allowed by the state"])
+@pytest.mark.parametrize("name", sorted(ALLOWED_BY))
+def test_what_an_outsider_asks_for_counts_only_where_the_blocks_state_allows_it(config, tmp_path, name, allowed):
+    # force_batch succeeds whether or not the call it wraps does, so the extrinsic's events
+    # show only that it was applied.
+    call, allow = ALLOWED_BY[name]
+    signer = ATTEMPTERS[0]
+    chain = FakeChain(head=9001, blocks={}, state_at={9000, 9001}, events_hex=_succeeded(4))
+    _recoverable_by(chain, SUDO, FRIENDS)
+    if allowed:
+        allow(chain, signer)
+    chain.extra[9001] = [signed_extrinsic(_force_batch(call), signer)]
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(9000)
+    _drain(source)
+    [finding] = [f for f in store.findings() if f.key == "materios-preprod:9001:3"]
+    if allowed:
+        assert finding.severity == rules.CRITICAL
+    else:
+        assert finding.severity == rules.INFO and "cannot take effect from this origin" in finding.text
+
+
+def _own_recovery_naming(friend: bytes) -> bytes:
+    """Utility.batch_all(create_recovery([friend], 1, 0), remove_recovery()): the deposit is
+    reserved and returned in one extrinsic, so it costs the signer fees alone."""
+    create = bytes([24, 2]) + rules._compact(1) + friend + (1).to_bytes(2, "little") + bytes(4)
+    return bytes([8, 2]) + rules._compact(2) + create + bytes([24, 7])
+
+
+def test_an_outsider_naming_sudo_key_a_friend_of_its_own_recovery_never_pages_here(config, tmp_path):
+    # A friend in the signer's own recovery config gains power over the signer's account,
+    # never over Sudo.Key.
+    first, signer = 9000, ATTEMPTERS[0]
+    chain = FakeChain(head=first, blocks={}, state_at=set(range(first - 1, first + 11)), events_hex=_succeeded(4))
+    _recoverable_by(chain, SUDO, FRIENDS)
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(first - 1)
+    posts, clock = Posts(), [_at("2026-09-28T02:00:00")]
+    watch = _watch(config, store, [source], posts, clock)
+    for n in range(10):
+        chain.head = first + n
+        chain.extra[first + n] = [signed_extrinsic(_own_recovery_naming(SUDO), signer)]
+        for _ in range(6):
+            watch.cycle()
+            clock[0] += 1
+    created = [f for f in store.findings() if "Recovery.create_recovery" in f.text]
+    assert len(created) == 10 and {f.severity for f in created} == {rules.ALERT}
+    assert not [p for p in posts.payloads if "@here" in p["content"]]
+
+
+def _remarks(count: int) -> bytes:
+    """Utility.batch of ``count`` empty remarks; 20,000 of them are past the decode budget."""
+    return UTILITY_BATCH + rules._compact(count) + (bytes([0, 0]) + rules._compact(0)) * count
+
+
+PROXY = bytes([0xD7]) * 32
+
+
+@pytest.mark.parametrize("signer, severity", [
+    (ATTEMPTERS[0], rules.ALERT), (ATT, rules.ALERT), (FRIENDS[0], rules.CRITICAL), (RESCUER, rules.CRITICAL),
+    (PROXY, rules.CRITICAL)], ids=["stranger", "rescuer no friend vouched for", "friend", "vouched rescuer", "proxy"])
+def test_what_cannot_be_decoded_pages_critical_only_from_an_account_that_can_act_for_sudo_key(config, tmp_path,
+                                                                                             signer, severity):
+    chain = FakeChain(head=8000, blocks={}, state_at={7999, 8000})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    _recovering(chain, SUDO, ATT, [])
+    _recovering(chain, SUDO, RESCUER, FRIENDS[:3])
+    _as_proxy_of_sudo_key(chain, PROXY)
+    chain.extra[8000] = [signed_extrinsic(_remarks(20_000), signer)]
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(7999)
+    _drain(source)
+    [finding] = [f for f in store.findings() if ":undecoded" in f.key
+                 and f"signer {rules.render_account(signer)}" in f.text]
+    assert finding.severity == severity
+    assert (finding.group is None) == (severity == rules.CRITICAL)
 
 
 def test_a_proxy_acting_as_sudo_key_stays_watched_after_its_recovery_is_closed(config, tmp_path):

@@ -234,9 +234,9 @@ def test_a_block_filled_to_its_length_limit_is_read_within_the_decode_budget(dec
         assert found["2"].headline.endswith("Sudo.sudo > System.set_code")
         assert f"<{size} bytes blake2_256" in found["2"].render()
     else:
-        assert found["undecoded"].severity == rules.CRITICAL
-        assert found["undecoded"].details[0].startswith("extrinsic 2: ")
-        assert "DecodeBudgetExceeded" in found["undecoded"].details[0]
+        [line] = [d for d in found["ordinary"].details if d.startswith("extrinsic ")]
+        assert found["ordinary"].severity == rules.ALERT
+        assert line.startswith("extrinsic 2: ") and "DecodeBudgetExceeded" in line
     assert peak < 64 * 1024 * 1024
     assert decoder.values - before <= rules.DECODE_BUDGET
 
@@ -279,16 +279,20 @@ def test_a_blocks_inherents_are_decoded_before_any_signed_extrinsic_however_smal
     assert sum("undecodable" in e for e in extrinsics) == 10
 
 
-def test_what_the_budget_did_not_reach_pages_as_one_critical_finding_per_block(decoder, monkeypatch):
+def test_what_the_budget_did_not_reach_from_accounts_with_no_authority_pages_one_alert_per_block(decoder,
+                                                                                                monkeypatch):
+    # Any funded account can send an extrinsic the budget does not reach, and none of
+    # these signers can move custody or authority whatever it holds.
     monkeypatch.setattr(rules, "DECODE_BUDGET", 100)
     fillers = [signed_extrinsic(filler_call("keys", 1000 + i), STRANGER) for i in range(30)]
     extrinsics = decoder.extrinsics(_block("block_2029707.json")["extrinsics"] + fillers)
     [finding] = rules.classify_materios_block("materios-preprod", 2029707, extrinsics, lambda: None, None)
-    assert finding.key == "materios-preprod:2029707:undecoded"
-    assert finding.severity == rules.CRITICAL and finding.group == "materios-preprod unclassifiable"
-    assert finding.headline == "materios-preprod #2029707: 30 extrinsics could not be decoded"
-    assert finding.details[0].startswith("extrinsic 3: ") and "DecodeBudgetExceeded" in finding.details[0]
-    assert len(finding.details) == rules.MAX_UNDECODED_LINES + 1 and finding.details[-1] == "... 10 more"
+    assert finding.key == "materios-preprod:2029707:undecoded:ordinary"
+    assert finding.severity == rules.ALERT and finding.group == "materios-preprod unclassifiable"
+    assert finding.headline == ("materios-preprod #2029707: 30 extrinsics could not be decoded, signed by accounts "
+                                "with no authority")
+    assert finding.details[1].startswith("extrinsic 3: ") and "DecodeBudgetExceeded" in finding.details[1]
+    assert len(finding.details) == rules.MAX_UNDECODED_LINES + 2 and finding.details[-1] == "... 10 more"
 
 
 LEG_SIGNER = bytes.fromhex(_block(LEG_BLOCK)["extrinsics"][2][2:])[4:36]
@@ -326,7 +330,7 @@ def test_what_sudo_key_or_an_authority_signs_is_decoded_whatever_smaller_filler_
     assert found["2"].severity == rules.CRITICAL and found["2"].group is None
     assert "System.authorize_upgrade" in text
     assert ("multisig account is Sudo.Key" if signer == "authority" else "signed by Sudo.Key") in text
-    assert found["undecoded"].group == "materios-preprod unclassifiable"
+    assert found["ordinary"].group == "materios-preprod unclassifiable"
 
 
 def test_what_sudo_key_or_an_authority_signed_and_cannot_be_decoded_pages_alone_per_signer(decoder, monkeypatch):
@@ -346,7 +350,7 @@ def test_what_sudo_key_or_an_authority_signed_and_cannot_be_decoded_pages_alone_
     assert legs.details[0].startswith(f"extrinsic 2: signer {signer}: 281 bytes blake2_256 0x")
     assert legs.details[1].startswith(f"extrinsic {filler + 1}: signer {signer}: ")
     assert all("DecodeBudgetExceeded" in line for line in legs.details)
-    grouped = found["materios-preprod:1829210:undecoded"]
+    grouped = found["materios-preprod:1829210:undecoded:ordinary"]
     assert grouped.group == "materios-preprod unclassifiable"
     assert any(line.startswith(f"extrinsic {filler}: signer {rules.render_account(STRANGER)}: 271 bytes")
                for line in grouped.details)
@@ -779,20 +783,56 @@ def test_an_ordinary_account_creating_its_own_recovery_is_an_alert():
         assert finding.severity == rules.ALERT
 
 
-@pytest.mark.parametrize(
-    "ext, authorities",
-    [
-        (_signed(ALICE, "Recovery", "initiate_recovery", account=SUDO_KEY), frozenset()),
-        (_signed(ALICE, "Recovery", "create_recovery", friends=[BOB], threshold=1, delay_period=0),
-         frozenset({BOB})),
-        (_signed(BOB, "Recovery", "vouch_recovery", lost=ALICE, rescuer=BOB), frozenset({BOB})),
-    ],
-)
-def test_recovery_that_touches_an_authority_account_is_critical(ext, authorities):
-    [finding] = rules.classify_materios_block("materios-preprod", 9, [ext], read_events=lambda: SUCCEEDED,
-                                              sudo_key=rules.account_bytes(SUDO_KEY),
-                                              authorities=frozenset(map(rules.account_bytes, authorities)))
+@pytest.mark.parametrize("call", [
+    _call("Recovery", "vouch_recovery", lost=ALICE, rescuer=BOB),
+    _call("Recovery", "create_recovery", friends=[ALICE], threshold=1, delay_period=0),
+    _call("Recovery", "initiate_recovery", account=ALICE),
+], ids=["vouch", "create", "initiate"])
+def test_what_an_authority_account_does_in_any_recovery_is_critical(call):
+    [finding] = rules.classify_materios_block("materios-preprod", 9, [{"address": BOB, "call": call}],
+                                              read_events=lambda: SUCCEEDED, sudo_key=rules.account_bytes(SUDO_KEY),
+                                              authorities=frozenset({rules.account_bytes(BOB)}))
     assert finding.severity == rules.CRITICAL
+
+
+@pytest.mark.parametrize("call", [
+    _call("Recovery", "initiate_recovery", account=SUDO_KEY),
+    _call("Recovery", "create_recovery", friends=[SUDO_KEY], threshold=1, delay_period=0),
+    _call("Recovery", "close_recovery", rescuer=SUDO_KEY),
+], ids=["initiate", "create naming Sudo.Key a friend", "close naming Sudo.Key the rescuer"])
+def test_a_recovery_an_outsider_starts_or_configures_gives_it_no_power_over_sudo_key(call):
+    # A recovery of Sudo.Key does nothing until Sudo.Key's friends vouch for it, and a
+    # recovery config or its closing concerns the caller's own account.
+    [finding] = _classify_extrinsics([{"address": ALICE, "call": call}], events=SUCCEEDED)
+    assert finding.severity == rules.ALERT
+
+
+def _state(value):
+    """A read of the block's state in which Sudo.Key held throughout and every other fact
+    asked for is ``value``."""
+    return lambda wanted: {fact: rules.account_bytes(SUDO_KEY) if fact == rules.SUDO else value for fact in wanted}
+
+
+BATCH_APPLIED = {0: ["Utility.ItemFailed", "Utility.BatchCompleted", "System.ExtrinsicSuccess"]}
+ASKED_FOR = {
+    "vouch": _call("Recovery", "vouch_recovery", lost=SUDO_KEY, rescuer=BOB),
+    "claim": _call("Recovery", "claim_recovery", account=SUDO_KEY),
+    "cancel": _call("Recovery", "cancel_recovered", account=SUDO_KEY),
+    "as_recovered": _call("Recovery", "as_recovered", account=SUDO_KEY, call=_call("Sudo", "sudo", call=SET_CODE)),
+    "apply_authorized_upgrade": _call("System", "apply_authorized_upgrade", code="0x00"),
+    "payout": _call("Treasury", "payout", index=0),
+}
+
+
+@pytest.mark.parametrize("events", [BATCH_APPLIED, None], ids=["events read", "events unread"])
+@pytest.mark.parametrize("name", sorted(ASKED_FOR))
+def test_a_call_the_blocks_state_does_not_allow_from_its_origin_goes_to_the_digest(name, events):
+    ext = {"address": ALICE, "call": _call("Utility", "force_batch", calls=[ASKED_FOR[name]])}
+    for allowed, severity in ((False, rules.INFO), (True, rules.CRITICAL)):
+        [finding] = rules.classify_materios_block("materios-preprod", 9, [ext], lambda: events,
+                                                  rules.account_bytes(SUDO_KEY), read_state=_state(allowed))
+        assert finding.severity == severity, allowed
+        assert ("cannot take effect from this origin" in finding.render()) != allowed
 
 
 def test_an_ordinary_signers_findings_share_a_group_and_an_authoritys_page_alone(decoder):

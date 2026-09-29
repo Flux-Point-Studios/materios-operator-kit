@@ -7,7 +7,7 @@ custody and authority move it can see. It holds no signing key and submits nothi
 
 | Source | CRITICAL (immediate, `@here`) | ALERT (immediate) | INFO (daily digest) |
 |---|---|---|---|
-| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, a `Recovery` call that names `Sudo.Key` or an authority account, `Sudo.Key` changing, any change in the recovery of `Sudo.Key` or an authority (below), a `RuntimeEnvironmentUpdated` header digest, the runtime code's hash changing, a new genesis (chain reset), an extrinsic the runtime metadata cannot decode, the block's decode budget does not reach, or the classifier cannot read | any other `Recovery` call, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below); the recovery state as first read |
+| Materios finalized blocks | any `Sudo` call, a multisig leg whose account is `Sudo.Key`, anything signed by `Sudo.Key`, `System` code and storage changes, `Balances`/`Vesting` force calls, `Treasury` spends, `Grandpa.note_stalled`, main-chain script changes, root-gated `OrinqReceipts` levers, any `RootTimelock` call, any `Recovery` call from `Sudo.Key` or an authority account, a vouch, claim, `cancel_recovered` or `as_recovered` that names one and could take effect (below), `Sudo.Key` changing, any change in the recovery of `Sudo.Key` or an authority other than a recovery started (below), a `RuntimeEnvironmentUpdated` header digest, the runtime code's hash changing, a new genesis (chain reset), an extrinsic the classifier cannot read, and one the runtime metadata cannot decode, or the block's decode budget does not reach, that is unsigned or signed by an account that can act for `Sudo.Key` or an authority | any other `Recovery` call, a recovery of `Sudo.Key` or an authority started with no friend's vouch, an extrinsic that cannot be decoded from any other account, session key changes, equivocation reports, native token transfers, committee membership changes, a call in neither the severity table nor the routine list | committee rotations with unchanged membership; an attempt that could not take effect (below); the recovery state as first read |
 | Cardano custody addresses | any outflow, collateral a failed script consumed included | any inflow | reads as a reference input |
 | Cardano contract addresses | a spend, at the address's `severity` | a spend, at the address's `severity`; any payment in | |
 | Cardano policies | mint or burn, as configured | as configured | |
@@ -19,10 +19,14 @@ headline names the most severe call's path (`Sudo.sudo > Utility.batch_all >
 System.set_code`), and every privileged call is listed with its own arguments, most
 severe first, ahead of the tree, so a page cut to Discord's length still shows what
 matters. Calls nested as deep as a runtime decodes them (`MAX_EXTRINSIC_DEPTH`, 256)
-are decoded and named; an extrinsic that still cannot be decoded may hide any call, so
-it pages CRITICAL, in one finding per block that lists each such extrinsic's signer, size
-and hash. Those signed by `Sudo.Key` or a configured authority page alone, in one
-finding per signer and block. Every call of the
+are decoded and named. An extrinsic that still cannot be decoded may hide any call its
+signer can make, so it is paged in a finding that lists each such extrinsic's signer,
+size and hash. Those signed by `Sudo.Key`, a configured authority, or an account that
+can act in the recovery of one (a friend, a proxy acting as one, or a rescuer its
+friends have vouched for up to its threshold, read at the head) page CRITICAL alone, one
+finding per signer and block. Unsigned ones, which only the runtime admits, page
+CRITICAL grouped. Those signed by anyone else page one grouped ALERT a block: no state
+lets such a signer move custody or authority, and any funded account can send one. Every call of the
 pinned runtime is in the severity table or the routine list, and a test holds it there;
 a call a runtime upgrade adds pages as an ALERT until it is classified. Text from the
 chain is rendered as JSON with every backtick replaced, so it can never close the
@@ -52,16 +56,24 @@ signer, is `Sudo.Key` or a configured authority. Naming an authority as the targ
 not count. An event from the `Sudo` pallet proves its caller held the
 key at that block, so the call pages whatever key the watcher last read.
 
-Any funded account can push a block's events past the decode budget, so a block's
-events are not what decides whether an ordinary account's attempt could have taken
-effect. When an extrinsic's events cannot be read, the watcher reads `Sudo.Key`, and
-`Recovery.Proxy` of every account that calls `as_recovered`, at the block's parent and
-at the block, in storage queries of at most 1,000 keys. A value that is the same at
-both held throughout the block, so a `Sudo` call from any other account, and an `as_recovered`
-whose caller is not the proxy of the account it names, could not take effect and goes
+An ordinary account's call can take effect only where the chain's state lets it: a
+`Sudo` call only for `Sudo.Key`; `as_recovered`, and `cancel_recovered` of a watched
+account, only for the proxy of the account it names; a vouch for the recovery of
+`Sudo.Key` or an authority only from one of its friends; a claim only from a rescuer its
+friends have vouched for up to its threshold; `System.apply_authorized_upgrade` only
+once Root has authorized an upgrade; `Treasury.payout` only for a spend Root approved.
+The extrinsic's events do not settle this: any funded account can push a block's events
+past the decode budget, and `Utility.force_batch` succeeds whether or not the calls it
+wraps do. So for such a call that did not fail outright, the watcher reads the storage
+that decides it (`Sudo.Key`, `Recovery.Proxy`, `Recovery.Recoverable`,
+`Recovery.ActiveRecoveries`, `System.AuthorizedUpgrade`, `Treasury.Spends`) at the
+block's parent and at the block, in storage queries of at most 1,000 keys. `Sudo.Key`
+must be the same at both to prove anything; for the rest either state letting the call
+through is enough to count it. A call the state rules out could not take effect and goes
 to the digest with everything it wraps. A root-gated call from an account needs no
-proof. What the state cannot rule out pages, grouped per source rather than per
-signer; an authority's attempts always page alone.
+proof. What the state cannot rule out, as when it is pruned, pages, grouped per source
+rather than per signer when the events are unread; an authority's attempts always page
+alone.
 
 `Sudo.Key` has a recovery config on the chain, so its friends can take it over together
 with a rescuer after a delay. Each poll reads, at the finalized head, `Recovery.Recoverable`
@@ -75,15 +87,16 @@ added, changed or removed, pages CRITICAL alone with the friends, threshold, del
 rescuer and vouches decoded, a removed entry as it last stood. The one exception is a
 poll whose only changes are recoveries started with no friend's vouch yet: any funded
 account can start one each poll, and it can do nothing until friends vouch, so those
-page CRITICAL in the group `<source> recovery started`, all pending ones in one message
-behind the pages that go alone. Entries are decoded only
-when they change, so each recovery of `Sudo.Key` a stranger starts costs a poll one
-more key to read and nothing to decode. What the friends and rescuers it names sign
+page as an ALERT in the group `<source> recovery started`. Each entry is decoded once,
+when it is first read with its value, so each recovery of `Sudo.Key` a stranger starts
+costs a poll one more key to read and one decode. What the friends and rescuers it names sign
 decodes ahead of other accounts' extrinsics (below), but none of them counts as an
 authority: any funded account becomes a rescuer of `Sudo.Key` by starting a recovery of
-it for a deposit. Their attempts are judged by their outcome like any other account's,
-and a vouch, claim or `as_recovered` naming `Sudo.Key` or an authority pages CRITICAL
-once it can have taken effect. An authority acting as the rescuer of some other account
+it for a deposit. Their attempts are judged like any other account's, and a vouch, claim,
+`cancel_recovered` or `as_recovered` naming `Sudo.Key` or an authority pages CRITICAL once
+it can have taken effect (above). Starting a recovery, and naming `Sudo.Key` as a friend in
+one's own recovery config, give no power over `Sudo.Key` and page as an ALERT. An authority
+acting as the rescuer of some other account
 is paged from its own extrinsics, and from its `Recovery.Proxy` once it claims.
 
 ## Surrender-pool coverage
@@ -294,9 +307,10 @@ message through the webhook to prove delivery end to end.
   everyone else's, smallest first within each. A large extrinsic cannot spend what the
   inherents and a small privileged call need, and filler cannot push a friend's vouch
   out. Anyone can become a rescuer, so rescuers' filler can push out another rescuer's
-  claim, though never a friend's vouch or an authority's leg; a claim that takes effect
-  still pages, as a change in `Recovery.Proxy`. What a budget does not reach pages
-  CRITICAL with its signer and the cursor moves on. Events past the budget are left
+  claim, though never a friend's vouch or an authority's leg; that claim still pages
+  CRITICAL once its friends have vouched for it (above), and as a change in
+  `Recovery.Proxy` once it takes effect. What a budget does not reach pages with its
+  signer, at the severity above, and the cursor moves on. Events past the budget are left
   unread, and the block's state decides what its attempts could do (above). A
   Materios poll ends after the block that brings it to the budget, so the Cardano
   sources are read between expensive blocks. Every call tree is walked once, holds at

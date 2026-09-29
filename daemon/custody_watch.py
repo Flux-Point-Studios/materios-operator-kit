@@ -571,6 +571,7 @@ KEYS_PAGE = 1000
 
 
 PROXY_PREFIX = "0x" + (RECOVERY + xxh128(b"Proxy")).hex()
+AUTHORIZED_UPGRADE_STORAGE = "0x" + (xxh128(b"System") + xxh128(b"AuthorizedUpgrade")).hex()
 
 
 def recovery_proxy_key(rescuer: bytes) -> str:
@@ -586,6 +587,48 @@ def _recoverable_key(account: bytes) -> str:
 def _active_prefix(lost: bytes) -> str:
     """Recovery.ActiveRecoveries(lost, *): every recovery of ``lost`` under way, by rescuer."""
     return "0x" + (RECOVERY + xxh128(b"ActiveRecoveries") + two_x64_concat(lost)).hex()
+
+
+def _active_key(lost: bytes, rescuer: bytes) -> str:
+    """Recovery.ActiveRecoveries(lost, rescuer): the rescuer's recovery of lost and its vouches."""
+    return _active_prefix(lost) + two_x64_concat(rescuer).hex()
+
+
+def _spend_key(index: int) -> str:
+    """Treasury.Spends(index): an approved treasury spend."""
+    return "0x" + (xxh128(b"Treasury") + xxh128(b"Spends") + two_x64_concat(index.to_bytes(4, "little"))).hex()
+
+
+def _fact_keys(fact: tuple) -> list[str]:
+    """The storage that decides ``fact`` (see ``rules.SUDO``)."""
+    if fact == rules.SUDO:
+        return [SUDO_KEY_STORAGE]
+    if fact == rules.UPGRADE:
+        return [AUTHORIZED_UPGRADE_STORAGE]
+    kind, *accounts = fact
+    if kind == "proxy":
+        return [recovery_proxy_key(accounts[0])]
+    if kind == "friend":
+        return [_recoverable_key(accounts[0])]
+    if kind == "claim":
+        return [_active_key(*accounts), _recoverable_key(accounts[0])]
+    return [_spend_key(accounts[0])]
+
+
+def _allows(fact: tuple, state: dict[str, str | None], decoder: rules.RuntimeDecoder) -> bool:
+    """Whether ``state`` lets the call that ``fact`` guards take effect."""
+    values = [state.get(key) for key in _fact_keys(fact)]
+    if not all(values):
+        return False
+    kind = fact[0]
+    if kind == "proxy":
+        return bytes.fromhex(values[0][2:]) == fact[2]
+    if kind == "friend":
+        return fact[2] in rules.recovery_friends(decoder.storage("Recovery", "Recoverable", values[0]))
+    if kind == "claim":
+        return rules.vouched(decoder.storage("Recovery", "ActiveRecoveries", values[0]),
+                             decoder.storage("Recovery", "Recoverable", values[1]))
+    return True
 
 
 def _trailing_account(key: str) -> bytes:
@@ -622,8 +665,12 @@ class MateriosSource:
         self._decoders: dict[tuple[str, str], rules.RuntimeDecoder] = {}
         self._decoder: rules.RuntimeDecoder | None = None
         self._genesis: str | None = None
-        # The recovery entries last read, with the friends and the rescuers they name.
-        self._recovering: tuple[dict[str, list], tuple[frozenset[bytes], frozenset[bytes]]] | None = None
+        # The recovery entries last read, with the friends, the rescuers and the empowered
+        # accounts they name.
+        self._recovering: tuple[dict[str, list], tuple[frozenset[bytes], ...]] | None = None
+        # Each recovery entry as last decoded, by runtime code, item and value, so an entry
+        # is decoded once however many polls read it.
+        self._decoded: dict[tuple[str, str, str], tuple[object, Exception | None]] = {}
 
     @property
     def position(self) -> str:
@@ -741,15 +788,20 @@ class MateriosSource:
         return code
 
     def _recovery(self, head_hash: str, head: int, sudo_key: bytes | None, code: str,
-                  now: float) -> tuple[frozenset[bytes], frozenset[bytes]]:
+                  now: float) -> tuple[frozenset[bytes], frozenset[bytes], frozenset[bytes]]:
         """Read at the finalized head who can recover Sudo.Key or a configured authority,
         who is recovering one, and who may already act as one or as whom one may act, and
         page any change. Returns those friends, then those rescuers, whose extrinsics
         decode ahead of other accounts' but count as nobody's authority: any funded
-        account can start a recovery of Sudo.Key. Entries are decoded only when they change."""
-        entries = self._recovery_entries(rules.accountable(sudo_key, self._authorities), head_hash)
+        account can start a recovery of Sudo.Key. Then the empowered among them, who can
+        act in such a recovery: the friends, each proxy acting as a watched account, and
+        each rescuer its friends have vouched for up to its threshold. Each entry is
+        decoded once, when it is first read with its value."""
+        watched = rules.accountable(sudo_key, self._authorities)
+        entries = self._recovery_entries(watched, head_hash)
         if self._recovering is not None and self._recovering[0] == entries:
             return self._recovering[1]
+        decoded: dict[tuple[str, str, str], tuple[object, Exception | None]] = {}
 
         def who(account: bytes) -> str:
             role = ", Sudo.Key" if account == sudo_key else ", authority" if account in self._authorities else ""
@@ -758,22 +810,34 @@ class MateriosSource:
         def read(entry: list) -> tuple[str, object]:
             """An entry's line, and its value decoded, or None when it does not decode."""
             item, accounts, value = entry[0], tuple(bytes.fromhex(a) for a in entry[1]), entry[2]
-            decoder = self._decoder_for(code, [head_hash])
-            try:
-                decoded = decoder.storage("Recovery", item, value)
-            except Exception as e:  # a runtime may change the layout; the entry still pages, as its hash
+            memo = (code, item, value)
+            if memo not in self._decoded:
+                try:
+                    self._decoded[memo] = (self._decoder_for(code, [head_hash]).storage("Recovery", item, value), None)
+                except Exception as e:  # a runtime may change the layout; the entry still pages, as its hash
+                    self._decoded[memo] = (None, e)
+            decoded[memo] = self._decoded[memo]
+            value_decoded, error = decoded[memo]
+            if error is not None:
                 return (f"Recovery.{item}({', '.join(who(a) for a in accounts)}): "
-                        f"{rules.hex_digest(value)}, not decodable: {type(e).__name__}: {e}"[:400]), None
-            return rules.describe_recovery(item, accounts, decoded, who), decoded
+                        f"{rules.hex_digest(value)}, not decodable: {type(error).__name__}: {error}"[:400]), None
+            return rules.describe_recovery(item, accounts, value_decoded, who), value_decoded
 
         self._recovery_change(entries, read, head, now)
-        friends: set[bytes] = set()
+        configs = {bytes.fromhex(e[1][0]): read(e)[1] for e in entries.values() if e[0] == "Recoverable"}
+        friends = {f for config in configs.values() if config is not None for f in rules.recovery_friends(config)}
+        empowered = set(friends)
         for entry in entries.values():
-            decoded = read(entry)[1] if entry[0] == "Recoverable" else None
-            if decoded is not None:
-                friends.update(rules.recovery_friends(decoded))
+            accounts = [bytes.fromhex(a) for a in entry[1]]
+            if entry[0] == "Proxy" and bytes.fromhex(entry[2][2:]) in watched:
+                empowered.add(accounts[0])
+            elif entry[0] == "ActiveRecoveries" and accounts[0] in configs:
+                active, config = read(entry)[1], configs[accounts[0]]
+                if active is None or config is None or rules.vouched(active, config):
+                    empowered.add(accounts[1])
         rescuers = frozenset(bytes.fromhex(entry[1][-1]) for entry in entries.values() if entry[0] != "Recoverable")
-        self._recovering = (entries, (frozenset(friends), rescuers))
+        self._decoded = decoded
+        self._recovering = (entries, (frozenset(friends), rescuers, frozenset(empowered)))
         return self._recovering[1]
 
     def _recovery_entries(self, watched: frozenset[bytes], at_hash: str) -> dict[str, list]:
@@ -821,13 +885,13 @@ class MateriosSource:
             lines = ([f"+ {current[k][0]}" for k in added] + [f"~ {current[k][0]}" for k in changed]
                      + [f"- {read(previous[k])[0]}" for k in removed])
             # Any funded account can start a recovery of Sudo.Key, once a poll; until a
-            # friend vouches it can do nothing, so such starts page grouped, behind what
-            # pages alone.
+            # friend vouches it can do nothing, so such starts page as an ALERT, grouped
+            # behind what pages alone.
             started = not changed and not removed and all(
                 entries[k][0] == "ActiveRecoveries" and current[k][1] is not None and not current[k][1]["friends"]
                 for k in added)
             self._store.add(rules.Finding(
-                rules.CRITICAL, f"{self.name}:recovery:{head}",
+                rules.ALERT if started else rules.CRITICAL, f"{self.name}:recovery:{head}",
                 f"{self.name}: a recovery of Sudo.Key or an authority started (seen at finalized #{head})" if started
                 else f"{self.name}: recovery of Sudo.Key or an authority changed (seen at finalized #{head})",
                 details=tuple(lines), group=f"{self.name} recovery started" if started else None,
@@ -894,35 +958,49 @@ class MateriosSource:
             values.update(changes["changes"])
         return values
 
-    def _dispatch_facts(self, parent_hash: str, block_hash: str, rescuers: frozenset[bytes]) -> dict | None:
-        """Sudo.Key and each rescuer's Recovery.Proxy, for those that held one value at
-        both the block's parent and the block, so none changed inside it; None once the
-        node has pruned either state."""
-        keys = {rules.SUDO: SUDO_KEY_STORAGE, **{rules.proxy_fact(r): recovery_proxy_key(r) for r in rescuers}}
+    def _dispatch_facts(self, decoder: rules.RuntimeDecoder, parent_hash: str, block_hash: str,
+                        wanted: frozenset) -> dict | None:
+        """The facts ``wanted`` (see ``rules.SUDO``) as the state at the block's parent and at
+        the block decides them, read in storage queries of at most KEYS_PAGE keys: Sudo.Key
+        when it held one value at both, and every other fact True when either state lets
+        the call it guards take effect. A fact whose entries do not decode stays undecided,
+        so its call counts. None once the node has pruned either state."""
+        keys = sorted({key for fact in wanted for key in _fact_keys(fact)})
         try:
-            before = self._storage_at(list(keys.values()), parent_hash)
-            after = self._storage_at(list(keys.values()), block_hash)
+            states = (self._storage_at(keys, parent_hash), self._storage_at(keys, block_hash))
         except SubstrateRequestException:
             return None
-        return {fact: bytes.fromhex(after[key][2:]) if after.get(key) else None
-                for fact, key in keys.items() if before.get(key) == after.get(key)}
+        facts: dict = {}
+        for fact in wanted:
+            if fact == rules.SUDO:
+                before, after = (state.get(SUDO_KEY_STORAGE) for state in states)
+                if before == after:
+                    facts[fact] = bytes.fromhex(after[2:]) if after else None
+                continue
+            try:
+                facts[fact] = any(_allows(fact, state, decoder) for state in states)
+            except Exception as e:  # scalecodec raises any type on a layout it cannot place
+                logger.warning("%s: %s undecided at %s: %s: %s", self.name, fact[0], block_hash, type(e).__name__, e)
+        return facts
 
     def _block(self, number: int, block_hash: str, sudo_key: bytes | None,
-               recovering: tuple[frozenset[bytes], ...], now: float) -> int:
+               recovering: tuple[frozenset[bytes], frozenset[bytes], frozenset[bytes]], now: float) -> int:
         """Classify one block and commit its findings with the cursor; returns the values
-        its extrinsics and events decoded into. What the accounts in ``recovering`` sign
-        decodes ahead of other accounts' extrinsics, from the budget they share."""
+        its extrinsics and events decoded into. What the friends and rescuers in
+        ``recovering`` sign decodes ahead of other accounts' extrinsics, from the budget
+        they share; the empowered among them page what cannot be decoded CRITICAL."""
         block = self._rpc("chain_getBlock", [block_hash])["block"]
         header = block["header"]
         if self._decoder is None:
             self._decoder = self._load_decoder(header["parentHash"])
         decoder = self._decoder
         before = decoder.values
+        friends, rescuers, empowered = recovering
         extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, self._authorities),
-                                        recovering)
+                                        (friends, rescuers))
         findings = rules.classify_materios_block(
             self.name, number, extrinsics, lambda: self._events(block_hash, decoder), sudo_key, self._authorities,
-            lambda rescuers: self._dispatch_facts(header["parentHash"], block_hash, rescuers))
+            lambda wanted: self._dispatch_facts(decoder, header["parentHash"], block_hash, wanted), empowered)
         if rules.runtime_upgraded(header):
             findings.append(rules.runtime_changed(self.name, number))
         try:

@@ -651,15 +651,24 @@ def _indent(depth: int) -> str:
 
 
 # What must hold for a call to dispatch, as (fact, value): the call is blocked once a
-# block's state proves the fact holds another value. SUDO is Sudo.Key; ("proxy", rescuer)
-# is Recovery.Proxy(rescuer), the account the rescuer may act as. NEVER, a root-gated call
-# reached from an account, needs no proof: Root comes only from Sudo.
+# block's state proves the fact holds another value. SUDO is Sudo.Key, held throughout the
+# block. Every other fact is True when the state at the block's parent or at the block
+# lets the call take effect from its origin:
+#   ("proxy", rescuer, lost)   Recovery.Proxy(rescuer) is lost
+#   ("friend", lost, friend)   friend is among the friends in lost's recovery config
+#   ("claim", lost, rescuer)   rescuer's recovery of lost has its threshold of vouches
+#   UPGRADE                    System.AuthorizedUpgrade holds an upgrade
+#   ("spend", index)           Treasury.Spends(index) holds an approved spend
+# NEVER, a root-gated call reached from an account, needs no proof: Root comes only from Sudo.
 SUDO = ("sudo",)
+UPGRADE = ("upgrade",)
 NEVER = (("never",), None)
-
-
-def proxy_fact(rescuer: bytes) -> tuple:
-    return ("proxy", rescuer)
+# The argument naming the account each Recovery call can move power over: a friend's
+# vouch, a rescuer's claim, and a proxy acting as, or giving up, the account it recovered.
+# Starting a recovery, and a caller's own recovery config, move none over the account
+# they name.
+_RECOVERY_TARGET = {"vouch_recovery": "lost", "claim_recovery": "account", "cancel_recovered": "account",
+                    "as_recovered": "account"}
 
 
 @dataclass(frozen=True)
@@ -757,12 +766,36 @@ def _severity(module: str, function: str, args: dict, origin, inner, tree: _Tree
         return CRITICAL
     severity = _CALL_SEVERITY.get((module, function), _CALL_SEVERITY.get((module, _ANY)))
     if module == "Recovery" and severity == ALERT:
-        named = [origin, *(_account(args.get(n)) for n in ("account", "lost", "rescuer"))]
-        friends = args.get("friends")
-        named += [_account(f) for f in friends] if isinstance(friends, list) else []
-        if any(isinstance(a, bytes) and a in tree.authority for a in named):
+        target = _account(args.get(_RECOVERY_TARGET.get(function, "")))
+        if any(isinstance(a, bytes) and a in tree.authority for a in (origin, target)):
             return CRITICAL
     return severity
+
+
+def _dispatch_conditions(module: str, function: str, args: dict, origin: bytes, watched: frozenset[bytes]
+                         ) -> frozenset:
+    """What the block's state must allow for this call, from an account's origin, to take
+    effect: Sudo.Key for Sudo, the recovery relationship a Recovery call acts through, or
+    the approval Root gave to what it carries out."""
+    if (module, function) in _ROOT_GATED:
+        return frozenset({NEVER})
+    if module == "Sudo":
+        return frozenset({(SUDO, origin)})
+    if (module, function) == ("System", "apply_authorized_upgrade"):
+        return frozenset({(UPGRADE, True)})
+    if (module, function) == ("Treasury", "payout"):
+        index = args.get("index")
+        return frozenset({(("spend", index), True)}) if isinstance(index, int) and 0 <= index < 1 << 32 else frozenset()
+    if module != "Recovery":
+        return frozenset()
+    lost = _account(args.get(_RECOVERY_TARGET.get(function, "")))
+    if (function == "as_recovered" and lost is not None) or (function == "cancel_recovered" and lost in watched):
+        return frozenset({(("proxy", origin, lost), True)})
+    if function == "vouch_recovery" and lost in watched:
+        return frozenset({(("friend", lost, origin), True)})
+    if function == "claim_recovery" and lost in watched:
+        return frozenset({(("claim", lost, origin), True)})
+    return frozenset()
 
 
 # Wrappers whose inner origin follows from the outer one alone. Any other wrapper
@@ -782,24 +815,17 @@ def _abridged(path: tuple[str, ...]) -> str:
 
 def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...], conditions: frozenset,
           proven: bool) -> None:
-    """Record ``call`` and every call it wraps. From an account's origin a root-gated call
-    never dispatches, a Sudo call dispatches only if that account holds Sudo.Key, and
-    Recovery.as_recovered, with everything it wraps, only if its Recovery.Proxy is the
-    account named; a subtree carries the conditions of every call above it. ``proven``
-    holds while the origin follows from the signer alone; only such an origin can make
-    an authority's attempt."""
+    """Record ``call`` and every call it wraps. From an account's origin a call dispatches
+    only where ``_dispatch_conditions`` hold, and a subtree carries the conditions of every
+    call above it. ``proven`` holds while the origin follows from the signer alone; only
+    such an origin can make an authority's attempt."""
     module, function = call["call_module"], call["call_function"]
     args = _args(call)
     path = (*parents, f"{module}.{function}")
     rendered = ", ".join(f"{k}={_render_value(v)}" for k, v in args.items() if not _holds_calls(v))
     tree.line(f"{_indent(depth)}{module}.{function}({rendered})")
     if isinstance(origin, bytes):
-        if (module, function) in _ROOT_GATED:
-            conditions = conditions | {NEVER}
-        elif module == "Sudo":
-            conditions = conditions | {(SUDO, origin)}
-        elif (module, function) == ("Recovery", "as_recovered") and (lost := _account(args.get("account"))):
-            conditions = conditions | {(proxy_fact(origin), lost)}
+        conditions = conditions | _dispatch_conditions(module, function, args, origin, tree.authority)
     inner = _inner_origin(module, function, args, origin, tree, depth)
     inner_proven = proven and (module, function) in _DERIVED
     if any(p and isinstance(o, bytes) and o in tree.authority for o, p in ((origin, proven), (inner, inner_proven))):
@@ -850,42 +876,64 @@ def _undecoded_line(index: int, ext: dict) -> str:
     return f"extrinsic {index}: {who}: {hex_digest(ext['undecodable'])}: {ext['error']}"
 
 
+def _failed(own: list[str]) -> bool:
+    return any(e.startswith("System.ExtrinsicFailed") for e in own)
+
+
 def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
                             read_events: Callable[[], dict[int, list[str]] | None], sudo_key: bytes | None,
                             authorities: frozenset[bytes] = frozenset(),
-                            read_state: Callable[[frozenset[bytes]], dict | None] = lambda rescuers: None,
-                            ) -> list[Finding]:
+                            read_state: Callable[[frozenset], dict | None] = lambda wanted: None,
+                            empowered: frozenset[bytes] = frozenset()) -> list[Finding]:
     """Findings for a block's extrinsics, each call tree walked once. ``read_events``
     returns the block's events by extrinsic, or None when they could not be read, and is
-    called once, only when an extrinsic has something to report. Without an extrinsic's
-    events its calls page as though they took effect, except those the chain's state
-    proves could not: ``read_state`` is called at most once, only then, with the
-    rescuers whose Recovery.Proxy matters, and returns the facts (SUDO, and
-    ("proxy", rescuer)) that held the same value at the block's parent and at the
-    block, or None when that state is gone too."""
+    called once, only when an extrinsic has something to report. An ordinary account's
+    calls count only where the block's state allows them from their origin:
+    ``read_state`` is called at most once, only when such calls did not fail outright,
+    with the facts they need (see ``SUDO``), and returns those the state at the block's
+    parent and at the block decides, or None when that state is gone. Without events,
+    what the state cannot rule out counts as though it took effect. ``empowered`` are the
+    accounts besides Sudo.Key and the authorities that can act in the recovery of one: its
+    friends, its proxies and the rescuers its friends have vouched for up to its threshold."""
     findings = []
     accounts = accountable(sudo_key, authorities)
-    # What cannot be read may hide any call, so it pages CRITICAL: grouped per source
-    # when anyone could have sent it, alone when Sudo.Key or an authority signed it. One
-    # finding a block for each, however many extrinsics it could not read.
+    # What cannot be read may hide any call. One finding a block per kind of signer: alone
+    # and CRITICAL per signer when it is Sudo.Key, an authority, or empowered; grouped and
+    # CRITICAL when unsigned or signed by no account, since only the runtime admits those;
+    # grouped and an ALERT for everyone else, whose calls no state lets move custody or
+    # authority, since any funded account can send one.
     unreadable = f"{chain} unclassifiable"
-    undecoded: dict[bytes | None, list[tuple[int, dict]]] = defaultdict(list)
+    by_signer: dict[bytes, list[tuple[int, dict]]] = defaultdict(list)
+    unsigned: list[tuple[int, dict]] = []
+    ordinary: list[tuple[int, dict]] = []
     for index, ext in enumerate(extrinsics):
         if "undecodable" in ext:
             signer = _envelope(ext["undecodable"])[1]
-            undecoded[signer if signer in accounts else None].append((index, ext))
-    for signer, items in undecoded.items():
+            (by_signer[signer] if signer in accounts | empowered else ordinary if signer else unsigned).append(
+                (index, ext))
+
+    def undecoded(items: list[tuple[int, dict]]) -> tuple[str, list[str]]:
         listed = [_undecoded_line(index, ext) for index, ext in items[:MAX_UNDECODED_LINES]]
         if len(items) > MAX_UNDECODED_LINES:
             listed.append(f"... {len(items) - MAX_UNDECODED_LINES:,} more")
-        what = f"{chain} #{number}: {plural(len(items), 'extrinsic')} could not be decoded"
-        if signer is None:
-            findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded", what, details=tuple(listed),
-                                    group=unreadable))
-        else:
-            role = "Sudo.Key" if signer == sudo_key else "an authority account"
-            findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded:{render_account(signer)}",
-                                    f"{what}, signed by {role}", details=tuple(listed), authority=True))
+        return f"{chain} #{number}: {plural(len(items), 'extrinsic')} could not be decoded", listed
+
+    for signer, items in by_signer.items():
+        what, listed = undecoded(items)
+        role = ("Sudo.Key" if signer == sudo_key else "an authority account" if signer in accounts
+                else "an account that can act in the recovery of Sudo.Key or an authority")
+        findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded:{render_account(signer)}",
+                                f"{what}, signed by {role}", details=tuple(listed), authority=True))
+    if unsigned:
+        what, listed = undecoded(unsigned)
+        findings.append(Finding(CRITICAL, f"{chain}:{number}:undecoded", what, details=tuple(listed),
+                                group=unreadable))
+    if ordinary:
+        what, listed = undecoded(ordinary)
+        findings.append(Finding(
+            ALERT, f"{chain}:{number}:undecoded:ordinary", f"{what}, signed by accounts with no authority",
+            details=("no signer is Sudo.Key, an authority account, or a friend, proxy or vouched rescuer in the "
+                     "recovery of one, so none can move custody or authority", *listed), group=unreadable))
     reported = []
     for index, ext in enumerate(extrinsics):
         if "undecodable" in ext:
@@ -902,27 +950,29 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
         if tree.sites or (signer is not None and signer == sudo_key):
             reported.append((index, ext, signer, tree))
     events = read_events() if reported else None
-    unverified = [tree for index, _, signer, tree in reported
-                  if (events is None or events.get(index) is None) and signer not in (None, sudo_key)
-                  and not tree.involved]
-    rescuers = frozenset(fact[1] for tree in unverified for site in tree.sites
-                         for fact, _ in site.conditions if fact[0] == "proxy")
-    facts = read_state(rescuers) if unverified else None
-    findings.extend(_report(chain, number, index, ext, signer, tree, events, facts)
+    wanted = set()
+    for index, _, signer, tree in reported:
+        # Every applied extrinsic has events, so one with none is as unverified as a block
+        # whose events could not be read.
+        own = None if events is None else events.get(index)
+        # pallet-sudo emits events only for a caller that passed its key check, whatever
+        # key this watcher last read.
+        if own is not None and any(e.startswith("Sudo.") for e in own):
+            tree.involved = True
+        if tree.involved or signer is None or (own is not None and _failed(own)):
+            continue
+        wanted.update(fact for site in tree.sites for fact, _ in site.conditions
+                      if fact != NEVER[0] and (own is None or fact != SUDO))
+    facts = read_state(frozenset(wanted)) if wanted else None
+    findings.extend(_report(chain, number, index, ext, signer, tree, None if events is None else events.get(index),
+                            facts)
                     for index, ext, signer, tree in reported)
     return findings
 
 
 def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None, tree: _Tree,
-            events: dict[int, list[str]] | None, facts: dict | None) -> Finding:
+            own: list[str] | None, facts: dict | None) -> Finding:
     address = ext.get("address")
-    # Every applied extrinsic has events, so one with none is as unverified as a block
-    # whose events could not be read.
-    own = None if events is None else events.get(index)
-    # pallet-sudo emits events only for a caller that passed its key check, whatever
-    # key this watcher last read.
-    if own is not None and any(e.startswith("Sudo.") for e in own):
-        tree.involved = True
     by_sudo = signer is not None and signer == tree.sudo_key
 
     if address is None:
@@ -942,13 +992,15 @@ def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None
         if ordinary:
             proof = facts or {}
             counted = [s for s in tree.sites if not s.blocked(proof)]
-            notes.append("Sudo.Key and Recovery.Proxy, the same at the block and its parent, decide what could "
-                         "take effect" if facts is not None else "state at the block unavailable too")
+            notes.append("the state at the block and its parent decides what could take effect" if facts is not None
+                         else "state at the block unavailable too")
     else:
         shown = [e for e in own if not e.startswith(EVENT_NOISE)]
         notes.append("result: " + (", ".join(shown) if shown else "no events"))
-        proof = {SUDO: tree.sudo_key}
-        if not tree.involved and any(e.startswith("System.ExtrinsicFailed") for e in own):
+        # A Sudo call that passes its key check leaves a Sudo event, so without one the head's
+        # Sudo.Key stands in; what else the state decides comes from the block.
+        proof = {**(facts or {}), SUDO: tree.sudo_key}
+        if not tree.involved and _failed(own):
             counted = []
             notes.append("dispatch failed: nothing took effect")
         elif not tree.involved:
@@ -993,6 +1045,12 @@ def describe_recovery(item: str, accounts: tuple[bytes, ...], value, who: Callab
 def recovery_friends(value) -> list[bytes]:
     """The friends a decoded ``Recoverable`` or ``ActiveRecoveries`` entry names."""
     return [account_bytes(f) for f in value["friends"]]
+
+
+def vouched(active, config) -> bool:
+    """Whether a decoded ``ActiveRecoveries`` entry has as many vouches as the decoded
+    ``Recoverable`` config of its lost account asks for, so its rescuer may claim."""
+    return len(active["friends"]) >= config["threshold"]
 
 
 def committee_of(extrinsics: list[dict]) -> tuple[tuple[str, ...], ...] | None:
