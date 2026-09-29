@@ -165,7 +165,10 @@ Pages go out in three lanes, most severe first within each:
 
 A group pages its first finding at once. After that it waits ten minutes
 (`GROUP_WINDOW`) and pages everything it gathered in one message, so an account that
-raises a finding in every block costs one message per ten minutes. All groups together
+raises a finding in every block costs one message per ten minutes. Only a CRITICAL
+opens that wait for the group's CRITICALs: a payment anyone can make into a contract
+address holds back no CRITICAL spend from it, and a group still pings `@here` at most
+once per ten minutes. All groups together
 take at most one post every 30 seconds, a fifth of the bucket below, however many
 accounts send them, and when more than three groups are ready they go out in one
 summary that names each group, its count and its first headline.

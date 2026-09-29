@@ -174,11 +174,14 @@ class Store:
 
     def unsent_pages(self, held_since: float = math.inf) -> list[StoredFinding]:
         """Unsent ALERTs and CRITICALs: an authority's first, then the rest that page alone,
-        then groups, most severe first within each. A group paged after ``held_since`` is
-        left in the database, however much it has gathered since."""
-        return self._rows("sent_at IS NULL AND severity >= ? AND (grp IS NULL OR grp NOT IN (SELECT grp FROM finding "
-                          "WHERE sent_at > ? AND grp IS NOT NULL AND severity >= ?))",
-                          (int(rules.ALERT), held_since, int(rules.ALERT)),
+        then groups, most severe first within each. A group's findings are left in the
+        database, however many it has gathered, while it has paged one as severe after
+        ``held_since``: its ALERTs after any page, its CRITICALs after a CRITICAL."""
+        paged = "SELECT grp FROM finding WHERE sent_at > ? AND grp IS NOT NULL AND severity >= ?"
+        return self._rows(f"sent_at IS NULL AND severity >= ? AND (grp IS NULL OR grp NOT IN ({paged}) "
+                          f"OR (severity >= ? AND grp NOT IN ({paged})))",
+                          (int(rules.ALERT), held_since, int(rules.ALERT), int(rules.CRITICAL), held_since,
+                           int(rules.CRITICAL)),
                           order="authority DESC, grp IS NOT NULL, severity DESC, seq")
 
     def unsent_routine(self) -> list[StoredFinding]:
@@ -261,6 +264,8 @@ AUTHORITY_RESERVE = 1
 # A group is what any funded account can cause. It pages its first finding at once and
 # then what it has gathered once per GROUP_WINDOW, and all groups together take at most
 # one post per GROUPED_INTERVAL, a fifth of the bucket, however many accounts send them.
+# Only a CRITICAL opens the window for a CRITICAL, so an ALERT anyone can raise holds no
+# CRITICAL of its group back, and a group pings at most once per window.
 GROUP_WINDOW = 600.0
 GROUPED_INTERVAL = 5 * PAGE_INTERVAL
 # Past this many groups ready at once, they all go out in one summary message.

@@ -161,6 +161,29 @@ def test_a_group_pages_its_first_finding_at_once_and_then_one_summary_per_window
                                  "**100 findings from materios-preprod signer X**"]
 
 
+def test_a_groups_first_critical_waits_for_no_window_its_alerts_opened(tmp_path):
+    # Anyone may pay into a contract address, which opens the window of that address's
+    # group; a spend from it that pages CRITICAL waits only for another CRITICAL's window.
+    store = cw.Store(str(tmp_path / "state.db"))
+    posts = Posts()
+    pager = cw.Pager(posts)
+    group = "cardano-preprod-partner-chain ReserveValidator"
+    started = _at("2026-09-28T02:00:00")
+
+    def found(key, severity, second):
+        store.add(rules.Finding(severity, key, f"headline {key}", group=group), started + second)
+        pager.flush(store, started + second)
+
+    found("paid-in", rules.ALERT, 0)
+    found("paid-in-again", rules.ALERT, 60)
+    found("spent", rules.CRITICAL, 90)
+    found("spent-again", rules.CRITICAL, 120)
+    assert _headlines(posts) == ["**headline paid-in**", "**headline spent**"]
+    assert posts.payloads[1]["content"].startswith("\U0001f6a8 **CRITICAL** @here")
+    pager.flush(store, started + 90 + cw.GROUP_WINDOW + 1)
+    assert _headlines(posts)[2:] == [f"**2 findings from {group}**"]
+
+
 def test_groups_from_fresh_accounts_take_at_most_one_post_in_five(tmp_path):
     # Each block brings a group from an account never seen before.
     store = cw.Store(str(tmp_path / "state.db"))
