@@ -1661,6 +1661,18 @@ def test_a_sudo_key_its_holder_may_have_handed_on_and_back_inside_a_block_proves
     assert acted.severity == rules.CRITICAL and f"signer {rules.render_account(x)}" in acted.text
 
 
+def test_an_authoritys_call_that_moves_neither_sudo_key_nor_a_proxy_leaves_the_proof_standing(config, tmp_path):
+    # A committee operator is an authority account; its session keys change neither
+    # Sudo.Key nor a Recovery.Proxy, so an outsider cannot time a failed Sudo call to it.
+    config = _leg_signer_an_authority(config)
+    chain = FakeChain(head=OVERFLOW_AT, blocks={}, state_at={OVERFLOW_AT - 1, OVERFLOW_AT})
+    set_keys = _encoded("PalletSession", "purge_keys")
+    _events_overflow(chain, [(set_keys, LEG_SIGNER), (SUDO_FORCE_TRANSFER, ATTEMPTERS[0])])
+    store, posts = _watched_block(config, tmp_path, chain, OVERFLOW_AT)
+    [attempt] = [f for f in store.findings() if "Balances.force_transfer" in f.text]
+    assert attempt.severity == rules.INFO and "cannot take effect from this origin" in attempt.text
+
+
 def test_a_sudo_key_no_holder_touched_in_the_block_still_proves_an_outsiders_attempt_inert(config, tmp_path):
     chain = FakeChain(head=OVERFLOW_AT, blocks={}, state_at={OVERFLOW_AT - 1, OVERFLOW_AT})
     _events_overflow(chain, [(_encoded("Sudo", "set_key", new={"Id": "0x" + NOBODY.hex()}), ATTEMPTERS[1]),

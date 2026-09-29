@@ -675,6 +675,7 @@ _RECOVERY_TARGET = {"vouch_recovery": "lost", "claim_recovery": "account", "canc
 class _Site:
     """A privileged call in an extrinsic's call tree, with its own arguments rendered;
     ``conditions`` for its dispatch, ``unlisted`` when it is in neither call table."""
+    call: str
     path: str
     args: str
     depth: int
@@ -842,7 +843,7 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
     if unlisted:
         severity = ALERT
     if severity is not None:
-        tree.sites.append(_Site(_abridged(path), rendered, depth, severity, conditions, unlisted))
+        tree.sites.append(_Site(path[-1], _abridged(path), rendered, depth, severity, conditions, unlisted))
     for value in args.values():
         for child in ([value] if _is_call(value) else value if isinstance(value, list) else []):
             if _is_call(child):
@@ -904,6 +905,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     friends, its proxies and the rescuers its friends have vouched for up to its threshold."""
     findings = []
     accounts = accountable(sudo_key, authorities)
+    powerful = accounts | empowered
     # What cannot be read may hide any call. One finding a block per kind of signer: alone
     # and CRITICAL per signer when it is Sudo.Key, an authority, or empowered; grouped and
     # CRITICAL when unsigned or signed by no account, since only the runtime admits those;
@@ -916,8 +918,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     for index, ext in enumerate(extrinsics):
         if "undecodable" in ext:
             signer = _envelope(ext["undecodable"])[1]
-            (by_signer[signer] if signer in accounts | empowered else ordinary if signer else unsigned).append(
-                (index, ext))
+            (by_signer[signer] if signer in powerful else ordinary if signer else unsigned).append((index, ext))
 
     def undecoded(items: list[tuple[int, dict]]) -> tuple[str, list[str]]:
         listed = [_undecoded_line(index, ext) for index, ext in items[:MAX_UNDECODED_LINES]]
@@ -973,9 +974,11 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     facts = read_state(frozenset(wanted)) if wanted else None
     # Sudo.Key or a Recovery.Proxy can change and change back inside a block, so the state
     # at its parent and at the block proves nothing about either once Sudo.Key, an
-    # authority or an empowered account acted in the block, or signed something unread.
-    powerful = accounts | empowered
-    if facts is not None and (by_signer or any(tree.involved or signer in powerful for _, _, signer, tree in reported)):
+    # authority or an empowered account made a Sudo or Recovery call in the block, or
+    # signed something unread.
+    if facts is not None and (by_signer or any(
+            (tree.involved or signer in powerful) and any(s.call.startswith(("Sudo.", "Recovery.")) for s in tree.sites)
+            for _, _, signer, tree in reported)):
         facts = {fact: value for fact, value in facts.items() if fact != SUDO and fact[0] != "proxy"}
     findings.extend(_report(chain, number, index, ext, signer, tree, None if events is None else events.get(index),
                             facts)
@@ -1022,8 +1025,8 @@ def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None
     # A proxy acting as Sudo.Key or an authority, a friend of its recovery, or a rescuer its
     # friends have vouched for is no outsider: what it does in that recovery pages alone.
     recovery = [fact for s in counted for fact in s.recovery_of(tree.authority)] if ordinary else []
-    empowered = bool(recovery) and (signer in tree.empowered or any(proof.get(f) is True for f in recovery))
-    if empowered:
+    in_recovery = bool(recovery) and (signer in tree.empowered or any(proof.get(f) is True for f in recovery))
+    if in_recovery:
         notes.append("acts in the recovery of Sudo.Key or an authority")
     # Calls that count lead, most severe and then innermost first, so the headline and
     # the top of a truncated page name the call that matters.
@@ -1040,9 +1043,9 @@ def _report(chain: str, number: int, index: int, ext: dict, signer: bytes | None
         key=f"{chain}:{number}:{index}",
         headline=f"{chain} #{number} extrinsic {index}: {top}",
         details=tuple(notes + sites + ["call tree:"] + lines),
-        group=(None if not ordinary or empowered else f"{chain} unverified" if own is None
+        group=(None if not ordinary or in_recovery else f"{chain} unverified" if own is None
                else f"{chain} signer {render_account(signer)}"),
-        authority=tree.involved or empowered,
+        authority=tree.involved or in_recovery,
     )
 
 

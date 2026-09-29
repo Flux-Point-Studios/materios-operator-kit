@@ -72,7 +72,8 @@ must be the same at both to prove anything; for the rest either state letting th
 through is enough to count it. `Sudo.Key` and a `Recovery.Proxy` can change and change
 back inside one block, so neither proves anything in a block where `Sudo.Key`, an
 authority, or a friend, proxy or vouched rescuer in the recovery of one (read at the
-head, below) made a privileged call or signed something that cannot be decoded. A call the state rules out could not take effect and goes to the
+head, below) made a `Sudo` or `Recovery` call or signed something that cannot be
+decoded. A call the state rules out could not take effect and goes to the
 digest with everything it wraps. A root-gated call from an account needs no proof. What
 the state cannot rule out, as when it is pruned, pages, grouped per source rather than
 per signer when the events are unread; an authority's attempts always page alone, and so
