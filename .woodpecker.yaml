@@ -71,6 +71,12 @@ variables:
       branch: main
 
 steps:
+  - name: test
+    image: python:3.12-slim@sha256:804ddf3251a60bbf9c92e73b7566c40428d54d0e79d3428194edf40da6521286
+    commands:
+      - pip install --no-cache-dir --root-user-action=ignore -r requirements.txt pytest
+      - python -B -m pytest -q -p no:cacheprovider
+
   - name: test-registry-token
     image: python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f
     commands:

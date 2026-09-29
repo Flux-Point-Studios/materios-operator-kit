@@ -1,0 +1,72 @@
+{
+ "network": "preprod",
+ "tx": {
+  "hash": "b9ebe459c3ba8e890f951dacb50cba6fa02cf099c6308c7abd26cf616bf26ca5",
+  "block": "5c49fd35b593da9e5f762051311bca90fe27806f25b88bab9a6ed6ad96995a61",
+  "block_height": 283100,
+  "block_time": 1668596062,
+  "slot": 12912862,
+  "index": 0,
+  "output_amount": [
+   {
+    "unit": "lovelace",
+    "quantity": "7000000"
+   }
+  ],
+  "fees": "3000000",
+  "deposit": "0",
+  "size": 392,
+  "invalid_before": null,
+  "invalid_hereafter": null,
+  "utxo_count": 2,
+  "withdrawal_count": 0,
+  "mir_cert_count": 0,
+  "delegation_count": 0,
+  "stake_cert_count": 0,
+  "pool_update_count": 0,
+  "pool_retire_count": 0,
+  "asset_mint_or_burn_count": 0,
+  "redeemer_count": 0,
+  "valid_contract": false,
+  "treasury_donation": "0"
+ },
+ "utxos": {
+  "hash": "b9ebe459c3ba8e890f951dacb50cba6fa02cf099c6308c7abd26cf616bf26ca5",
+  "inputs": [
+   {
+    "address": "addr_test1vqyaztht2clcm8x0s0r7n3hzqyz66g5cutkkxs9kdphwwgczq2j89",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "10000000"
+     }
+    ],
+    "tx_hash": "99c2ef8e340d5991b1acfcb2a3bf06145ab139f0b10837fb8862cf0ec2324d03",
+    "output_index": 0,
+    "data_hash": null,
+    "inline_datum": null,
+    "reference_script_hash": null,
+    "collateral": false,
+    "reference": false
+   }
+  ],
+  "outputs": [
+   {
+    "address": "addr_test1qpe6s9amgfwtu9u6lqj998vke6uncswr4dg88qqft5d7f67kfjf77qy57hqhnefcqyy7hmhsygj9j38rj984hn9r57fswc4wg0",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "7000000"
+     }
+    ],
+    "output_index": 1,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": "181f753497ddaf710d905d3be351dae2cee8ef6f85a60e13d4f34c7e1d9793c4"
+   }
+  ]
+ },
+ "redeemers": []
+}

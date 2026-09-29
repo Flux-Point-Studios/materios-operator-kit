@@ -1,0 +1,146 @@
+{
+ "network": "mainnet",
+ "tx": {
+  "hash": "c9dc8388b788d38aca0904e223579e85075d8e2400913567d8ce864dfb4a15ba",
+  "block": "462dc9da3b14bb1358e700cc1272cf9ea8a8fbe98f0c8dc9d44752323134602c",
+  "block_height": 13436306,
+  "block_time": 1779153063,
+  "slot": 187586772,
+  "index": 3,
+  "output_amount": [
+   {
+    "unit": "lovelace",
+    "quantity": "47631672"
+   },
+   {
+    "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+    "quantity": "722500000000000"
+   }
+  ],
+  "fees": "395637",
+  "deposit": "0",
+  "size": 1199,
+  "invalid_before": "187586648",
+  "invalid_hereafter": "187601048",
+  "utxo_count": 4,
+  "withdrawal_count": 0,
+  "mir_cert_count": 0,
+  "delegation_count": 0,
+  "stake_cert_count": 0,
+  "pool_update_count": 0,
+  "pool_retire_count": 0,
+  "asset_mint_or_burn_count": 0,
+  "redeemer_count": 1,
+  "valid_contract": true,
+  "treasury_donation": "0"
+ },
+ "utxos": {
+  "hash": "c9dc8388b788d38aca0904e223579e85075d8e2400913567d8ce864dfb4a15ba",
+  "inputs": [
+   {
+    "address": "addr1w8s6rqdjlzm5he27v9s202p8vjumza8qfsmufm2f6dy68hg9mn27a",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "2000000"
+     },
+     {
+      "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+      "quantity": "722500000000000"
+     }
+    ],
+    "tx_hash": "93a916aca379ca42ee5fa583df82fca3d267a410f000b4d639a4730355dcb711",
+    "output_index": 0,
+    "data_hash": "e91e9c37cad5a5215f210776134143165a4c438a46cc0d82e5111611805c3864",
+    "inline_datum": "a24b636f6e7374727563746f7200466669656c647380",
+    "reference_script_hash": null,
+    "collateral": false,
+    "reference": false
+   },
+   {
+    "address": "addr1v8efuqhk7tdmp9f4wkwjvr2yl0x6ew02ufe3t88lj59ggpcagsu4g",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "46027309"
+     }
+    ],
+    "tx_hash": "93a916aca379ca42ee5fa583df82fca3d267a410f000b4d639a4730355dcb711",
+    "output_index": 2,
+    "data_hash": null,
+    "inline_datum": null,
+    "reference_script_hash": null,
+    "collateral": false,
+    "reference": false
+   },
+   {
+    "address": "addr1v8efuqhk7tdmp9f4wkwjvr2yl0x6ew02ufe3t88lj59ggpcagsu4g",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "46027309"
+     }
+    ],
+    "tx_hash": "93a916aca379ca42ee5fa583df82fca3d267a410f000b4d639a4730355dcb711",
+    "output_index": 2,
+    "data_hash": null,
+    "inline_datum": null,
+    "reference_script_hash": null,
+    "collateral": true,
+    "reference": false
+   }
+  ],
+  "outputs": [
+   {
+    "address": "addr1w8s6rqdjlzm5he27v9s202p8vjumza8qfsmufm2f6dy68hg9mn27a",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "2000000"
+     },
+     {
+      "unit": "7ff33a5565393dc47b48ac47becc12d92c9952e724e8446dfb6adc66634d41545241",
+      "quantity": "722500000000000"
+     }
+    ],
+    "output_index": 0,
+    "data_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+    "inline_datum": "d87980",
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": "4f017ef2770c02779500e317cf4a09ae0921c76c205fb4fb3fc6241a80eb4713"
+   },
+   {
+    "address": "addr1v8efuqhk7tdmp9f4wkwjvr2yl0x6ew02ufe3t88lj59ggpcagsu4g",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "45631672"
+     }
+    ],
+    "output_index": 1,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": "c95837aa64f1b12ab85e69c6d28fe707dfaf94de6adfb337e5697ace613564e4"
+   }
+  ]
+ },
+ "redeemers": [
+  {
+   "tx_index": 0,
+   "purpose": "spend",
+   "script_hash": "e1a181b2f8b74be55e6160a7a82764b9b174e04c37c4ed49d349a3dd",
+   "redeemer_data_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+   "datum_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+   "unit_mem": "1000000",
+   "unit_steps": "500000000",
+   "fee": "93750",
+   "json_value": {
+    "fields": [],
+    "constructor": 0
+   }
+  }
+ ]
+}

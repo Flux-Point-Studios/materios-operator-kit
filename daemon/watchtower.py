@@ -25,6 +25,8 @@ from datetime import datetime
 
 import requests
 
+from daemon import discord
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -72,10 +74,8 @@ class Watchtower:
                     "footer": {"text": "Materios Watchtower"},
                 }]
             }
-            resp = requests.post(self.discord_url, json=payload, timeout=10)
-            if resp.status_code not in (200, 204):
-                logger.warning(f"Discord webhook returned {resp.status_code}")
-        except Exception as e:
+            discord.post_json(self.discord_url, payload)
+        except discord.DiscordError as e:
             logger.error(f"Discord send failed: {e}")
 
     def _check(self):

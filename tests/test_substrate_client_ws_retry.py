@@ -515,3 +515,36 @@ def test_no_bare_substrate_calls_in_substrate_client_outside_wrapper():
         "bare self.substrate.<method>(...) call sites still in substrate_client.py "
         f"(must route through self._call): {offenders[:5]}"
     )
+
+
+# --- 8. read-only consumers -----------------------------------------------
+
+
+def test_a_read_only_client_never_derives_a_signing_keypair(monkeypatch):
+    """A watcher reads the chain and signs nothing, so building a client for it must
+    not turn a signer URI (default or configured) into a keypair."""
+    derived = []
+    monkeypatch.setattr(sc_module.Keypair, "create_from_uri", lambda uri: derived.append(uri))
+    client = SubstrateClient(DaemonConfig(rpc_url="ws://test-rpc:9944"))
+    fake = _FakeSI()
+    fake.set_method("rpc_request", lambda method, params: {"jsonrpc": "2.0", "id": 1, "result": "0xabc"})
+    client.substrate = fake
+    assert client.rpc("chain_getFinalizedHead", []) == "0xabc"
+    assert derived == []
+
+
+def test_the_keypair_is_derived_from_the_signer_uri_on_first_use():
+    client = SubstrateClient(DaemonConfig(signer_uri="//Bob"))
+    assert client.keypair.ss58_address == "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+
+
+def test_raw_rpc_reads_route_through_the_bounded_call_on_the_read_conn():
+    client = _make_client(rpc_timeout_secs=0.05)
+    reader = _FakeSI()
+    reader.set_method("rpc_request", lambda *_a, **_kw: time.sleep(60))
+    client._read.si = reader
+    client.substrate = _FakeSI()
+    with pytest.raises(RPCTimeoutError):
+        client.rpc("chain_getBlock", ["0x00"])
+    assert client._read.consecutive_timeouts == 1
+    assert client._write.consecutive_timeouts == 0
