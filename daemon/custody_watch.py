@@ -18,6 +18,7 @@ import contextlib
 import functools
 import json
 import logging
+import math
 import os
 import socket
 import sqlite3
@@ -171,17 +172,14 @@ class Store:
     def findings(self) -> list[StoredFinding]:
         return self._rows("1")
 
-    def unsent_pages(self) -> list[StoredFinding]:
-        """An authority's findings first, then the rest that page alone, then groups; most
-        severe first within each."""
-        return self._rows("sent_at IS NULL AND severity >= ?", (int(rules.ALERT),),
+    def unsent_pages(self, held_since: float = math.inf) -> list[StoredFinding]:
+        """Unsent ALERTs and CRITICALs: an authority's first, then the rest that page alone,
+        then groups, most severe first within each. A group paged after ``held_since`` is
+        left in the database, however much it has gathered since."""
+        return self._rows("sent_at IS NULL AND severity >= ? AND (grp IS NULL OR grp NOT IN (SELECT grp FROM finding "
+                          "WHERE sent_at > ? AND grp IS NOT NULL AND severity >= ?))",
+                          (int(rules.ALERT), held_since, int(rules.ALERT)),
                           order="authority DESC, grp IS NOT NULL, severity DESC, seq")
-
-    def paged_groups(self, since: float) -> set[str]:
-        """The groups a page went out for after ``since``."""
-        rows = self._db.execute("SELECT DISTINCT grp FROM finding WHERE sent_at > ? AND grp IS NOT NULL "
-                                "AND severity >= ?", (since, int(rules.ALERT))).fetchall()
-        return {g for (g,) in rows}
 
     def unsent_routine(self) -> list[StoredFinding]:
         return self._rows("sent_at IS NULL AND severity < ?", (int(rules.ALERT),))
@@ -271,13 +269,13 @@ def _doubling(n: int) -> float:
     return min(2.0 ** (n - 1), MAX_HOLD)
 
 
-def _messages(pending: list[StoredFinding], held: set[str]) -> list[list[StoredFinding]]:
+def _messages(pending: list[StoredFinding]) -> list[list[StoredFinding]]:
     """Pending pages as messages, in order: every finding that pages alone, then each group
-    not ``held`` whole, most severe group first. When more than MAX_GROUP_MESSAGES groups
-    are ready, they go as one summary."""
+    whole, most severe group first. When more than MAX_GROUP_MESSAGES groups are ready,
+    they go as one summary."""
     groups: dict[str, list[StoredFinding]] = {}
     for finding in pending:
-        if finding.group is not None and finding.group not in held:
+        if finding.group is not None:
             groups.setdefault(finding.group, []).append(finding)
     grouped = list(groups.values())
     if len(grouped) > MAX_GROUP_MESSAGES:
@@ -353,7 +351,7 @@ class Pager:
         Returns how many findings went out. Undelivered pages stay pending, in order, and a
         message refused FALLBACK_AFTER times goes out as its headline alone."""
         delivered = 0
-        for message in _messages(store.unsent_pages(), store.paged_groups(now - GROUP_WINDOW)):
+        for message in _messages(store.unsent_pages(held_since=now - GROUP_WINDOW)):
             grouped = message[0].group is not None
             floor = 0 if message[0].authority else AUTHORITY_RESERVE + keep
             if self._available(now) < floor + 1 or (grouped and now - self._grouped_at < GROUPED_INTERVAL):

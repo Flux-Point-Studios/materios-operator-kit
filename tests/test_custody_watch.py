@@ -176,6 +176,23 @@ def test_groups_from_fresh_accounts_take_at_most_one_post_in_five(tmp_path):
     assert min(later - earlier for earlier, later in zip(sent, sent[1:])) >= 5 * cw.PAGE_INTERVAL
 
 
+def test_a_flush_reads_only_what_it_may_send(tmp_path, monkeypatch):
+    # A held group gathers findings for GROUP_WINDOW; reading them all back on every flush
+    # would let accounts that raise a finding each block slow every cycle as they pile up.
+    store = cw.Store(str(tmp_path / "state.db"))
+    pager = cw.Pager(Posts())
+    started = _at("2026-09-28T02:00:00")
+    for block in range(100):
+        _outsider_groups(store, block, started + 6 * block, 30)
+        pager.flush(store, started + 6 * block)
+    read = []
+    rows = cw.Store._rows
+    monkeypatch.setattr(cw.Store, "_rows", lambda self, *args, **kwargs: read.append(rows(self, *args, **kwargs))
+                        or read[-1])
+    pager.flush(store, started + 6 * 99 + 1)
+    assert sum(len(r) for r in read) == 0
+
+
 def _classified_cardano(name):
     def add(config, store, now):
         tx = _tx(name)
