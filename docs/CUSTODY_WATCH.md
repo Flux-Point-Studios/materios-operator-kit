@@ -69,11 +69,15 @@ that decides it (`Sudo.Key`, `Recovery.Proxy`, `Recovery.Recoverable`,
 `Recovery.ActiveRecoveries`, `System.AuthorizedUpgrade`, `Treasury.Spends`) at the
 block's parent and at the block, in storage queries of at most 1,000 keys. `Sudo.Key`
 must be the same at both to prove anything; for the rest either state letting the call
-through is enough to count it. A call the state rules out could not take effect and goes
-to the digest with everything it wraps. A root-gated call from an account needs no
-proof. What the state cannot rule out, as when it is pruned, pages, grouped per source
-rather than per signer when the events are unread; an authority's attempts always page
-alone.
+through is enough to count it. `Sudo.Key` and a `Recovery.Proxy` can change and change
+back inside one block, so neither proves anything in a block where `Sudo.Key`, an
+authority, or a friend, proxy or vouched rescuer in the recovery of one (read at the
+head, below) made a privileged call or signed something that cannot be decoded. A call the state rules out could not take effect and goes to the
+digest with everything it wraps. A root-gated call from an account needs no proof. What
+the state cannot rule out, as when it is pruned, pages, grouped per source rather than
+per signer when the events are unread; an authority's attempts always page alone, and so
+does what a friend, a proxy or a vouched rescuer does in the recovery of `Sudo.Key` or
+an authority.
 
 `Sudo.Key` has a recovery config on the chain, so its friends can take it over together
 with a rescuer after a delay. Each poll reads, at the finalized head, `Recovery.Recoverable`
@@ -141,7 +145,8 @@ Pages go out in three lanes, most severe first within each:
 
 1. What only `Sudo.Key`, an authority account, a custody key, or the keys that spend
    the surrender pool or mint under a watched policy can cause: what `Sudo.Key` or an
-   authority signs, its multisig legs included; a change of `Sudo.Key`, of the runtime
+   authority signs, its multisig legs included; what a friend, a proxy, or a rescuer
+   its friends have vouched for does in the recovery of one; a change of `Sudo.Key`, of the runtime
    code or of the genesis; a runtime environment digest; a change in the recovery of
    `Sudo.Key` or an authority other than a recovery started; a custody outflow; a
    surrender-pool spend that is not a surrender; a mint or burn under a watched policy.

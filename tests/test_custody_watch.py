@@ -1573,6 +1573,86 @@ def test_what_cannot_be_decoded_pages_critical_only_from_an_account_that_can_act
     assert (finding.group is None) == (severity == rules.CRITICAL)
 
 
+def _encoded(module: str, function: str, **args) -> bytes:
+    """A call as the spec-238 runtime encodes it."""
+    decoder = _decoder_238()
+    call = decoder._config.create_scale_object("Call", metadata=decoder._metadata)
+    return bytes.fromhex(call.encode({"call_module": module, "call_function": function, "call_args": args})
+                         .to_hex()[2:])
+
+
+FORCE_TRANSFER = {"call_module": "Balances", "call_function": "force_transfer",
+                  "call_args": {"source": "0x" + SUDO.hex(), "dest": "0x" + NOBODY.hex(), "value": 10 ** 15}}
+SUDO_FORCE_TRANSFER = _encoded("Sudo", "sudo", call=FORCE_TRANSFER)
+AS_SUDO_KEY_FORCE_TRANSFER = _encoded("Recovery", "as_recovered", account="0x" + SUDO.hex(), call={
+    "call_module": "Sudo", "call_function": "sudo", "call_args": {"call": FORCE_TRANSFER}})
+
+
+def _watched_block(config, tmp_path, chain, number):
+    store = cw.Store(str(tmp_path / "state.db"))
+    source = _materios(config, store, chain)
+    source.start_at(number - 1)
+    posts = Posts()
+    _watch(config, store, [source], posts, [_at("2026-09-28T02:00:00")]).cycle()
+    return store, posts
+
+
+@pytest.mark.parametrize("events", ["overflowing", "read"])
+def test_what_a_rescuer_does_as_sudo_key_between_its_claim_and_its_cancel_pages_by_name(config, tmp_path, events):
+    # Recovery.Proxy is empty at the block's parent and at the block, but a rescuer the
+    # friends have vouched for can claim Sudo.Key inside the block and give it back.
+    chain = FakeChain(head=OVERFLOW_AT, blocks={}, state_at={OVERFLOW_AT - 1, OVERFLOW_AT})
+    _recoverable_by(chain, SUDO, FRIENDS)
+    _recovering(chain, SUDO, RESCUER, FRIENDS[:3])
+    attempts = [(CLAIM_SUDO_KEY, RESCUER), (AS_SUDO_KEY_FORCE_TRANSFER, RESCUER), (CANCEL_SUDO_KEY, RESCUER)]
+    if events == "overflowing":
+        _events_overflow(chain, attempts)
+    else:
+        chain.extra[OVERFLOW_AT] = [signed_extrinsic(call, signer) for call, signer in attempts]
+        chain.events_hex = _succeeded(6)
+    store, posts = _watched_block(config, tmp_path, chain, OVERFLOW_AT)
+    [acted] = [f for f in store.findings() if "Balances.force_transfer" in f.text]
+    assert acted.severity == rules.CRITICAL
+    assert any(f"**{acted.headline}**" in p["content"] for p in posts.payloads)
+
+
+def test_a_proven_proxys_act_as_sudo_key_pages_alone_by_name_however_many_outsiders_share_its_block(config,
+                                                                                                  tmp_path):
+    chain = FakeChain(head=9001, blocks={}, state_at={9000, 9001}, events_hex=_succeeded(3 + 16))
+    _recoverable_by(chain, SUDO, FRIENDS)
+    _as_proxy_of_sudo_key(chain, PROXY)
+    chain.extra[9001] = ([signed_extrinsic(_own_recovery_naming(SUDO), bytes([0x90 + i]) * 32) for i in range(15)]
+                         + [signed_extrinsic(AS_SUDO_KEY_FORCE_TRANSFER, PROXY)])
+    store, posts = _watched_block(config, tmp_path, chain, 9001)
+    [acted] = [f for f in store.findings() if "Balances.force_transfer" in f.text]
+    assert acted.severity == rules.CRITICAL and acted.group is None
+    [page] = [p["content"] for p in posts.payloads if "Balances.force_transfer" in p["content"]]
+    assert page.startswith("\U0001f6a8 **CRITICAL** @here") and f"**{acted.headline}**" in page
+
+
+@pytest.mark.parametrize("holder", ["set_key", "undecoded"])
+def test_a_sudo_key_its_holder_may_have_handed_on_and_back_inside_a_block_proves_nothing(config, tmp_path, holder):
+    # Sudo.Key is the same at the block's parent and at the block, but its holder acted in
+    # the block, by a key change or by an extrinsic the watcher cannot read, so X may have
+    # held the key in between and given it back.
+    x = ATTEMPTERS[0]
+    chain = FakeChain(head=OVERFLOW_AT, blocks={}, state_at={OVERFLOW_AT - 1, OVERFLOW_AT})
+    handed = _encoded("Sudo", "set_key", new={"Id": "0x" + x.hex()}) if holder == "set_key" else _remarks(20_000)
+    _events_overflow(chain, [(handed, SUDO), (SUDO_FORCE_TRANSFER, x)])
+    store, posts = _watched_block(config, tmp_path, chain, OVERFLOW_AT)
+    [acted] = [f for f in store.findings() if "Balances.force_transfer" in f.text]
+    assert acted.severity == rules.CRITICAL and f"signer {rules.render_account(x)}" in acted.text
+
+
+def test_a_sudo_key_no_holder_touched_in_the_block_still_proves_an_outsiders_attempt_inert(config, tmp_path):
+    chain = FakeChain(head=OVERFLOW_AT, blocks={}, state_at={OVERFLOW_AT - 1, OVERFLOW_AT})
+    _events_overflow(chain, [(_encoded("Sudo", "set_key", new={"Id": "0x" + NOBODY.hex()}), ATTEMPTERS[1]),
+                             (SUDO_FORCE_TRANSFER, ATTEMPTERS[0])])
+    store, posts = _watched_block(config, tmp_path, chain, OVERFLOW_AT)
+    assert {f.severity for f in store.findings()} == {rules.INFO}
+    assert posts.payloads == []
+
+
 def test_a_proxy_acting_as_sudo_key_stays_watched_after_its_recovery_is_closed(config, tmp_path):
     chain = FakeChain(head=1000, blocks={}, state_at=set(range(1000, 1010)))
     _recoverable_by(chain, SUDO, FRIENDS)
