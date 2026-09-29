@@ -302,15 +302,15 @@ class Pager:
 
     Posts are paced by a token bucket (PAGE_BURST, PAGE_INTERVAL), so no flood of findings
     can hold the webhook at Discord's rate limit. An authority's pages go first and may
-    spend the last token but one kept for a due digest; the rest that page alone go next; groups go last, each at most
-    once per GROUP_WINDOW and all of them at most once per GROUPED_INTERVAL. A failure of the
-    webhook (unreachable, a server error, a rate limit, or a refusal of every post, as a
-    revoked or deleted webhook answers) holds all posting: for a rate limit's
-    Retry-After, otherwise for a delay that doubles with each consecutive failure up to
-    MAX_HOLD. A refusal of one message's content holds only that message, on its own
-    doubling delay. A webhook that refuses everything is then asked about once a minute
-    rather than once per page per cycle, since Discord's edge bans an address that sends
-    it thousands of refused requests, and the pages wait intact.
+    spend the last token but one kept for a due digest; the rest that page alone go next;
+    groups go last, each at most once per GROUP_WINDOW and all of them at most once per
+    GROUPED_INTERVAL. A failure of the webhook (unreachable, a server error, a rate limit,
+    or a refusal of every post, as a revoked or deleted webhook answers) holds all posting:
+    for a rate limit's Retry-After, otherwise for a delay that doubles with each consecutive
+    failure up to MAX_HOLD. A refusal of one message's content holds only that message, on
+    its own doubling delay. A webhook that refuses everything is then asked about once a
+    minute rather than once per page per cycle, since Discord's edge bans an address that
+    sends it thousands of refused requests, and the pages wait intact.
     """
 
     def __init__(self, post: Callable[[dict], None]):
