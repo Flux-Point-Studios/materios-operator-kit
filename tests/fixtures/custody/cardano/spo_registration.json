@@ -1,0 +1,87 @@
+{
+ "network": "preprod",
+ "tx": {
+  "hash": "1d5e5bda3290692e5cd42e58ce5764054aa38e1fdf39d8ef264b65653dc62c09",
+  "block": "4e75969abc95868f5da347025bef58f8219ca37e400d6a0a5fefe83750045f0d",
+  "block_height": 4676383,
+  "block_time": 1778003064,
+  "slot": 122319864,
+  "index": 1,
+  "output_amount": [
+   {
+    "unit": "lovelace",
+    "quantity": "34735860"
+   }
+  ],
+  "fees": "264140",
+  "deposit": "0",
+  "size": 631,
+  "invalid_before": null,
+  "invalid_hereafter": null,
+  "utxo_count": 3,
+  "withdrawal_count": 0,
+  "mir_cert_count": 0,
+  "delegation_count": 0,
+  "stake_cert_count": 0,
+  "pool_update_count": 0,
+  "pool_retire_count": 0,
+  "asset_mint_or_burn_count": 0,
+  "redeemer_count": 0,
+  "valid_contract": true,
+  "treasury_donation": "0"
+ },
+ "utxos": {
+  "hash": "1d5e5bda3290692e5cd42e58ce5764054aa38e1fdf39d8ef264b65653dc62c09",
+  "inputs": [
+   {
+    "address": "addr_test1vqad2mve9hyt2y4mmgg96dyq57mpeww9pgzlnp4ryq9gt6sa4qtvw",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "35000000"
+     }
+    ],
+    "tx_hash": "e9ab28d3d944f09bbe0ec881ca545aef0d062f20bc82dd7493c44d9a057950f1",
+    "output_index": 0,
+    "data_hash": null,
+    "inline_datum": null,
+    "reference_script_hash": null,
+    "collateral": false,
+    "reference": false
+   }
+  ],
+  "outputs": [
+   {
+    "address": "addr_test1wrld9uhaepas48twjy3qevncsyrhjdqnkz2wzu4yzjc2qhq24f4v4",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "2413600"
+     }
+    ],
+    "output_index": 0,
+    "data_hash": "0d0b5f1c8a92d29718b66b144b003de5dd7586b8091a8f4f64c6b62769942f2d",
+    "inline_datum": "9f581c680a93dd4deb4873fc0aa31678eb02c57258717953ffc9a654b0af78d8799fd8799f5820e30ab7940745fca7ee40cef9d2c743f8f633a61e89d4d4bc461ef28a3b407fba58406356934f8aaecc8f1beba24047add8b0cb67471c015e3250eceb57355c779c0f3bc33861b9c646ea36f9207da891333d59e1644cf09f65b9c7474ab4f3bdc10cff582103f2c1c50d62f023c637afe79996843157c6914e929605cde3c53de47a6896fc0e58400f1e079641a48ca0d58ed935ae86ee50ea3199382403abb3b8f0edd2674621f7682edaccde9faf765d40d11f4cd86a96882ac7e45ff8f84d73b68a719555b219d8799fd8799f58207167bcac0c82dd152433a18b61eb3faf82c952f8f01943a2793190f583b47b31ff00ff5820925fe8605fe32a53a7b391498fc1b0ab91d3af7319607bd70b850b4f5fa9d2555820750d4ba2a831a30d419009f2d8bc1ef1e6fc6f673c7a2b5b500a2b7f2a68458eff00ff",
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": null
+   },
+   {
+    "address": "addr_test1vqad2mve9hyt2y4mmgg96dyq57mpeww9pgzlnp4ryq9gt6sa4qtvw",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "32322260"
+     }
+    ],
+    "output_index": 1,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": "646258d433dac1603316d608c75347949a0e7b4fefde334288dbe9a2adcf3dbf"
+   }
+  ]
+ },
+ "redeemers": []
+}

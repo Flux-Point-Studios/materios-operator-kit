@@ -1,0 +1,161 @@
+{
+  "repo": "materios-operator-kit",
+  "primitives": [
+    {
+      "id": "daemon-core",
+      "name": "Daemon core",
+      "desc": "Shared runtime plumbing for every operator-kit daemon module: configuration, the Substrate chain client (bounded per-call timeout and reconnect, raw reads that never derive a signer), data models, Cardano address decoding, the health server, heartbeat reporting and Discord delivery.",
+      "kind": "toolkit",
+      "paths": [
+        "daemon/config.py",
+        "daemon/substrate_client.py",
+        "daemon/models.py",
+        "daemon/health_server.py",
+        "daemon/heartbeat.py",
+        "daemon/cardano_address.py",
+        "daemon/discord.py"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "cert-daemon",
+      "name": "Cert daemon",
+      "desc": "Committee attestor: watches receipts, resolves blob locators through the gateway, verifies content (including the self-rooted short-circuit), attests availability certificates on chain and heartbeats.",
+      "kind": "agent",
+      "paths": [
+        "daemon/cert_daemon.py",
+        "daemon/blob_verifier.py",
+        "daemon/locator_registry.py",
+        "daemon/cert_builder.py",
+        "daemon/cert_store.py"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet",
+        "blob-gateway-api",
+        "evidence-submitter",
+        "settlement-attestors",
+        "slash-watcher",
+        "checkpoint-anchoring",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "checkpoint-anchoring",
+      "name": "Checkpoint anchoring",
+      "desc": "Batches certified receipts into a Merkle root on a size, age or interval trigger and posts it to the anchor worker; keyed only on the AvailabilityCertified event, so it is source-agnostic.",
+      "kind": "pipeline",
+      "paths": [
+        "daemon/checkpoint.py",
+        "daemon/merkle.py"
+      ],
+      "consumes": [
+        "materios-anchor-worker",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "evidence-submitter",
+      "name": "Evidence submitter",
+      "desc": "Lifts pending attestation evidence from the gateway to the tee-attestation pallet.",
+      "kind": "pipeline",
+      "paths": [
+        "daemon/evidence_submitter.py"
+      ],
+      "consumes": [
+        "gateway-attestation-evidence",
+        "tee-attestation-pallet",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "slash-watcher",
+      "name": "Slash watcher",
+      "desc": "Bad-attestation detection with multisig-aggregated slash and settlement evidence.",
+      "kind": "agent",
+      "paths": [
+        "daemon/slash_watcher.py",
+        "daemon/multisig_aggregator.py",
+        "daemon/watchtower.py"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet",
+        "blob-gateway-api",
+        "settlement-attestors",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "settlement-attestors",
+      "name": "Settlement attestors",
+      "desc": "Settle-claim and expire-policy attestors that read Cardano state and attest outcomes on chain.",
+      "kind": "agent",
+      "paths": [
+        "daemon/settle_claim_attestor.py",
+        "daemon/expire_policy_attestor.py"
+      ],
+      "consumes": [
+        "orinq-receipts-pallet",
+        "daemon-core"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "operator-install",
+      "name": "Operator install",
+      "desc": "One-command onboarding for validators and attestors: key generation, faucet bootstrap with optional identity capture, daemon install, update and watchdog.",
+      "kind": "toolkit",
+      "paths": [
+        "install.sh",
+        "install-linux.sh",
+        "install-macos.command",
+        "install-windows.bat",
+        "update.sh",
+        "watchdog.sh",
+        "generate_key.py"
+      ],
+      "consumes": [
+        "gateway-faucet",
+        "cert-daemon"
+      ],
+      "status": "live"
+    },
+    {
+      "id": "oci-index-plugin",
+      "name": "OCI multi-arch index plugin",
+      "desc": "Woodpecker plugin (crane + jq), the only image the org GHCR token (gchr_token) is released to. It pushes credential-less kaniko OCI layouts, and publishes one platform as a plain image or several as a verified multi-arch index, moving extra tags only after verification. With the token it runs only on a push or manual pipeline of the default branch, against ghcr.io/flux-point-studios. Publishes operator-kit, materios-gateway, anchor-worker, anchor-worker-materios and saturnswap-backend.",
+      "kind": "toolkit",
+      "paths": [
+        "ci/oci-index"
+      ],
+      "consumes": [],
+      "status": "live"
+    },
+    {
+      "id": "custody-watch",
+      "name": "Custody watch",
+      "desc": "Read-only watcher that pages Discord on every custody and authority move: root, upgrade, forced-balance, recovery, treasury, finality, timelock and committee-gate calls in finalized Materios blocks (decoded through Sudo, Multisig, Utility and Recovery wrappers with the origin each call dispatches with, so attempts that cannot take effect go to the digest once events, or the state at the block and its parent (Sudo.Key, recovery proxies, friends and vouches, an authorized upgrade, an approved spend), prove it, a proof no block trusts once Sudo.Key, an authority or a friend, proxy or vouched rescuer made a Sudo or Recovery call in it), committee and Sudo.Key changes, any change in the recovery of Sudo.Key or an authority (Recoverable, ActiveRecoveries, and every Proxy acting as or for one, read from the whole map in bounded requests and decoded only on change, recoveries a stranger starts paged as a grouped ALERT, whose friends and then rescuers decode ahead of other accounts but are never authorities, since anyone can start a recovery), runtime environment digests and runtime code hash changes, transactions at watched Cardano custody and contract addresses (a failed script's consumed collateral included), mints under watched policies (and burns, which any holder may make, as grouped ALERTs), and surrender-pool spends checked against the rate-table entitlement, the pinned redeemable asset names and the redeemable supply, with each wallet that gave up legacy units paid exactly its own units' entitlement and no cMATRA paid into the quarantine address. Classification is total and bounded: calls nested as deep as a runtime decodes them are read, each block is decoded within fixed budgets of values (what Sudo.Key and the authorities sign against a budget of its own, then inherents, recovery friends, rescuers and small extrinsics first) so no block can exhaust its memory or hold back the Cardano sources, no argument value stalls a cursor, and anything unread pages: CRITICAL unless every signer of it is an account no state lets move custody or authority. Cursors, dedupe and delivery state persist in SQLite; pages go out through a token bucket of ten messages a minute (to its own channel when configured): what only Sudo.Key, an authority, a custody key or the pool's and policies' keys can cause first, with a token no other page may spend, then the other pages that go alone, then what anyone can cause, grouped per source, each group paging its first finding at once and then one summary per ten minutes, all groups at most one post per 30 seconds and many merged into one summary; the digest is never starved, a failing or refusing webhook is retried on a doubling delay rather than hammered, and a refused page never holds back the queue. Routine moves and liveness go to a daily digest that names stale sources and says whether the surrender pool covers every unit still redeemable under the merger's redemption pin and rate table (paging below a floor or on a run-out before the deadline), and a source that is unreadable or stays behind its head pages hourly. Replays any recent window without paging.",
+      "kind": "agent",
+      "paths": [
+        "daemon/custody_watch.py",
+        "daemon/custody_rules.py"
+      ],
+      "consumes": [
+        "daemon-core",
+        "orinq-receipts-pallet",
+        "cmatra-claim-validator",
+        "cmatra-mint-policy",
+        "cmatra-quarantine-validator",
+        "surrender-api"
+      ],
+      "status": "experimental",
+      "terminal": true
+    }
+  ]
+}

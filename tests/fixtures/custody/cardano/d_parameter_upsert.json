@@ -1,0 +1,193 @@
+{
+ "network": "preprod",
+ "tx": {
+  "hash": "db4a0683ff2d8c67ef0c08e04b1e8e02a0bc5076a8d060e2770ce3be52662953",
+  "block": "9c5dc21ee4a5a9b9e662848a7244180bc2c098c37f7295f2037002fd74ff5928",
+  "block_height": 4676413,
+  "block_time": 1778003690,
+  "slot": 122320490,
+  "index": 0,
+  "output_amount": [
+   {
+    "unit": "lovelace",
+    "quantity": "8985707667"
+   },
+   {
+    "unit": "38dddaf5198b927b19dac9b28226ab29eddad176d5d81c7748bc2c31",
+    "quantity": "1"
+   },
+   {
+    "unit": "645001e05c16084c75a970fd48f43981c4ec2b8d2637d3821ffee404",
+    "quantity": "17"
+   }
+  ],
+  "fees": "247099",
+  "deposit": "0",
+  "size": 1632,
+  "invalid_before": null,
+  "invalid_hereafter": null,
+  "utxo_count": 4,
+  "withdrawal_count": 0,
+  "mir_cert_count": 0,
+  "delegation_count": 0,
+  "stake_cert_count": 0,
+  "pool_update_count": 0,
+  "pool_retire_count": 0,
+  "asset_mint_or_burn_count": 1,
+  "redeemer_count": 1,
+  "valid_contract": true,
+  "treasury_donation": "0"
+ },
+ "utxos": {
+  "hash": "db4a0683ff2d8c67ef0c08e04b1e8e02a0bc5076a8d060e2770ce3be52662953",
+  "inputs": [
+   {
+    "address": "addr_test1wpdva5udy3ltq5yuvaknr0lkxl3hrglwgj7wxakx5egzamqt7sfr3",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "1430920"
+     },
+     {
+      "unit": "ac283f02b411d4e09a5960b060887e59d42af062d1bef9e2812fbe5556657273696f6e206f7261636c65",
+      "quantity": "1"
+     }
+    ],
+    "tx_hash": "b6e2e4df833e906ca6cbfe4b0fac71bfef88be01ed676def1db36844ec8c2cbe",
+    "output_index": 0,
+    "data_hash": "10d096d654cbc98d45fc523bf22cd952c81675f0343318e4db74bda644f6392d",
+    "inline_datum": "9f1820581cac283f02b411d4e09a5960b060887e59d42af062d1bef9e2812fbe55ff",
+    "reference_script_hash": "645001e05c16084c75a970fd48f43981c4ec2b8d2637d3821ffee404",
+    "collateral": false,
+    "reference": true
+   },
+   {
+    "address": "addr_test1vqad2mve9hyt2y4mmgg96dyq57mpeww9pgzlnp4ryq9gt6sa4qtvw",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "8984877266"
+     },
+     {
+      "unit": "645001e05c16084c75a970fd48f43981c4ec2b8d2637d3821ffee404",
+      "quantity": "16"
+     }
+    ],
+    "tx_hash": "ee6365ddeaefec903ec56d7c4a934a079d92030316d5b01f86f6bdc79640c0d9",
+    "output_index": 1,
+    "data_hash": null,
+    "inline_datum": null,
+    "reference_script_hash": null,
+    "collateral": false,
+    "reference": false
+   },
+   {
+    "address": "addr_test1wp2cyx2swmu838rzaxth5aa0z8zrcuz24unwpwy3dfsxhfgnd0xw8",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "1077500"
+     },
+     {
+      "unit": "38dddaf5198b927b19dac9b28226ab29eddad176d5d81c7748bc2c31",
+      "quantity": "1"
+     }
+    ],
+    "tx_hash": "08d1151fc198ce9805e77a7b49e0508d8c35454f7cc0ef6ef392c4ea3bed532f",
+    "output_index": 0,
+    "data_hash": "a3708f56a04d6f1ed01dc33af43296a6fad11bb1e5619389c317bc7f8d93aa41",
+    "inline_datum": "9fd879809f0800ff00ff",
+    "reference_script_hash": null,
+    "collateral": false,
+    "reference": false
+   },
+   {
+    "address": "addr_test1vqad2mve9hyt2y4mmgg96dyq57mpeww9pgzlnp4ryq9gt6sa4qtvw",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "8984877266"
+     }
+    ],
+    "tx_hash": "ee6365ddeaefec903ec56d7c4a934a079d92030316d5b01f86f6bdc79640c0d9",
+    "output_index": 1,
+    "data_hash": null,
+    "inline_datum": null,
+    "reference_script_hash": null,
+    "collateral": true,
+    "reference": false
+   }
+  ],
+  "outputs": [
+   {
+    "address": "addr_test1wp2cyx2swmu838rzaxth5aa0z8zrcuz24unwpwy3dfsxhfgnd0xw8",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "1077500"
+     },
+     {
+      "unit": "38dddaf5198b927b19dac9b28226ab29eddad176d5d81c7748bc2c31",
+      "quantity": "1"
+     }
+    ],
+    "output_index": 0,
+    "data_hash": "69442e66f7a7f71643613c8eea4b40b33c6ca3ce5aec426158e83fdc264838de",
+    "inline_datum": "9fd879809f0502ff00ff",
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": "3aad50e472168beb4525bd8cda8ac36e2f53eed2fd77ea641946301c68e8aa61"
+   },
+   {
+    "address": "addr_test1vqad2mve9hyt2y4mmgg96dyq57mpeww9pgzlnp4ryq9gt6sa4qtvw",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "8984630167"
+     },
+     {
+      "unit": "645001e05c16084c75a970fd48f43981c4ec2b8d2637d3821ffee404",
+      "quantity": "17"
+     }
+    ],
+    "output_index": 1,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": false,
+    "reference_script_hash": null,
+    "consumed_by_tx": "3aad50e472168beb4525bd8cda8ac36e2f53eed2fd77ea641946301c68e8aa61"
+   },
+   {
+    "address": "addr_test1vqad2mve9hyt2y4mmgg96dyq57mpeww9pgzlnp4ryq9gt6sa4qtvw",
+    "amount": [
+     {
+      "unit": "lovelace",
+      "quantity": "8984506617"
+     }
+    ],
+    "output_index": 2,
+    "data_hash": null,
+    "inline_datum": null,
+    "collateral": true,
+    "reference_script_hash": null,
+    "consumed_by_tx": null
+   }
+  ]
+ },
+ "redeemers": [
+  {
+   "tx_index": 1,
+   "purpose": "spend",
+   "script_hash": "5582195076f8789c62e9977a77af11c43c704aaf26e0b8916a606ba5",
+   "redeemer_data_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+   "datum_hash": "923918e403bf43c34b4ef6b48eb2ee04babed17320d8d1b9ff9ad086e86f44ec",
+   "unit_mem": "232618",
+   "unit_steps": "61907758",
+   "fee": "17886",
+   "json_value": {
+    "fields": [],
+    "constructor": 0
+   }
+  }
+ ]
+}

@@ -32,7 +32,7 @@ from daemon.slash_watcher import (
     SlashWatcher,
     maybe_create_slash_watcher,
 )
-from daemon import health_server
+from daemon import discord, health_server
 from daemon.health_server import drain_notifications
 
 logger = logging.getLogger(__name__)
@@ -467,13 +467,10 @@ class CertDaemon:
         prefix = {"info": "\u2139\ufe0f", "warning": "\u26a0\ufe0f", "critical": "\ud83d\udea8"}.get(level, "")
         payload = {"content": f"{prefix} **materios-cert-daemon**: {message}"}
         try:
-            async with aiohttp.ClientSession() as session:
-                await session.post(
-                    self.config.discord_webhook_url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                )
-        except Exception as e:
+            await asyncio.to_thread(
+                discord.post_json, self.config.discord_webhook_url, payload, timeout=5
+            )
+        except discord.DiscordError as e:
             logger.warning(f"Discord notification failed: {e}")
 
     def get_cardano_epoch(self) -> int:
