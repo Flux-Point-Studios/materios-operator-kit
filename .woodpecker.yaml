@@ -109,6 +109,18 @@ steps:
       context: ci/oci-index
       extra_opts: --custom-platform=linux/amd64 --reproducible --digest-file=/woodpecker/oci-index.digest --oci-layout-path=/woodpecker/oci/oci-index
 
+  # Holds publish-index's pin to the plugin built here, before push-oci-index pushes that
+  # build. The gchr_token filter is invisible to this check: a plugin change also needs
+  # ci/registry-token pin --add before it merges, or Woodpecker refuses main's whole
+  # pipeline and nothing is pushed.
+  - name: check-oci-index-pin
+    image: *crane
+    entrypoint: *busybox_entrypoint
+    commands:
+      - D=$$(cat /woodpecker/oci-index.digest)
+      - 'P=$$(sed -n "/^  - name: publish-index$$/,/^  - name: /s/^    image: //p" .woodpecker.yaml)'
+      - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index to the new digest and add it to every gchr_token copy with ci/registry-token pin --add"; exit 1; }'
+
   - name: push-oci-index
     image: *oci_index_in_service
     settings:
@@ -125,16 +137,6 @@ steps:
       # image's repository, and a :latest moved here would reach every operator.
       tags: ""
     when: *on_main
-
-  # publish-index runs the plugin by digest, and the gchr_token secret's image filter
-  # names that same digest. A plugin change fails here until both are updated.
-  - name: check-oci-index-pin
-    image: *crane
-    entrypoint: *busybox_entrypoint
-    commands:
-      - D=$$(cat /woodpecker/oci-index.digest)
-      - 'P=$$(sed -n "/^  - name: publish-index$$/,/^  - name: /s/^    image: //p" .woodpecker.yaml)'
-      - '[ "$${P}" = "ghcr.io/flux-point-studios/materios-operator-kit@$${D}" ] || { echo "ci/oci-index now builds to $${D}, but publish-index runs $${P}; pin publish-index to the new digest and add it to every gchr_token copy with ci/registry-token pin --add"; exit 1; }'
 
   # The test replaces npm and the plugin's busybox inside this step's own container.
   - name: test-npm-publish
