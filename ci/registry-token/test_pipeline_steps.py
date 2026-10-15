@@ -79,6 +79,10 @@ class PipelineInputsTest(unittest.TestCase):
                                              "/woodpecker/oci/oci-index"])
         self.assertEqual(published - built, set())
 
+    def test_the_plugin_build_is_held_to_the_pin_before_the_token_pushes_it(self):
+        order = list(STEPS)
+        self.assertLess(order.index("check-oci-index-pin"), order.index("push-oci-index"))
+
     def test_every_image_a_kaniko_step_builds_on_is_pinned_by_digest(self):
         for name, (_, declared, _) in KANIKO_STEPS.items():
             path = declared.get("dockerfile") or "Dockerfile"
