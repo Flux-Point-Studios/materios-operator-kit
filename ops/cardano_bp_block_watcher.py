@@ -66,7 +66,9 @@ def main() -> int:
     try:
         print(check(read, page, STATE_FILE), file=sys.stderr)
     except (OSError, ValueError, KeyError) as e:
-        print(f"check failed: {type(e).__name__}: {e}", file=sys.stderr)
+        # Never the error's text: urllib's names the URL it could not open, the webhook included.
+        detail = getattr(e, "code", None) or getattr(e, "reason", "")
+        print(f"check failed: {type(e).__name__} {detail}".rstrip(), file=sys.stderr)
         return 1
     return 0
 

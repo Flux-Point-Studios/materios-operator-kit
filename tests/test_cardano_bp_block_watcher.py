@@ -2,7 +2,9 @@
 
 import http.server
 import json
+import os
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -152,3 +154,12 @@ def test_a_check_insight_refuses_fails_the_run_without_the_key_in_its_output(end
     err = capsys.readouterr().err
     assert "403" in err and "SECRETKEY" not in err
     assert not bw.STATE_FILE.exists()
+
+
+def test_a_malformed_webhook_never_reaches_the_journal(endpoint, capsys):
+    # urllib names the URL it cannot open in its error, and the journal is readable by adm.
+    bw.STATE_FILE.write_text("6\n")
+    (Path(os.environ["CREDENTIALS_DIRECTORY"]) / "discord-webhook").write_text("discord.test/api/webhooks/1/TOKEN")
+    assert bw.main() == 1
+    err = capsys.readouterr().err
+    assert "check failed: ValueError" in err and "TOKEN" not in err
