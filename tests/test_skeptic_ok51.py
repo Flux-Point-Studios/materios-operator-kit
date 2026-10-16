@@ -1,6 +1,4 @@
-"""Skeptic reconstruction on a clean b9b8074 tree with the repo's own FakeInsight (not the
-red-team HTTP model): the custody verdict depends only on whether the address history lists
-the failed transaction whose collateral was the custody UTxO."""
+"""Collateral consumption pages whether or not address history lists the transaction."""
 import pytest
 
 from daemon import custody_rules as rules

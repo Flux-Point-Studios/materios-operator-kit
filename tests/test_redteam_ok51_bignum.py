@@ -1,4 +1,4 @@
-"""Red-team check (PR #51 @ b9b8074): /v1 slot numbers above 2^53 through the real cursor.
+"""Slot numbers above 2^53 through the real history cursor.
 
 Rows at slots 2^53+1 and 2^53+2 collapse to one slot under float parsing, which would make
 the same-slot offset skip a row. The real ``cw.Insight.history`` over HTTP must list all."""
