@@ -1,0 +1,11 @@
+[Unit]
+Description=Run cardano-bp-block-watcher every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

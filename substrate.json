@@ -158,6 +158,20 @@
       "terminal": true
     },
     {
+      "id": "cardano-bp-block-watcher",
+      "name": "Cardano BP block watcher",
+      "desc": "Timer-driven check that pages Discord when the Materios preprod stake pool forges a Cardano block: its lifetime blocks_minted read from Iagon Insight against the count the last run stored, with the newest block's hash, height, epoch and slot. The Insight key and webhook arrive as systemd credentials, and a refused page or unreadable count fails the run without advancing the count, so the next run pages again.",
+      "kind": "agent",
+      "paths": [
+        "ops/cardano_bp_block_watcher.py",
+        "ops/cardano-bp-block-watcher.service",
+        "ops/cardano-bp-block-watcher.timer"
+      ],
+      "consumes": [],
+      "status": "live",
+      "terminal": true
+    },
+    {
       "id": "registry-token-scope",
       "name": "Registry token scope",
       "desc": "Keeps the GHCR publish token (gchr_token) as repository-level Woodpecker secrets on exactly the repositories that publish through the OCI index plugin, each copy admitting only the plugin's pinned digests. plan lists every copy and the change; apply accepts only a classic write:packages token of the plugin's login that the registry lets open an upload in the plugin's package, stores it, checks what Woodpecker stored, then deletes every global, organization and stray copy (run it again to rotate); pin adds or drops a digest of the plugin image, and only of it, on every copy during a plugin upgrade. Any Woodpecker user with push on a holder can edit its copy, so plan and apply name every Woodpecker user who is not an admin.",
