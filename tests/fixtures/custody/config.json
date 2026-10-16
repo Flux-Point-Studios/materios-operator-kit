@@ -11,8 +11,8 @@
  "cardano": [
   {
    "name": "cardano-mainnet",
-   "blockfrost_url": "https://blockfrost.invalid/api/v0",
-   "project_id_file": "/nonexistent/blockfrost.key",
+   "insight_url": "https://insight.invalid",
+   "insight_key_file": "/nonexistent/insight.key",
    "poll_seconds": 60,
    "reorg_depth_blocks": 30,
    "addresses": [
@@ -962,8 +962,8 @@
   },
   {
    "name": "cardano-preprod-partner-chain",
-   "blockfrost_url": "https://blockfrost.invalid/api/v0",
-   "project_id_file": "/nonexistent/blockfrost.key",
+   "insight_url": "https://insight.invalid",
+   "insight_key_file": "/nonexistent/insight.key",
    "poll_seconds": 180,
    "reorg_depth_blocks": 30,
    "addresses": [
@@ -1051,8 +1051,8 @@
   },
   {
    "name": "merger-rehearsal-preprod",
-   "blockfrost_url": "https://blockfrost.invalid/api/v0",
-   "project_id_file": "/nonexistent/blockfrost.key",
+   "insight_url": "https://insight.invalid",
+   "insight_key_file": "/nonexistent/insight.key",
    "poll_seconds": 60,
    "reorg_depth_blocks": 30,
    "addresses": [],

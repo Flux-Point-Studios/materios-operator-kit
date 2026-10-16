@@ -42,10 +42,11 @@ credential decides who can spend a payout, so a stake credential never joins two
 A Cardano transaction whose script fails phase 2 consumes its collateral in place of its
 inputs and produces its collateral return in place of its outputs, so a custody key can
 move the reserve through one on purpose. db-sync stores that collateral and return as the
-transaction's inputs and outputs, and Blockfrost lists them without the `collateral`
-flag its documentation describes; for such a transaction the watcher counts every input
-and output row it is given, once per UTxO, so the outflow pages CRITICAL with what left
-whichever way the rows are flagged. It never counts as a surrender.
+transaction's inputs and outputs, and Blockfrost and Insight list them without the
+`collateral` flag Blockfrost's documentation describes; for such a transaction the
+watcher counts every input and output row it is given, once per UTxO, so the outflow
+pages CRITICAL with what left whichever way the rows are flagged. It never counts as a
+surrender.
 
 Root comes only from `Sudo`, and `Sudo` dispatches only for `Sudo.Key`, so a root-gated
 call reached from any other account cannot take effect. Once the block's events are
@@ -214,8 +215,8 @@ The configuration lives on the host that runs the watcher, never in this reposit
   "cardano": [
     {
       "name": "cardano-mainnet",
-      "blockfrost_url": "https://cardano-mainnet.blockfrost.io/api/v0",
-      "project_id_file": "blockfrost-mainnet.key",
+      "insight_url": "https://mainnet.insight.iagon.com",
+      "insight_key_file": "insight.key",
       "poll_seconds": 60,
       "reorg_depth_blocks": 30,
       "addresses": [{"label": "<name>", "address": "addr1...", "role": "custody"}],
@@ -232,11 +233,22 @@ fresh name redeemable; `max_payout` (cMATRA base units) is the per-surrender pay
 which a surrender pages. A watched policy of more than ten assets has each asset's mint
 count read only when that asset's supply moves, and every count once an hour.
 
+`insight_url` is the root of an Iagon Insight network (`https://mainnet.insight.iagon.com`
+or `https://preprod.insight.iagon.com`) and `insight_key_file` holds its API key, never
+a key a browser can see. Cardano is read through Insight's Blockfrost-compatible routes
+under `/api/v0`, except an address's transactions: Insight ignores Blockfrost's `from=`
+there, so they come from its native `/v1/tx/history`, from the slot of the reorg
+window's first block, each page resuming at the last slot read and skipping that slot's
+rows already read (a page's `next_cursor` alone repeats them, and never leaves a slot
+holding a page of them). A history page indexed short of the tip's slot fails the poll,
+so the cursor never passes a transaction the listing left out. The week's payouts are
+read from the slot a week before the tip, a slot lasting one second.
+
 `role` is `custody` (outflow CRITICAL, inflow ALERT) or `contract` (a spend at the
 address's own `severity`, a payment in as an ALERT). `materios.authority_accounts` lists
 the SS58 accounts besides `Sudo.Key` whose moves are authority moves, such as the sudo
 multisig's signatories. Recovery friends and rescuers are never authority accounts,
-whatever the recovery state names. A relative `project_id_file` is read from the config file's
+whatever the recovery state names. A relative `insight_key_file` is read from the config file's
 directory. `discord_webhook_file` names a file, read the same way, that holds the
 webhook of a channel of the watcher's own; without it the webhook comes from
 `DISCORD_WEBHOOK_URL` in the environment. `run` refuses to start without an https
@@ -262,7 +274,7 @@ WatchdogSec=900
 DynamicUser=yes
 EnvironmentFile=/etc/custody-watch/discord.env
 LoadCredential=config.json:/etc/custody-watch/config.json
-LoadCredential=blockfrost-mainnet.key:/etc/custody-watch/blockfrost-mainnet.key
+LoadCredential=insight.key:/etc/custody-watch/insight.key
 LoadCredential=discord-webhook:/etc/custody-watch/discord-webhook
 LoadCredential=redemption_pin.json:/etc/custody-watch/redemption_pin.json
 LoadCredential=rate_table_cmatra.json:/etc/custody-watch/rate_table_cmatra.json
