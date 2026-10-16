@@ -1049,9 +1049,9 @@ class Insight:
         return self._read("/api/v0" + path, params)
 
     def history(self, address: str, from_slot: int, through_slot: int):
-        """Every transaction at ``address`` from ``from_slot`` on, oldest first, each once,
-        from a history indexed at least through ``through_slot``, so a cursor moved to that
-        slot passes no transaction the listing left out.
+        """Transactions reported at ``address`` from ``from_slot`` on, oldest first, each once.
+        History must be indexed through ``through_slot`` before advancing the cursor.
+        Collateral-only spends require the output reconciliation in CardanoSource.
 
         Insight ignores Blockfrost's ``from`` on an address's transactions, so they are read
         from its native history. A page's ``next_cursor`` alone would re-read the rows of the
@@ -1075,6 +1075,33 @@ class Insight:
             at_last = sum(1 for row in rows if row["slot_no"] == last)
             offset = offset + at_last if last == slot else at_last
             slot = last
+
+    def utxos(self, address: str, slot: int) -> list[dict]:
+        return self._output_pages(f"/v1/utxos/address/{address}", slot, atSlot=slot)
+
+    def outputs(self, address: str, slot: int) -> list[dict]:
+        return self._output_pages(f"/v1/outputs/address/{address}", slot, order="asc")
+
+    def _output_pages(self, path: str, slot: int, **params) -> list[dict]:
+        rows = []
+        seen = set()
+        while True:
+            page = self._read(path, {**params, "limit": HISTORY_PAGE, "offset": len(rows)})
+            if page is None or not page.get("success"):
+                raise SourceError(f"insight serves no outputs for {path}")
+            if page["last_updated"]["slot_no"] < slot:
+                raise SourceError(f"insight outputs are indexed short of slot {slot}")
+            batch = page["data"]
+            for row in batch:
+                ref = (row.get("transaction_id", row.get("tx_hash")), row["output_index"])
+                if not ref[0] or ref in seen:
+                    raise SourceError("insight output pagination repeated or invalid reference")
+                seen.add(ref)
+            rows.extend(batch)
+            if not page["pagination"]["hasMore"]:
+                return rows
+            if not batch or len(rows) > 100000:
+                raise SourceError("insight output pagination made no progress or exceeded limit")
 
     def _read(self, path: str, params: dict):
         wait = self._last + self._min_interval - time.monotonic()
@@ -1148,7 +1175,10 @@ class CardanoSource:
     def _pages(self, path: str, first_page: int = 1, **params):
         page = first_page
         while True:
-            rows = self._api.get(path, count=PAGE, page=page, **params) or []
+            rows = self._api.get(path, count=PAGE, page=page, **params)
+            if rows is None and path.endswith("/history"):
+                raise SourceError(f"insight serves no history for {path}")
+            rows = rows or []
             yield from rows
             if len(rows) < PAGE:
                 return
@@ -1211,20 +1241,69 @@ class CardanoSource:
                     first_page = seen // PAGE + 1
                     history = list(self._pages(f"/assets/{unit}/history", first_page=first_page, order="asc"))
                     offset = (first_page - 1) * PAGE
-                    for entry in history[seen - offset:count - offset]:
+                    unread = history[seen - offset:count - offset]
+                    if len(unread) != count - seen:
+                        raise SourceError(f"insight mint history for {unit} is short of count {count}")
+                    for entry in unread:
                         pending.setdefault(entry["tx_hash"], floor)
                 cursors[key] = str(count)
+
+        missing = {}
+        for watched in self._network.addresses:
+            if watched.role != "custody":
+                continue
+            address = watched.address
+            snapshot_key = f"snapshot:{self.name}:{address}"
+            previous = self._store.get(snapshot_key)
+            previous = json.loads(previous) if previous is not None else None
+            if previous is not None and tip["slot"] < previous["slot"]:
+                raise SourceError(f"{self.name}: tip is behind persisted custody snapshot")
+            current = {f"{row['transaction_id']}#{row['output_index']}"
+                       for row in self._api.utxos(address, tip["slot"])}
+            outputs = self._api.outputs(address, tip["slot"])
+            # Ascending output enumeration also sees outputs received and spent between polls.
+            floor_slot = previous["slot"] if previous else tip["slot"]
+            if previous is None:
+                cursor = self._store.get(self._address_key(address))
+                if cursor is not None:
+                    floor_slot = self._slot(max(int(cursor) - self._network.reorg_depth_blocks, 0))
+            vanished = set(previous["refs"]) - current if previous else set()
+            for row in outputs:
+                spent = row["spent_by"]
+                if spent is None or spent["slot_no"] > tip["slot"]:
+                    continue
+                ref = f"{row['tx_hash']}#{row['output_index']}"
+                if ref in vanished or spent["slot_no"] >= floor_slot:
+                    pending[spent["tx_hash"]] = None
+            missing[address] = (watched.label, vanished)
+            cursors[snapshot_key] = json.dumps({"slot": tip["slot"], "refs": sorted(current)})
 
         todo = [(h, floor) for h, floor in pending.items() if not self._store.processed(f"{self.name}:{h}")]
         for tx_hash, floor in todo[:MAX_TX_PER_POLL]:
             self._classify(tx_hash, now, floor)
         if len(todo) > MAX_TX_PER_POLL:
             return False
+        # A spent_by pointer alone cannot prove consumption; verify the ledger inputs.
+        if any(refs for _, refs in missing.values()):
+            for tx_hash in pending:
+                tx = self._api.get(f"/txs/{tx_hash}")
+                utxos = self._api.get(f"/txs/{tx_hash}/utxos")
+                if tx is None or utxos is None:
+                    raise SourceError(f"{self.name}: missing consumption proof for {tx_hash}")
+                for row in rules._moved(utxos["inputs"], tx["valid_contract"]):
+                    if row["address"] in missing:
+                        missing[row["address"]][1].discard(f"{row['tx_hash']}#{row['output_index']}")
+        unexplained = [rules.Finding(
+            severity=rules.CRITICAL, key=f"{self.name}:missing:{address}:{ref}",
+            kind="unexplained-custody-outflow", authority=True,
+            headline=f"{self.name}: unexplained custody UTxO disappearance",
+            details=(f"{label}: {ref} vanished at slot {tip['slot']}",))
+            for address, (label, refs) in missing.items() for ref in sorted(refs)]
         overruns = self._redemption_overruns()
         with self._store.transaction():
             for key, value in cursors.items():
                 self._store.put(key, value)
-            for finding in overruns:
+            for finding in overruns + unexplained:
                 self._store.add(finding, now)
         return True
 

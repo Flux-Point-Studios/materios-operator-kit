@@ -1,0 +1,33 @@
+{
+  "tx": {
+    "hash": "98ca8f021b77488cce8ca34e31944c74752556e90e874f4258d2752f792e6ff0",
+    "block_height": 5024331,
+    "block_time": 1786033442,
+    "slot": 130350242,
+    "valid_contract": false,
+    "fees": "2063895",
+    "asset_mint_or_burn_count": 0
+  },
+  "utxos": {
+    "inputs": [
+      {
+        "address": "addr_test1vrjau4npl8vg8fvp38ahj3lxu3wtlp3qyh2agu4u6vqxlds065ldr",
+        "tx_hash": "78bb4fca20d7c82adf308ac852175350dba6eead858ddded2aa6ad7f8b5cce2f",
+        "output_index": 1,
+        "amount": [
+          {
+            "unit": "lovelace",
+            "quantity": "2063895"
+          }
+        ],
+        "data_hash": null,
+        "inline_datum": null,
+        "reference_script_hash": null,
+        "collateral": false,
+        "reference": false
+      }
+    ],
+    "outputs": []
+  },
+  "redeemers": []
+}

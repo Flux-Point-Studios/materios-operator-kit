@@ -1,0 +1,49 @@
+{
+  "tx": {
+    "hash": "b9ebe459c3ba8e890f951dacb50cba6fa02cf099c6308c7abd26cf616bf26ca5",
+    "block_height": 283100,
+    "block_time": 1668596062,
+    "slot": 12912862,
+    "valid_contract": false,
+    "fees": "3000000",
+    "asset_mint_or_burn_count": 0
+  },
+  "utxos": {
+    "inputs": [
+      {
+        "address": "addr_test1vqyaztht2clcm8x0s0r7n3hzqyz66g5cutkkxs9kdphwwgczq2j89",
+        "tx_hash": "99c2ef8e340d5991b1acfcb2a3bf06145ab139f0b10837fb8862cf0ec2324d03",
+        "output_index": 0,
+        "amount": [
+          {
+            "unit": "lovelace",
+            "quantity": "10000000"
+          }
+        ],
+        "data_hash": null,
+        "inline_datum": null,
+        "reference_script_hash": null,
+        "collateral": false,
+        "reference": false
+      }
+    ],
+    "outputs": [
+      {
+        "address": "addr_test1qpe6s9amgfwtu9u6lqj998vke6uncswr4dg88qqft5d7f67kfjf77qy57hqhnefcqyy7hmhsygj9j38rj984hn9r57fswc4wg0",
+        "output_index": 1,
+        "amount": [
+          {
+            "unit": "lovelace",
+            "quantity": "7000000"
+          }
+        ],
+        "data_hash": null,
+        "inline_datum": null,
+        "reference_script_hash": null,
+        "collateral": false,
+        "consumed_by_tx": "181f753497ddaf710d905d3be351dae2cee8ef6f85a60e13d4f34c7e1d9793c4"
+      }
+    ]
+  },
+  "redeemers": []
+}

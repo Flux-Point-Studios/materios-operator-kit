@@ -1366,7 +1366,7 @@ def _moved(rows: list[dict], valid: bool) -> list[dict]:
 
     A valid transaction's collateral is flagged ``collateral`` and stays unspent. A
     transaction whose script failed moves only its collateral and collateral return;
-    db-sync stores those as its inputs and outputs, so Blockfrost and Insight list them
+    db-sync stores those as its inputs and outputs; transaction-UTxO routes return them
     unflagged, where Blockfrost's documentation has them flagged. Every row of such a
     transaction counts, once per UTxO, as the row that lists the most units, since
     Blockfrost's flagged listing carries lovelace alone."""

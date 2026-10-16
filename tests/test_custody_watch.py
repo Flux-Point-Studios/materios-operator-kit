@@ -1985,6 +1985,12 @@ class FakeInsight:
             value = value[first:first + params["count"]]
         return copy.deepcopy(value)
 
+    def utxos(self, address, slot):
+        return []
+
+    def outputs(self, address, slot):
+        return []
+
     def history(self, address: str, from_slot: int, through_slot: int):
         self.calls.append(("history", address, from_slot))
         if self.indexed is not None and self.indexed < through_slot:

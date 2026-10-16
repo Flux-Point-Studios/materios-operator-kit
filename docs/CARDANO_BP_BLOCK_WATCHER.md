@@ -22,10 +22,15 @@ sudo install -d -m 0700 /etc/cardano-bp-block-watcher
 # write each secret from stdin, never from a command line
 sudo install -m 0600 /dev/stdin /etc/cardano-bp-block-watcher/insight.key
 sudo install -m 0600 /dev/stdin /etc/cardano-bp-block-watcher/discord-webhook
-sudo install -m 0700 ops/cardano_bp_block_watcher.py /home/cardano-bp/scripts/block-watcher.py
+sudo install -d -o root -g root -m 0755 /usr/local/lib/cardano-bp-block-watcher
+sudo install -o root -g root -m 0644 ops/cardano_bp_block_watcher.py /usr/local/lib/cardano-bp-block-watcher/block-watcher.py
 sudo install -m 0644 ops/cardano-bp-block-watcher.service ops/cardano-bp-block-watcher.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now cardano-bp-block-watcher.timer
 sudo systemctl start cardano-bp-block-watcher.service
 journalctl -u cardano-bp-block-watcher.service -n 5
 ```
+
+The service uses `DynamicUser=yes`; systemd grants access to its credentials and
+state directory. The executable and every parent directory are root-owned, outside
+user homes. A home-directory owner cannot replace code run by the service.

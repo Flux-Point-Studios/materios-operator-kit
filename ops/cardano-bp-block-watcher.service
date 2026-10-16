@@ -3,11 +3,12 @@ Description=Cardano BP block-forge watcher (poll Iagon Insight, page Discord on 
 
 [Service]
 Type=oneshot
+DynamicUser=yes
 LoadCredential=insight.key:/etc/cardano-bp-block-watcher/insight.key
 LoadCredential=discord-webhook:/etc/cardano-bp-block-watcher/discord-webhook
-ExecStart=/usr/bin/python3 /home/cardano-bp/scripts/block-watcher.py
+ExecStart=/usr/bin/python3 /usr/local/lib/cardano-bp-block-watcher/block-watcher.py
 StateDirectory=cardano-bp-block-watcher
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=true
 PrivateTmp=true
