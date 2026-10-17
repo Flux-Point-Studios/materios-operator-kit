@@ -1,5 +1,6 @@
 import functools
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -19,6 +20,64 @@ from daemon.voucher_canonicalize import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Slash signing contract fingerprint -> committee digest protocol. Derivation
+# and provenance: docs/slash-watcher-frv2.md. Never add a fallback protocol.
+SLASH_PROTOCOLS = {
+    "96dfe9b41a5471b578e065d9e3055a359e27e9a6576f94b1f932bd668219e85c": "FRAU",
+    "693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7": "FRV2",
+}
+
+
+def slash_contract_fingerprint(v14: dict) -> str:
+    """SHA-256 of the IntentSettlement items that define the slash signature.
+
+    Types are resolved structurally, so docs, Rust paths, type names and
+    registry ids never contribute.
+    """
+    types = {entry["id"]: entry["type"]["def"] for entry in v14["types"]["types"]}
+
+    def resolve(type_id, seen=()):
+        if type_id in seen:
+            raise ValueError("recursive type in slash contract")
+        seen += (type_id,)
+        (kind, body), = types[type_id].items()
+        if kind == "composite":
+            return {kind: fields(body["fields"], seen)}
+        if kind == "variant":
+            variants = sorted(body["variants"], key=lambda v: v["index"])
+            return {kind: [[v["index"], v["name"], fields(v["fields"], seen)] for v in variants]}
+        if kind in ("sequence", "compact"):
+            return {kind: resolve(body["type"], seen)}
+        if kind == "array":
+            return {kind: [body["len"], resolve(body["type"], seen)]}
+        if kind == "tuple":
+            return {kind: [resolve(item, seen) for item in body]}
+        if kind == "primitive":
+            return {kind: body}
+        raise ValueError(f"unsupported {kind} type in slash contract")
+
+    def fields(entries, seen=()):
+        return [[field["name"], resolve(field["type"], seen)] for field in entries]
+
+    def map_types(entry):
+        layout = entry["type"]["Map"]
+        return [resolve(layout["key"]), resolve(layout["value"])]
+
+    pallet = next(p for p in v14["pallets"] if p["name"] == "IntentSettlement")
+    calls = types[pallet["calls"]["ty"]]["variant"]["variants"]
+    call = next(c for c in calls if c["name"] == "slash_bad_settlement_evidence")
+    storage = {entry["name"]: entry for entry in pallet["storage"]["entries"]}
+    ttl = next(c for c in pallet["constants"] if c["name"] == "SettlementRequestTtl")
+    request_slashes = storage.get("SlashedSettlementRequests")
+    contract = {
+        "call": [call["index"], call["name"], fields(call["fields"])],
+        "requests": map_types(storage["ClaimSettlementRequests"]),
+        "request_slashes": None if request_slashes is None else map_types(request_slashes),
+        "ttl": [ttl["name"], resolve(ttl["type"])],
+    }
+    return hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -600,20 +659,7 @@ class SubstrateClient:
         try:
             if version["specName"] != "materios":
                 raise ValueError("unexpected spec name")
-            body = metadata.value[1]["V14"]
-            types = {entry["id"]: entry["type"]["def"] for entry in body["types"]["types"]}
-            pallet = next(p for p in body["pallets"] if p["name"] == "IntentSettlement")
-            calls = types[pallet["calls"]["ty"]]["variant"]["variants"]
-            call = next(c for c in calls if c["name"] == "slash_bad_settlement_evidence")
-            fingerprint = hashlib.sha256("\n".join(call["docs"]).encode()).hexdigest()
-            # An unfamiliar contract (including stripped docs) must be reviewed.
-            protocol = {
-                "aadf5c9cc7e213de2d6d4159210488bbe26477f2d9dd5f4c9ffe7a4a604539c8": "FRAU",
-                "8f28f5c971962e2b190d8f22619e492099f27da5a181da5bb1e39d33f75dd3d0": "FRV2",
-            }[fingerprint]
-            constant = next(c for c in pallet["constants"] if c["name"] == "SettlementRequestTtl")
-            if types[constant["type"]] != {"primitive": "u32"}:
-                raise ValueError("TTL is not u32")
+            protocol = SLASH_PROTOCOLS[slash_contract_fingerprint(metadata.value[1]["V14"])]
             constants = metadata.get_metadata_pallet("IntentSettlement").constants
             raw_ttl = next(c.constant_value for c in constants if c.name == "SettlementRequestTtl")
             if len(raw_ttl) != 4:

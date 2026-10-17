@@ -76,7 +76,7 @@
     {
       "id": "slash-watcher",
       "name": "Slash watcher",
-      "desc": "Bad-attestation detection with multisig-aggregated slash evidence. Selects FRAU or request-bound FRV2 from live runtime metadata, refuses unknown protocols, and filters requests using the chain TTL before signing and submission.",
+      "desc": "Bad-attestation detection with multisig-aggregated slash evidence. Selects FRAU or request-bound FRV2 from a docs-independent fingerprint of the runtime's slash signing contract, refuses unknown contracts, and filters requests using the chain TTL before signing and submission.",
       "kind": "agent",
       "paths": [
         "daemon/slash_watcher.py",

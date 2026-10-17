@@ -1,4 +1,6 @@
-use pallet_intent_settlement::{account_to_bytes, slash_bad_settlement_evidence_payload};
+use pallet_intent_settlement::{
+    account_to_bytes, settlement_request_id, slash_bad_settlement_evidence_payload,
+};
 use pallet_intent_settlement::types::{ClaimId, FraudProof, SettlementEvidence, SettlementRequestRecord};
 use parity_scale_codec::Encode;
 use serde_json::json;
@@ -20,6 +22,8 @@ fn vector<B: Copy + Into<u64> + Encode>(submitted: B, direct: bool, proof: Fraud
         submitted_block: submitted, settled_direct: direct, bond_amount: 10_000_000,
     };
     let preimage = (account_to_bytes(&request.requester), submitted.into(), request.evidence, direct).encode();
+    let request_id = settlement_request_id(&request);
+    assert_eq!(sp_io::hashing::blake2_256(&preimage), request_id, "request preimage drifted from the pallet");
     json!({
         "chain_id": hex(&chain_id), "claim_id": hex(claim_id.as_bytes()),
         "requester": hex(&request.requester), "submitted_block": submitted.into(),
@@ -30,7 +34,7 @@ fn vector<B: Copy + Into<u64> + Encode>(submitted: B, direct: bool, proof: Fraud
         "beneficiary_addr_hash": hex(&request.evidence.beneficiary_addr_hash),
         "amount_lovelace": request.evidence.amount_lovelace,
         "mainchain_genesis_hash": hex(&request.evidence.mainchain_genesis_hash),
-        "request_preimage": hex(&preimage), "request_id": hex(&sp_io::hashing::blake2_256(&preimage)),
+        "request_preimage": hex(&preimage), "request_id": hex(&request_id),
         "proof_scale": hex(&proof.encode()),
         "digest": hex(&slash_bad_settlement_evidence_payload(&chain_id, &claim_id, &request, &proof)),
     })
