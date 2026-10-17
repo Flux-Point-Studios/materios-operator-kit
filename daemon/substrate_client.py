@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import logging
 import os
 import threading
@@ -587,6 +588,41 @@ class SubstrateClient:
         detect that we're pointed at a different chain than we were last run
         (e.g. a chain reset) and self-heal stale daemon state."""
         return self._call("get_block_hash", 0, conn=self._read)
+
+    def get_slash_runtime_context(self) -> dict:
+        """Read the slash protocol and TTL from one head's post-state metadata."""
+        head = self._call("get_chain_head", conn=self._read)
+        version = self._call("get_block_runtime_version", head, conn=self._read)
+        block = self._call("get_block_number", head, conn=self._read)
+        # get_constant/get_metadata_call_function select the parent's runtime
+        # in substrate-interface 1.x, which is stale at an upgrade block.
+        metadata = self._call("get_block_metadata", head, conn=self._read)
+        try:
+            if version["specName"] != "materios":
+                raise ValueError("unexpected spec name")
+            body = metadata.value[1]["V14"]
+            types = {entry["id"]: entry["type"]["def"] for entry in body["types"]["types"]}
+            pallet = next(p for p in body["pallets"] if p["name"] == "IntentSettlement")
+            calls = types[pallet["calls"]["ty"]]["variant"]["variants"]
+            call = next(c for c in calls if c["name"] == "slash_bad_settlement_evidence")
+            fingerprint = hashlib.sha256("\n".join(call["docs"]).encode()).hexdigest()
+            # An unfamiliar contract (including stripped docs) must be reviewed.
+            protocol = {
+                "aadf5c9cc7e213de2d6d4159210488bbe26477f2d9dd5f4c9ffe7a4a604539c8": "FRAU",
+                "8f28f5c971962e2b190d8f22619e492099f27da5a181da5bb1e39d33f75dd3d0": "FRV2",
+            }[fingerprint]
+            constant = next(c for c in pallet["constants"] if c["name"] == "SettlementRequestTtl")
+            if types[constant["type"]] != {"primitive": "u32"}:
+                raise ValueError("TTL is not u32")
+            constants = metadata.get_metadata_pallet("IntentSettlement").constants
+            raw_ttl = next(c.constant_value for c in constants if c.name == "SettlementRequestTtl")
+            if len(raw_ttl) != 4:
+                raise ValueError("TTL width is not four bytes")
+            ttl = int.from_bytes(raw_ttl, "little")
+        except (KeyError, TypeError, ValueError, StopIteration, AttributeError) as error:
+            raise ValueError("unknown slash runtime metadata or TTL") from error
+        return dict(block_hash=head, block_number=block, protocol=protocol,
+                    ttl=ttl, spec_version=version["specVersion"])
 
     # --- Bond helpers (OrinqReceipts pallet) --------------------------------
     # These are used by CertDaemon._ensure_bond() to keep the attestor's
@@ -1443,7 +1479,7 @@ class SubstrateClient:
     # --- Slash helpers (task #84-watcher) -----------------------------------
     # spec-225 ships `slash_bad_settlement_evidence(claim_id, fraud_proof,
     # signatures)` (call_index 20 in pallet-intent-settlement::lib.rs). The
-    # daemon-side slash_watcher module assembles the M-of-N FRAU envelope
+    # daemon-side slash_watcher module assembles the M-of-N FRAU/FRV2 envelope
     # via the gateway aggregator and calls this helper to dispatch the
     # extrinsic. Encoding maps the daemon's typed FraudProof variant
     # (WrongAmount / TxNotFound / WrongBeneficiary) into the SCALE-encoded
@@ -1464,8 +1500,8 @@ class SubstrateClient:
         It's converted here to the substrate-interface variant-dict shape
         (``{"WrongAmount": {"actual_lovelace": int}}`` etc) — the encoder
         on the wire matches the byte-exact form
-        :func:`daemon.slash_watcher.encode_fraud_proof` produces (the FRAU
-        digest builder uses the latter, so the signatures bind to the
+        :func:`daemon.slash_watcher.encode_fraud_proof` produces (both
+        digest builders use the latter, so the signatures bind to the
         same bytes the runtime decodes).
 
         ``sigs`` is ``[(pubkey, sig), ...]``; the caller (the slash
