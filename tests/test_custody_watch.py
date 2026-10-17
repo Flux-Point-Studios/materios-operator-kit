@@ -2,17 +2,19 @@
 source health, and both sources driven by real chain history.
 
 Materios is served from the captured preprod blocks and runtime metadata;
-Cardano from the captured Blockfrost transactions (see test_custody_rules).
+Cardano from the captured Blockfrost-shaped transactions (see test_custody_rules).
 """
 
 import copy
 import dataclasses
 import functools
 import gzip
+import itertools
 import http.server
 import json
 import socket
 import threading
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1930,11 +1932,20 @@ def _tx(name: str) -> dict:
     return json.loads((FIX / "cardano" / f"{name}.json").read_text())
 
 
-class FakeBlockfrost:
-    """Serves Blockfrost routes from captured transactions."""
+# Block ``h`` of a fake chain sits at slot ``SLOTS_PER_BLOCK * h``: Cardano's mean
+# block interval in one-second slots.
+SLOTS_PER_BLOCK = 20
+
+
+class FakeInsight:
+    """Serves Insight's Blockfrost-compatible routes and its address history from
+    captured transactions."""
 
     def __init__(self, tip: int, time: int):
         self.routes = {"/blocks/latest": {"height": tip, "time": time}}
+        self.histories: dict[str, list[dict]] = {}
+        # The slot the history is indexed through; None keeps it at the tip.
+        self.indexed: int | None = None
         self.calls = []
 
     def add_tx(self, name: str, address: str | None = None, height: int | None = None,
@@ -1953,23 +1964,39 @@ class FakeBlockfrost:
         self.routes[f"/txs/{tx_hash}/utxos"] = doc["utxos"]
         self.routes[f"/txs/{tx_hash}/redeemers"] = redeemers
         if address is not None:
-            listing = self.routes.setdefault(f"/addresses/{address}/transactions", [])
-            listing.append({"tx_hash": tx_hash, "tx_index": 0, "block_height": doc["tx"]["block_height"],
-                            "block_time": doc["tx"]["block_time"]})
+            self.list_at(address, tx_hash, SLOTS_PER_BLOCK * doc["tx"]["block_height"])
         return tx_hash
+
+    def list_at(self, address: str, tx_hash: str, slot: int) -> None:
+        self.histories.setdefault(address, []).append(
+            {"tx_hash": tx_hash, "slot_no": slot, "block_no": slot // SLOTS_PER_BLOCK})
 
     def get(self, path, **params):
         self.calls.append((path, params))
+        if path == "/blocks/latest":
+            tip = self.routes[path]
+            return {**tip, "slot": SLOTS_PER_BLOCK * tip["height"]}
         value = self.routes.get(path)
-        if path.endswith("/transactions") and value is not None:
-            start = int(params.get("from", 0))
-            value = [row for row in value if row["block_height"] >= start]
-            if params.get("order") == "desc":
-                value = sorted(value, key=lambda row: (row["block_height"], row["tx_index"]), reverse=True)
+        if value is None and path.startswith("/blocks/"):
+            height = int(path.removeprefix("/blocks/"))
+            return {"height": height, "slot": SLOTS_PER_BLOCK * height}
         if isinstance(value, list) and "page" in params:
             first = (params["page"] - 1) * params["count"]
             value = value[first:first + params["count"]]
         return copy.deepcopy(value)
+
+    def utxos(self, address, slot):
+        return []
+
+    def outputs(self, address, slot):
+        return []
+
+    def history(self, address: str, from_slot: int, through_slot: int):
+        self.calls.append(("history", address, from_slot))
+        if self.indexed is not None and self.indexed < through_slot:
+            raise cw.SourceError(f"insight history of {address} is indexed to slot {self.indexed}")
+        rows = sorted(self.histories.get(address, []), key=lambda row: row["slot_no"])
+        return [copy.deepcopy(row) for row in rows if row["slot_no"] >= from_slot]
 
 
 def _mainnet(config):
@@ -1979,7 +2006,7 @@ def _mainnet(config):
 def test_the_first_poll_baselines_addresses_and_policies_without_alerting(config, tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     network = _mainnet(config)
-    api = FakeBlockfrost(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
+    api = FakeInsight(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
     api.add_tx("surrender_agent", address=network.pool.address)
     policy = network.policies[0].policy_id
     api.routes[f"/assets/policy/{policy}"] = [{"asset": network.pool.cmatra_unit, "quantity": "1"}]
@@ -1994,7 +2021,7 @@ def test_the_first_poll_baselines_addresses_and_policies_without_alerting(config
 def _baselined(config, tmp_path, tip=13_500_000):
     store = cw.Store(str(tmp_path / "state.db"))
     network = _mainnet(config)
-    api = FakeBlockfrost(tip=tip, time=int(_at("2026-09-27T01:00:00")))
+    api = FakeInsight(tip=tip, time=int(_at("2026-09-27T01:00:00")))
     source = cw.CardanoSource(network, api, store, stale_seconds=900)
     source.start_at(tip)
     return store, network, api, source
@@ -2011,8 +2038,35 @@ def test_a_new_surrender_is_classified_once_though_the_reorg_window_rescans_it(c
     assert finding.severity == rules.INFO and finding.kind == "surrender"
     assert finding.amount == 1056778496
     assert [c for c in api.calls if c[0] == f"/txs/{tx_hash}"] == [(f"/txs/{tx_hash}", {})]
-    rescans = [c[1]["from"] for c in api.calls if c[0] == f"/addresses/{network.pool.address}/transactions"]
-    assert rescans == ["13499970", "13499982"]
+    rescans = [c[2] for c in api.calls if c[:2] == ("history", network.pool.address)]
+    assert rescans == [SLOTS_PER_BLOCK * 13_499_970, SLOTS_PER_BLOCK * 13_499_982]
+
+
+def test_a_history_indexed_short_of_the_tip_leaves_the_cursor_for_the_next_poll(config, tmp_path):
+    store, network, api, source = _baselined(config, tmp_path)
+    tx_hash = api.add_tx("surrender_agent", address=network.pool.address, height=13_500_010)
+    api.routes["/blocks/latest"]["height"] = 13_500_012
+    api.indexed = SLOTS_PER_BLOCK * 13_500_012 - 1
+    with pytest.raises(cw.SourceError, match="indexed to slot"):
+        source.poll(_at("2026-09-27T01:01:00"))
+    assert store.get(f"cursor:cardano-mainnet:address:{network.pool.address}") == "13500000"
+    api.indexed = None
+    assert source.poll(_at("2026-09-27T01:02:00"))
+    assert [f.key for f in store.findings()] == [f"cardano-mainnet:{tx_hash}"]
+
+
+def test_the_reorg_window_starts_at_the_slot_insight_gives_its_first_block(config, tmp_path):
+    # Slots and heights do not advance in step, so the window's first slot is read, not reckoned.
+    store, network, api, source = _baselined(config, tmp_path)
+    first = 13_500_000 - network.reorg_depth_blocks
+    slot = SLOTS_PER_BLOCK * first + 593
+    api.routes[f"/blocks/{first}"] = {"height": first, "slot": slot}
+    inside = api.add_tx("surrender_agent", height=first)
+    before = api.add_tx("surrender_agent", height=first - 1, tx_hash="ab" * 32)
+    api.list_at(network.pool.address, before, slot - 1)
+    api.list_at(network.pool.address, inside, slot)
+    assert source.poll(_at("2026-09-27T01:01:00"))
+    assert [f.key for f in store.findings()] == [f"cardano-mainnet:{inside}"]
 
 
 def test_a_custody_wallet_outflow_pages_critical(config, tmp_path):
@@ -2030,7 +2084,7 @@ def test_a_custody_wallet_outflow_pages_critical(config, tmp_path):
 def test_a_mint_under_a_watched_policy_pages_critical(config, tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     network = _mainnet(config)
-    api = FakeBlockfrost(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
+    api = FakeInsight(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
     source = cw.CardanoSource(network, api, store, stale_seconds=900)
     unit = network.pool.cmatra_unit
     policy = network.policies[0].policy_id
@@ -2055,7 +2109,7 @@ class BurningHolder(cw.CardanoSource):
     one transaction each."""
 
     def __init__(self, network, store, clock, per_minute):
-        api = FakeBlockfrost(tip=13_600_000, time=int(clock[0]))
+        api = FakeInsight(tip=13_600_000, time=int(clock[0]))
         super().__init__(network, api, store, stale_seconds=900)
         self.api, self.per_minute, self.polls, self.burned = api, per_minute, 0, 0
         self.unit = network.pool.cmatra_unit
@@ -2129,7 +2183,7 @@ def _large_policy_watch(config, tmp_path):
     """A watched policy with more assets than are worth reading one by one every poll."""
     store = cw.Store(str(tmp_path / "state.db"))
     network = _mainnet(config)
-    api = FakeBlockfrost(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
+    api = FakeInsight(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
     source = cw.CardanoSource(network, api, store, stale_seconds=900)
     policy = network.policies[0].policy_id
     units = [network.pool.cmatra_unit] + [policy + f"{i:04x}" for i in range(cw.EXACT_POLICY_ASSETS)]
@@ -2164,7 +2218,7 @@ def test_a_mint_and_burn_that_cancel_out_under_a_large_policy_are_found_at_the_h
 def test_a_small_policy_has_every_mint_count_read_each_poll(config, tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     network = _mainnet(config)
-    api = FakeBlockfrost(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
+    api = FakeInsight(tip=13_500_000, time=int(_at("2026-09-27T01:00:00")))
     source = cw.CardanoSource(network, api, store, stale_seconds=900)
     unit, policy = network.pool.cmatra_unit, network.policies[0].policy_id
     api.routes[f"/assets/policy/{policy}"] = [{"asset": unit, "quantity": "5"}]
@@ -2250,7 +2304,7 @@ def test_a_transaction_the_classifier_cannot_read_pages_critical_once(config, tm
     assert finding.group == "cardano-mainnet unclassifiable"
 
 
-def test_an_address_blockfrost_has_never_seen_has_no_transactions(config, tmp_path):
+def test_an_address_insight_has_never_seen_has_no_transactions(config, tmp_path):
     store, network, api, source = _baselined(config, tmp_path)
     assert source.poll(_at("2026-09-27T01:01:00"))
     assert store.findings() == []
@@ -2272,7 +2326,7 @@ def _covered_source(covered, tmp_path, balance, api_class=None):
     held at the pin, and one surrender two days before the digest."""
     network = _mainnet(covered)
     store = cw.Store(str(tmp_path / "state.db"))
-    api = (api_class or FakeBlockfrost)(tip=13_989_360, time=int(_at("2026-09-28T13:00:00")))
+    api = (api_class or FakeInsight)(tip=13_989_360, time=int(_at("2026-09-28T13:00:00")))
     api.routes[f"/addresses/{network.pool.address}"] = {"amount": [
         {"unit": "lovelace", "quantity": "1500000"}, {"unit": network.pool.cmatra_unit, "quantity": str(balance)}]}
     api.routes[f"/addresses/{network.pool.quarantine_address}"] = {"amount": [
@@ -2307,35 +2361,49 @@ def test_a_pool_below_its_floor_pages_an_alert_once_a_day_and_the_digest_still_g
     assert "covers 87.13% of what is outstanding, below the 90% floor" in page["content"]
 
 
+def _pays_out(api, pool, tx_hash: str, cmatra: int) -> None:
+    """``tx_hash`` takes ``cmatra`` base units of cMATRA out of the pool."""
+    held = [{"address": pool.address, "amount": [{"unit": pool.cmatra_unit, "quantity": str(10 ** 15)}]}]
+    api.routes[f"/txs/{tx_hash}/utxos"] = {"inputs": held if cmatra else [], "outputs": [
+        {"address": pool.address, "amount": [{"unit": pool.cmatra_unit, "quantity": str(10 ** 15 - cmatra)}]}]}
+
+
 def test_the_weeks_pace_is_read_from_the_pools_newest_transactions(covered, tmp_path):
     # Anyone can pay dust into the pool. Read oldest first, 250 such payments early in the
     # week left the week's surrenders unread and the pace at nearly nothing.
     store, api, source = _covered_source(covered, tmp_path, TODAYS_POOL)
     pool = _mainnet(covered).pool
-    now = _at("2026-09-28T13:00:05")
-    listing = api.routes[f"/addresses/{pool.address}/transactions"]
-
-    def paid(tx_hash: str, height: int, when: float, cmatra: int) -> None:
-        listing.append({"tx_hash": tx_hash, "tx_index": 0, "block_height": height, "block_time": when})
-        held = [{"address": pool.address, "amount": [{"unit": pool.cmatra_unit, "quantity": str(10 ** 15)}]}]
-        api.routes[f"/txs/{tx_hash}/utxos"] = {"inputs": held if cmatra else [], "outputs": [
-            {"address": pool.address, "amount": [{"unit": pool.cmatra_unit, "quantity": str(10 ** 15 - cmatra)}]}]}
-
     for i in range(250):
-        paid(f"d{i:063x}", 13_960_000 + i, now - 6 * cw.DAY + i, 0)
+        api.list_at(pool.address, f"d{i:063x}", SLOTS_PER_BLOCK * (13_960_000 + i))
+        _pays_out(api, pool, f"d{i:063x}", 0)
     for i in range(6):
-        paid(f"e{i:063x}", 13_989_300 + i, now - cw.DAY + i, 3_400_000_000_000)
-    lines, _ = source.coverage(now)
+        api.list_at(pool.address, f"e{i:063x}", SLOTS_PER_BLOCK * (13_989_300 + i))
+        _pays_out(api, pool, f"e{i:063x}", 3_400_000_000_000)
+    lines, _ = source.coverage(_at("2026-09-28T13:00:05"))
     assert "redeemed in the last 7 days: at least 20,401,056.778496 cMATRA (57 transactions left unread)" in lines[1]
 
 
-class FailingPoolRead(FakeBlockfrost):
-    """Blockfrost failing every read of what the pool address holds."""
+def test_the_weeks_pace_counts_from_the_slot_a_week_before_the_digest(covered, tmp_path):
+    # A slot lasts one second, so the week starts the tip's slot less its age a week ago.
+    store, api, source = _covered_source(covered, tmp_path, TODAYS_POOL)
+    pool = _mainnet(covered).pool
+    now = _at("2026-09-28T13:00:05")
+    tip = api.get("/blocks/latest")
+    week_start = tip["slot"] - int(tip["time"] - (now - 7 * cw.DAY))
+    for tx_hash, slot, cmatra in (("e" * 64, week_start - 1, 1_000_000_000), ("f" * 64, week_start, 1_000_000)):
+        api.list_at(pool.address, tx_hash, slot)
+        _pays_out(api, pool, tx_hash, cmatra)
+    lines, _ = source.coverage(now)
+    assert "redeemed in the last 7 days: 1,057.778496 cMATRA;" in lines[1]
+
+
+class FailingPoolRead(FakeInsight):
+    """Insight failing every read of what the pool address holds."""
 
     def get(self, path, **params):
         if path == "/addresses/addr1w8s6rqdjlzm5he27v9s202p8vjumza8qfsmufm2f6dy68hg9mn27a":
             self.calls.append((path, params))
-            raise cw.SourceError("blockfrost answered HTTP 500 for the pool")
+            raise cw.SourceError("insight answered HTTP 500 for the pool")
         return super().get(path, **params)
 
 
@@ -2348,55 +2416,136 @@ def test_a_coverage_reading_that_fails_is_reported_in_the_digest_and_not_retried
     clock[0] += 120
     watch.cycle()
     [digest] = [p["content"] for p in posts.payloads]
-    assert "cardano-mainnet surrender pool coverage not read: SourceError: blockfrost answered HTTP 500" in digest
+    assert "cardano-mainnet surrender pool coverage not read: SourceError: insight answered HTTP 500" in digest
     assert "alive" in digest
     pool = _mainnet(covered).pool.address
     assert [c[0] for c in api.calls].count(f"/addresses/{pool}") == 1
 
 
-class _Blockfrost(http.server.BaseHTTPRequestHandler):
+class _Insight(http.server.BaseHTTPRequestHandler):
+    """Insight's two surfaces: a canned answer for any Blockfrost-compatible route, and an
+    address history paged as Insight pages it, at most ``page_cap`` rows a page; a
+    ``history`` of None is a history Insight does not serve."""
+
     status = 200
     body = b"{}"
     seen = []
+    history: list[dict] | None = []
+    page_cap = 500
+    indexed = 10 ** 12
 
     def do_GET(self):
-        type(self).seen.append((self.path, self.headers.get("project_id"), self.headers.get("User-Agent")))
-        self.send_response(type(self).status)
+        cls = type(self)
+        cls.seen.append((self.path, self.headers.get("project_id"), self.headers.get("User-Agent")))
+        url = urllib.parse.urlsplit(self.path)
+        if not url.path.startswith("/v1/tx/history/"):
+            status, body = cls.status, cls.body
+        elif cls.history is None:
+            status, body = 404, b'{"success": false}'
+        else:
+            status, body = 200, json.dumps(cls.page(dict(urllib.parse.parse_qsl(url.query)))).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(type(self).body)
+        self.wfile.write(body)
+
+    @classmethod
+    def page(cls, query: dict) -> dict:
+        """Newest first unless asked otherwise; ``fromSlot`` starts at that slot in the
+        order asked for, and ``offset`` then skips rows."""
+        asc = query.get("order", "desc") == "asc"
+        rows = cls.history if asc else cls.history[::-1]
+        if "fromSlot" in query:
+            start = int(query["fromSlot"])
+            rows = [r for r in rows if (r["slot_no"] >= start if asc else r["slot_no"] <= start)]
+        offset, limit = int(query.get("offset", 0)), min(int(query.get("limit", 100)), cls.page_cap)
+        page, more = rows[offset:offset + limit], offset + limit < len(rows)
+        pagination = {"limit": limit, "offset": offset, "hasMore": more}
+        if more:
+            pagination["next_cursor"] = page[-1]["slot_no"]
+        return {"success": True, "data": page, "pagination": pagination, "last_updated": {"slot_no": cls.indexed}}
 
     def log_message(self, *args):
         pass
 
 
 @pytest.fixture
-def blockfrost(tmp_path):
-    _Blockfrost.seen = []
-    server = http.server.HTTPServer(("127.0.0.1", 0), _Blockfrost)
+def insight(tmp_path):
+    _Insight.status, _Insight.body, _Insight.seen, _Insight.history = 200, b"{}", [], []
+    _Insight.page_cap, _Insight.indexed = 500, 10 ** 12
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Insight)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    key = tmp_path / "bf.key"
-    key.write_text("mainnetSECRETKEY\n")
-    yield cw.Blockfrost(f"http://127.0.0.1:{server.server_port}/api/v0", str(key), min_interval=0)
+    key = tmp_path / "insight.key"
+    key.write_text("SECRETKEY\n")
+    yield cw.Insight(f"http://127.0.0.1:{server.server_port}", str(key), min_interval=0)
     server.shutdown()
 
 
-def test_blockfrost_sends_the_project_key_and_a_named_agent(blockfrost):
-    _Blockfrost.status, _Blockfrost.body = 200, b'{"height": 5}'
-    assert blockfrost.get("/blocks/latest") == {"height": 5}
-    path, key, agent = _Blockfrost.seen[0]
+def test_insight_sends_the_key_and_a_named_agent(insight):
+    _Insight.status, _Insight.body = 200, b'{"height": 5}'
+    assert insight.get("/blocks/latest") == {"height": 5}
+    path, key, agent = _Insight.seen[0]
     assert path == "/api/v0/blocks/latest"
-    assert key == "mainnetSECRETKEY"
+    assert key == "SECRETKEY"
     assert agent and not agent.startswith("Python-urllib")
 
 
-def test_blockfrost_not_found_is_none_and_errors_never_carry_the_key(blockfrost):
-    _Blockfrost.status, _Blockfrost.body = 404, b'{"status_code": 404}'
-    assert blockfrost.get("/addresses/addr1x/transactions", order="asc") is None
-    _Blockfrost.status = 429
+def test_insight_not_found_is_none_and_errors_never_carry_the_key(insight):
+    _Insight.status, _Insight.body = 404, b'{"status_code": 404}'
+    assert insight.get("/addresses/addr1x") is None
+    _Insight.status = 429
     with pytest.raises(cw.SourceError) as err:
-        blockfrost.get("/blocks/latest")
+        insight.get("/blocks/latest")
     assert "429" in str(err.value) and "SECRETKEY" not in str(err.value)
+
+
+# The surrender pool's transactions up to height 14060391 as Blockfrost lists them (tx id,
+# height, index in block) and as Insight's history does (tx id, slot, height), tx ids
+# pseudonymized alike. Six of its slots hold two each.
+POOL_HISTORY = json.loads((FIX / "insight" / "surrender_pool_history.json").read_text())
+
+
+def _walk(insight, address: str, from_slot: int, through_slot: int = 0) -> list[str]:
+    """The history's tx ids, cut off one past everything served, so a cursor that repeats
+    rows or stalls fails rather than hangs."""
+    rows = itertools.islice(insight.history(address, from_slot, through_slot), len(_Insight.history) + 1)
+    return [row["tx_hash"] for row in rows]
+
+
+@pytest.mark.parametrize("page_cap", [500, 7, 1])
+def test_an_address_history_is_what_blockfrost_lists_from_the_same_block(insight, page_cap):
+    _Insight.history = [{"tx_hash": h, "slot_no": s, "block_no": b} for h, s, b in POOL_HISTORY["insight"]]
+    _Insight.page_cap = page_cap
+    slots = {b: s for _, s, b in POOL_HISTORY["insight"]}
+    heights = sorted(slots)
+    for height in heights[::25] + heights[-1:]:
+        listed = [h for h, at, _ in POOL_HISTORY["blockfrost"] if at >= height]
+        assert _walk(insight, POOL_HISTORY["address"], slots[height]) == listed
+
+
+def test_an_address_history_reads_past_a_slot_holding_more_than_a_page(insight):
+    rows = [(99, 2), (100, 25), (101, 3)]
+    _Insight.history = [{"tx_hash": f"{slot}-{i}", "slot_no": slot, "block_no": slot}
+                        for slot, n in rows for i in range(n)]
+    _Insight.page_cap = 7
+    assert _walk(insight, "addr1x", 0) == [r["tx_hash"] for r in _Insight.history]
+    assert _walk(insight, "addr1x", 100) == [r["tx_hash"] for r in _Insight.history[2:]]
+
+
+def test_an_unused_address_has_no_history_and_an_unserved_history_is_a_source_error(insight):
+    assert list(insight.history("addr1unused", 0, 0)) == []
+    _Insight.history = None
+    with pytest.raises(cw.SourceError, match="serves no history"):
+        list(insight.history("addr1x", 0, 0))
+
+
+def test_a_history_indexed_short_of_the_slot_asked_for_is_a_source_error(insight):
+    # A history read from behind the tip would let the cursor pass transactions it never listed.
+    _Insight.history = [{"tx_hash": "a", "slot_no": 5, "block_no": 5}]
+    _Insight.indexed = 99
+    assert _walk(insight, "addr1x", 0, through_slot=99) == ["a"]
+    with pytest.raises(cw.SourceError, match="indexed to slot 99, short of slot 100"):
+        list(insight.history("addr1x", 0, 100))
 
 
 # --- backtest, CLI and systemd --------------------------------------------------------
@@ -2407,7 +2556,7 @@ def test_a_backtest_reports_every_finding_in_its_window_and_pages_nothing(config
     blocks = {1829210: "block_1829210.json", 1829226: "block_1829226.json"}
     chain = FakeChain(head=1829226, blocks=blocks, state_at={1829226})
     network = _mainnet(config)
-    api = FakeBlockfrost(tip=13_500_100, time=int(_at("2026-09-27T01:00:00")))
+    api = FakeInsight(tip=13_500_100, time=int(_at("2026-09-27T01:00:00")))
     api.add_tx("surrender_agent", address=network.pool.address, height=13_500_050)
     sources = [cw.MateriosSource(config.materios, chain, store, config.source_stale_seconds),
                cw.CardanoSource(network, api, store, stale_seconds=10 ** 9)]
@@ -2477,7 +2626,7 @@ def test_the_systemd_watchdog_is_pinged_through_the_notify_socket(tmp_path, monk
 
 def test_a_relative_key_file_resolves_against_the_config_directory(tmp_path):
     doc = json.loads((FIX / "config.json").read_text())
-    doc["cardano"][0]["project_id_file"] = "blockfrost-mainnet.key"
+    doc["cardano"][0]["insight_key_file"] = "insight.key"
     config = rules.parse_config(doc, base_dir=tmp_path)
-    assert config.cardano[0].project_id_file == str(tmp_path / "blockfrost-mainnet.key")
-    assert config.cardano[1].project_id_file == "/nonexistent/blockfrost.key"
+    assert config.cardano[0].insight_key_file == str(tmp_path / "insight.key")
+    assert config.cardano[1].insight_key_file == "/nonexistent/insight.key"

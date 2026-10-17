@@ -6,7 +6,7 @@ responses for real transactions; wallet (key-hash) credentials and transaction
 ids are pseudonymized, while contract addresses, policies, amounts, datums and
 redeemers are as they are on chain. The two custody-wallet fixtures also carry a
 synthetic block position, and the outflow synthetic amounts. The failed-script
-fixture is a preprod transaction exactly as Blockfrost serves it.
+fixture is a preprod transaction exactly as Blockfrost and Insight serve it.
 """
 
 import copy
@@ -1194,7 +1194,7 @@ def _with_custody(network, address: str, label: str = "collateral-wallet"):
 def _failed_script(mutate=lambda utxos: None):
     """The real preprod transaction b9ebe459, whose script failed: db-sync stores the
     collateral it consumed and the collateral return it produced as its inputs and outputs,
-    so Blockfrost lists them unflagged, and lists no redeemer."""
+    so Blockfrost and Insight list them unflagged, and list no redeemer."""
     tx = copy.deepcopy(_tx("phase2_invalid_collateral"))
     assert tx["tx"]["valid_contract"] is False and tx["redeemers"] == []
     mutate(tx["utxos"])
@@ -1241,6 +1241,16 @@ def test_a_failed_scripts_collateral_listed_twice_counts_once_with_its_tokens(ne
         utxos["inputs"].append(flagged)
 
     finding = _classify_failed(networks, _failed_script(listed_twice))
+    assert finding.details[0] == "outflow from collateral-wallet: net -10.000000 ADA, -277,500,000.000000 cMATRA"
+
+
+def test_a_failed_scripts_collateral_flagged_with_every_unit_counts_once(networks):
+    # Insight's flagged collateral listing carries every unit of the UTxO.
+    def listed_twice_in_full(utxos):
+        _reserve_as_collateral(utxos)
+        utxos["inputs"].append({**copy.deepcopy(utxos["inputs"][0]), "collateral": True})
+
+    finding = _classify_failed(networks, _failed_script(listed_twice_in_full))
     assert finding.details[0] == "outflow from collateral-wallet: net -10.000000 ADA, -277,500,000.000000 cMATRA"
 
 

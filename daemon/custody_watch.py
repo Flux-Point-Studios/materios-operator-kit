@@ -1033,23 +1033,82 @@ class MateriosSource:
 # --- Cardano ------------------------------------------------------------------------------
 
 
-class Blockfrost:
-    """Blockfrost REST reads. The project key never appears in an error."""
+class Insight:
+    """Iagon Insight reads: its Blockfrost-compatible routes and its native address
+    history. The key never appears in an error."""
 
-    def __init__(self, base_url: str, project_id_file: str, min_interval: float = 0.12, timeout: float = 30.0):
-        self._base = base_url.rstrip("/")
-        self._key = Path(project_id_file).read_text().strip()
+    def __init__(self, url: str, key_file: str, min_interval: float = 0.12, timeout: float = 30.0):
+        self._url = url.rstrip("/")
+        self._key = Path(key_file).read_text().strip()
         self._min_interval = min_interval
         self._timeout = timeout
         self._last = 0.0
 
     def get(self, path: str, **params):
-        """The decoded JSON body, or None when Blockfrost answers 404."""
+        """The decoded JSON body of a Blockfrost-compatible route, or None when Insight answers 404."""
+        return self._read("/api/v0" + path, params)
+
+    def history(self, address: str, from_slot: int, through_slot: int):
+        """Transactions reported at ``address`` from ``from_slot`` on, oldest first, each once.
+        History must be indexed through ``through_slot`` before advancing the cursor.
+        Collateral-only spends require the output reconciliation in CardanoSource.
+
+        Insight ignores Blockfrost's ``from`` on an address's transactions, so they are read
+        from its native history. A page's ``next_cursor`` alone would re-read the rows of the
+        page's last slot and never leave a slot holding a page of them; the cursor here is
+        that slot and how many of its rows were read."""
+        slot, offset = from_slot, 0
+        while True:
+            page = self._read(f"/v1/tx/history/{address}", {
+                "order": "asc", "limit": HISTORY_PAGE, "fromSlot": slot, "offset": offset})
+            if page is None:
+                raise SourceError(f"insight serves no history for {address}")
+            indexed = page["last_updated"]["slot_no"]
+            if indexed < through_slot:
+                raise SourceError(f"insight history of {address} is indexed to slot {indexed}, "
+                                  f"short of slot {through_slot}")
+            rows = page["data"]
+            yield from rows
+            if not rows or not page["pagination"]["hasMore"]:
+                return
+            last = rows[-1]["slot_no"]
+            at_last = sum(1 for row in rows if row["slot_no"] == last)
+            offset = offset + at_last if last == slot else at_last
+            slot = last
+
+    def utxos(self, address: str, slot: int) -> list[dict]:
+        return self._output_pages(f"/v1/utxos/address/{address}", slot, atSlot=slot)
+
+    def outputs(self, address: str, slot: int) -> list[dict]:
+        return self._output_pages(f"/v1/outputs/address/{address}", slot, order="asc")
+
+    def _output_pages(self, path: str, slot: int, **params) -> list[dict]:
+        rows = []
+        seen = set()
+        while True:
+            page = self._read(path, {**params, "limit": HISTORY_PAGE, "offset": len(rows)})
+            if page is None or not page.get("success"):
+                raise SourceError(f"insight serves no outputs for {path}")
+            if page["last_updated"]["slot_no"] < slot:
+                raise SourceError(f"insight outputs are indexed short of slot {slot}")
+            batch = page["data"]
+            for row in batch:
+                ref = (row.get("transaction_id", row.get("tx_hash")), row["output_index"])
+                if not ref[0] or ref in seen:
+                    raise SourceError("insight output pagination repeated or invalid reference")
+                seen.add(ref)
+            rows.extend(batch)
+            if not page["pagination"]["hasMore"]:
+                return rows
+            if not batch or len(rows) > 100000:
+                raise SourceError("insight output pagination made no progress or exceeded limit")
+
+    def _read(self, path: str, params: dict):
         wait = self._last + self._min_interval - time.monotonic()
         if wait > 0:
             time.sleep(wait)
         self._last = time.monotonic()
-        url = self._base + path + ("?" + urllib.parse.urlencode(params) if params else "")
+        url = self._url + path + ("?" + urllib.parse.urlencode(params) if params else "")
         request = urllib.request.Request(url, headers={
             "project_id": self._key, "User-Agent": discord.USER_AGENT, "Accept": "application/json"})
         try:
@@ -1058,18 +1117,18 @@ class Blockfrost:
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
-            raise SourceError(f"blockfrost answered HTTP {e.code} for {path}") from None
+            raise SourceError(f"insight answered HTTP {e.code} for {path}") from None
         except (urllib.error.URLError, OSError, ValueError) as e:
-            raise SourceError(f"blockfrost unreachable for {path}: {type(e).__name__}") from None
+            raise SourceError(f"insight unreachable for {path}: {type(e).__name__}") from None
 
 
 PAGE = 100
+# The most rows Insight serves in one page of an address's history.
+HISTORY_PAGE = 500
 MAX_TX_PER_POLL = 200
 EXACT_POLICY_ASSETS = 10
-# Cardano's mean block interval, and how many blocks further back than that a trailing
-# window's listing starts, so a slow week never leaves a transaction out.
+# Cardano's mean block interval.
 CARDANO_BLOCK_SECONDS = 20
-WINDOW_MARGIN_BLOCKS = 2_000
 
 
 class CardanoSource:
@@ -1116,7 +1175,10 @@ class CardanoSource:
     def _pages(self, path: str, first_page: int = 1, **params):
         page = first_page
         while True:
-            rows = self._api.get(path, count=PAGE, page=page, **params) or []
+            rows = self._api.get(path, count=PAGE, page=page, **params)
+            if rows is None and path.endswith("/history"):
+                raise SourceError(f"insight serves no history for {path}")
+            rows = rows or []
             yield from rows
             if len(rows) < PAGE:
                 return
@@ -1128,7 +1190,7 @@ class CardanoSource:
         polls, so pages and the systemd watchdog run between them."""
         tip = self._api.get("/blocks/latest")
         if tip is None:
-            raise SourceError(f"{self.name}: blockfrost served no chain tip")
+            raise SourceError(f"{self.name}: insight served no chain tip")
         age = now - tip["time"]
         if age > self._stale_seconds:
             raise SourceError(f"{self.name}: chain tip {tip['height']} is {int(age) // 60} min old")
@@ -1139,6 +1201,7 @@ class CardanoSource:
         pending: dict[str, int | None] = {}
         cursors: dict[str, str] = {f"cursor:{self.name}:tip": str(height)}
 
+        slots: dict[int, int] = {}
         for address in self._addresses:
             key = self._address_key(address)
             cursor = self._store.get(key)
@@ -1146,7 +1209,9 @@ class CardanoSource:
             if cursor is None:
                 continue
             start = max(int(cursor) - self._network.reorg_depth_blocks, 0)
-            for row in self._pages(f"/addresses/{address}/transactions", order="asc", **{"from": str(start)}):
+            if start not in slots:
+                slots[start] = self._slot(start)
+            for row in self._api.history(address, slots[start], tip["slot"]):
                 pending[row["tx_hash"]] = None
 
         for policy in self._network.policies:
@@ -1176,22 +1241,77 @@ class CardanoSource:
                     first_page = seen // PAGE + 1
                     history = list(self._pages(f"/assets/{unit}/history", first_page=first_page, order="asc"))
                     offset = (first_page - 1) * PAGE
-                    for entry in history[seen - offset:count - offset]:
+                    unread = history[seen - offset:count - offset]
+                    if len(unread) != count - seen:
+                        raise SourceError(f"insight mint history for {unit} is short of count {count}")
+                    for entry in unread:
                         pending.setdefault(entry["tx_hash"], floor)
                 cursors[key] = str(count)
+
+        missing = {}
+        for watched in self._network.addresses:
+            if watched.role != "custody":
+                continue
+            address = watched.address
+            snapshot_key = f"snapshot:{self.name}:{address}"
+            previous = self._store.get(snapshot_key)
+            previous = json.loads(previous) if previous is not None else None
+            if previous is not None and tip["slot"] < previous["slot"]:
+                raise SourceError(f"{self.name}: tip is behind persisted custody snapshot")
+            current = {f"{row['transaction_id']}#{row['output_index']}"
+                       for row in self._api.utxos(address, tip["slot"])}
+            outputs = self._api.outputs(address, tip["slot"])
+            # Ascending output enumeration also sees outputs received and spent between polls.
+            floor_slot = previous["slot"] if previous else tip["slot"]
+            if previous is None:
+                cursor = self._store.get(self._address_key(address))
+                if cursor is not None:
+                    floor_slot = self._slot(max(int(cursor) - self._network.reorg_depth_blocks, 0))
+            vanished = set(previous["refs"]) - current if previous else set()
+            for row in outputs:
+                spent = row["spent_by"]
+                if spent is None or spent["slot_no"] > tip["slot"]:
+                    continue
+                ref = f"{row['tx_hash']}#{row['output_index']}"
+                if ref in vanished or spent["slot_no"] >= floor_slot:
+                    pending[spent["tx_hash"]] = None
+            missing[address] = (watched.label, vanished)
+            cursors[snapshot_key] = json.dumps({"slot": tip["slot"], "refs": sorted(current)})
 
         todo = [(h, floor) for h, floor in pending.items() if not self._store.processed(f"{self.name}:{h}")]
         for tx_hash, floor in todo[:MAX_TX_PER_POLL]:
             self._classify(tx_hash, now, floor)
         if len(todo) > MAX_TX_PER_POLL:
             return False
+        # A spent_by pointer alone cannot prove consumption; verify the ledger inputs.
+        if any(refs for _, refs in missing.values()):
+            for tx_hash in pending:
+                tx = self._api.get(f"/txs/{tx_hash}")
+                utxos = self._api.get(f"/txs/{tx_hash}/utxos")
+                if tx is None or utxos is None:
+                    raise SourceError(f"{self.name}: missing consumption proof for {tx_hash}")
+                for row in rules._moved(utxos["inputs"], tx["valid_contract"]):
+                    if row["address"] in missing:
+                        missing[row["address"]][1].discard(f"{row['tx_hash']}#{row['output_index']}")
+        unexplained = [rules.Finding(
+            severity=rules.CRITICAL, key=f"{self.name}:missing:{address}:{ref}",
+            kind="unexplained-custody-outflow", authority=True,
+            headline=f"{self.name}: unexplained custody UTxO disappearance",
+            details=(f"{label}: {ref} vanished at slot {tip['slot']}",))
+            for address, (label, refs) in missing.items() for ref in sorted(refs)]
         overruns = self._redemption_overruns()
         with self._store.transaction():
             for key, value in cursors.items():
                 self._store.put(key, value)
-            for finding in overruns:
+            for finding in overruns + unexplained:
                 self._store.add(finding, now)
         return True
+
+    def _slot(self, height: int) -> int:
+        block = self._api.get(f"/blocks/{height}")
+        if block is None:
+            raise SourceError(f"{self.name}: insight does not serve block {height}")
+        return block["slot"]
 
     def _redemption_overruns(self) -> list[rules.Finding]:
         pool = self._network.pool
@@ -1200,7 +1320,7 @@ class CardanoSource:
         return rules.redemption_overruns(self._network, self._holding(pool.quarantine_address))
 
     def _holding(self, address: str) -> dict[str, int]:
-        """What ``address`` holds now, by unit; nothing for an address Blockfrost has never seen."""
+        """What ``address`` holds now, by unit; nothing for an address Insight has never seen."""
         holding = self._api.get(f"/addresses/{address}")
         return {a["unit"]: int(a["quantity"]) for a in holding["amount"]} if holding else {}
 
@@ -1224,16 +1344,14 @@ class CardanoSource:
         pool = self._network.pool
         tip = self._api.get("/blocks/latest")
         if tip is None:
-            raise SourceError(f"{self.name}: blockfrost served no chain tip")
-        start = tip["height"] - int(tip["time"] - since) // CARDANO_BLOCK_SECONDS - WINDOW_MARGIN_BLOCKS
-        rows = [row for row in self._pages(f"/addresses/{pool.address}/transactions", order="desc",
-                                           **{"from": str(max(start, 0))})
-                if row["block_time"] >= since]
+            raise SourceError(f"{self.name}: insight served no chain tip")
+        # A slot has lasted one second in every era since Shelley.
+        rows = list(self._api.history(pool.address, math.ceil(tip["slot"] - (tip["time"] - since)), tip["slot"]))
         paid = 0
-        for row in rows[:MAX_TX_PER_POLL]:
+        for row in rows[-MAX_TX_PER_POLL:]:
             utxos = self._api.get(f"/txs/{row['tx_hash']}/utxos")
             if utxos is None:
-                raise SourceError(f"{self.name}: blockfrost does not serve transaction {row['tx_hash']} yet")
+                raise SourceError(f"{self.name}: insight does not serve transaction {row['tx_hash']} yet")
             paid += rules.pool_outflow(pool, utxos)
         return paid, max(0, len(rows) - MAX_TX_PER_POLL)
 
@@ -1245,7 +1363,7 @@ class CardanoSource:
             return
         utxos = self._api.get(f"/txs/{tx_hash}/utxos")
         if tx is None or utxos is None:
-            raise SourceError(f"{self.name}: blockfrost does not serve transaction {tx_hash} yet")
+            raise SourceError(f"{self.name}: insight does not serve transaction {tx_hash} yet")
         redeemers = self._api.get(f"/txs/{tx_hash}/redeemers") or []
         for redeemer in redeemers:
             datum = self._api.get(f"/scripts/datum/{redeemer['redeemer_data_hash']}")
@@ -1289,7 +1407,7 @@ def build_sources(config: rules.WatchConfig, store: Store, materios_rpc: str | N
         client = SubstrateClient(DaemonConfig(rpc_url=materios_rpc or config.materios.rpc_url))
         sources.append(MateriosSource(config.materios, client, store, config.source_stale_seconds))
     for network in config.cardano:
-        api = Blockfrost(network.blockfrost_url, network.project_id_file)
+        api = Insight(network.insight_url, network.insight_key_file)
         sources.append(CardanoSource(network, api, store, config.source_stale_seconds))
     return sources
 

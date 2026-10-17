@@ -139,8 +139,8 @@ class SurrenderPool:
 @dataclass(frozen=True)
 class CardanoNetwork:
     name: str
-    blockfrost_url: str
-    project_id_file: str
+    insight_url: str
+    insight_key_file: str
     poll_seconds: int
     reorg_depth_blocks: int
     addresses: tuple[WatchedAddress, ...]
@@ -215,8 +215,8 @@ def _parse_network(doc: dict, base_dir: Path | None) -> CardanoNetwork:
         raise ValueError(f"{doc['name']}: surrender_pool coverage needs the quarantine_address it counts")
     return CardanoNetwork(
         name=doc["name"],
-        blockfrost_url=doc["blockfrost_url"].rstrip("/"),
-        project_id_file=_relative(doc["project_id_file"], base_dir),
+        insight_url=doc["insight_url"].rstrip("/"),
+        insight_key_file=_relative(doc["insight_key_file"], base_dir),
         poll_seconds=int(doc.get("poll_seconds", 60)),
         reorg_depth_blocks=int(doc.get("reorg_depth_blocks", 30)),
         addresses=tuple(addresses),
@@ -1366,10 +1366,10 @@ def _moved(rows: list[dict], valid: bool) -> list[dict]:
 
     A valid transaction's collateral is flagged ``collateral`` and stays unspent. A
     transaction whose script failed moves only its collateral and collateral return;
-    db-sync stores those as its inputs and outputs, so Blockfrost lists them unflagged,
-    where its documentation has them flagged. Every row of such a transaction counts,
-    once per UTxO, as the row that lists the most units, since the flagged listing
-    carries lovelace alone."""
+    db-sync stores those as its inputs and outputs; transaction-UTxO routes return them
+    unflagged, where Blockfrost's documentation has them flagged. Every row of such a
+    transaction counts, once per UTxO, as the row that lists the most units, since
+    Blockfrost's flagged listing carries lovelace alone."""
     if valid:
         return [u for u in rows if not u.get("reference") and not u.get("collateral")]
     kept: dict[tuple, dict] = {}
