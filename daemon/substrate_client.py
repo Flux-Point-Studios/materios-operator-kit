@@ -1,4 +1,6 @@
 import functools
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -18,6 +20,64 @@ from daemon.voucher_canonicalize import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Slash signing contract fingerprint -> committee digest protocol. Derivation
+# and provenance: docs/slash-watcher-frv2.md. Never add a fallback protocol.
+SLASH_PROTOCOLS = {
+    "96dfe9b41a5471b578e065d9e3055a359e27e9a6576f94b1f932bd668219e85c": "FRAU",
+    "693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7": "FRV2",
+}
+
+
+def slash_contract_fingerprint(v14: dict) -> str:
+    """SHA-256 of the IntentSettlement items that define the slash signature.
+
+    Types are resolved structurally, so docs, Rust paths, type names and
+    registry ids never contribute.
+    """
+    types = {entry["id"]: entry["type"]["def"] for entry in v14["types"]["types"]}
+
+    def resolve(type_id, seen=()):
+        if type_id in seen:
+            raise ValueError("recursive type in slash contract")
+        seen += (type_id,)
+        (kind, body), = types[type_id].items()
+        if kind == "composite":
+            return {kind: fields(body["fields"], seen)}
+        if kind == "variant":
+            variants = sorted(body["variants"], key=lambda v: v["index"])
+            return {kind: [[v["index"], v["name"], fields(v["fields"], seen)] for v in variants]}
+        if kind in ("sequence", "compact"):
+            return {kind: resolve(body["type"], seen)}
+        if kind == "array":
+            return {kind: [body["len"], resolve(body["type"], seen)]}
+        if kind == "tuple":
+            return {kind: [resolve(item, seen) for item in body]}
+        if kind == "primitive":
+            return {kind: body}
+        raise ValueError(f"unsupported {kind} type in slash contract")
+
+    def fields(entries, seen=()):
+        return [[field["name"], resolve(field["type"], seen)] for field in entries]
+
+    def map_types(entry):
+        layout = entry["type"]["Map"]
+        return [resolve(layout["key"]), resolve(layout["value"])]
+
+    pallet = next(p for p in v14["pallets"] if p["name"] == "IntentSettlement")
+    calls = types[pallet["calls"]["ty"]]["variant"]["variants"]
+    call = next(c for c in calls if c["name"] == "slash_bad_settlement_evidence")
+    storage = {entry["name"]: entry for entry in pallet["storage"]["entries"]}
+    ttl = next(c for c in pallet["constants"] if c["name"] == "SettlementRequestTtl")
+    request_slashes = storage.get("SlashedSettlementRequests")
+    contract = {
+        "call": [call["index"], call["name"], fields(call["fields"])],
+        "requests": map_types(storage["ClaimSettlementRequests"]),
+        "request_slashes": None if request_slashes is None else map_types(request_slashes),
+        "ttl": [ttl["name"], resolve(ttl["type"])],
+    }
+    return hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +647,28 @@ class SubstrateClient:
         detect that we're pointed at a different chain than we were last run
         (e.g. a chain reset) and self-heal stale daemon state."""
         return self._call("get_block_hash", 0, conn=self._read)
+
+    def get_slash_runtime_context(self) -> dict:
+        """Read the slash protocol and TTL from one head's post-state metadata."""
+        head = self._call("get_chain_head", conn=self._read)
+        version = self._call("get_block_runtime_version", head, conn=self._read)
+        block = self._call("get_block_number", head, conn=self._read)
+        # get_constant/get_metadata_call_function select the parent's runtime
+        # in substrate-interface 1.x, which is stale at an upgrade block.
+        metadata = self._call("get_block_metadata", head, conn=self._read)
+        try:
+            if version["specName"] != "materios":
+                raise ValueError("unexpected spec name")
+            protocol = SLASH_PROTOCOLS[slash_contract_fingerprint(metadata.value[1]["V14"])]
+            constants = metadata.get_metadata_pallet("IntentSettlement").constants
+            raw_ttl = next(c.constant_value for c in constants if c.name == "SettlementRequestTtl")
+            if len(raw_ttl) != 4:
+                raise ValueError("TTL width is not four bytes")
+            ttl = int.from_bytes(raw_ttl, "little")
+        except (KeyError, TypeError, ValueError, StopIteration, AttributeError) as error:
+            raise ValueError("unknown slash runtime metadata or TTL") from error
+        return dict(block_hash=head, block_number=block, protocol=protocol,
+                    ttl=ttl, spec_version=version["specVersion"])
 
     # --- Bond helpers (OrinqReceipts pallet) --------------------------------
     # These are used by CertDaemon._ensure_bond() to keep the attestor's
@@ -1443,7 +1525,7 @@ class SubstrateClient:
     # --- Slash helpers (task #84-watcher) -----------------------------------
     # spec-225 ships `slash_bad_settlement_evidence(claim_id, fraud_proof,
     # signatures)` (call_index 20 in pallet-intent-settlement::lib.rs). The
-    # daemon-side slash_watcher module assembles the M-of-N FRAU envelope
+    # daemon-side slash_watcher module assembles the M-of-N FRAU/FRV2 envelope
     # via the gateway aggregator and calls this helper to dispatch the
     # extrinsic. Encoding maps the daemon's typed FraudProof variant
     # (WrongAmount / TxNotFound / WrongBeneficiary) into the SCALE-encoded
@@ -1464,8 +1546,8 @@ class SubstrateClient:
         It's converted here to the substrate-interface variant-dict shape
         (``{"WrongAmount": {"actual_lovelace": int}}`` etc) — the encoder
         on the wire matches the byte-exact form
-        :func:`daemon.slash_watcher.encode_fraud_proof` produces (the FRAU
-        digest builder uses the latter, so the signatures bind to the
+        :func:`daemon.slash_watcher.encode_fraud_proof` produces (both
+        digest builders use the latter, so the signatures bind to the
         same bytes the runtime decodes).
 
         ``sigs`` is ``[(pubkey, sig), ...]``; the caller (the slash

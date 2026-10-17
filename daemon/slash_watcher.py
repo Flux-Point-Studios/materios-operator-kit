@@ -1,103 +1,17 @@
-"""Cert-daemon module that prosecutes fraudulent ``SettlementEvidence``
-posts via the spec-225 ``slash_bad_settlement_evidence`` extrinsic
-(task #84-watcher).
+"""Prosecute fraudulent bonded settlement evidence using Cardano observations.
 
-Why this exists
----------------
-Spec-225 (live on Materios preprod 2026-05-15 block hash
-``0x14389692...``) shipped three permissionless bond-and-slash
-extrinsics on ``pallet-intent-settlement``:
+The live runtime metadata selects FRAU or request-bound FRV2 signatures.
+Unknown contracts and expired requests are refused before signing; runtime
+and expiry are checked again under the shared write lock before submission.
+Peer signatures are aggregated only for the locally computed digest.
 
-  * ``post_settlement_bond(claim_id, amount)`` — requester opt-in bond
-    against their ``request_settle`` evidence.
-  * ``release_settlement_bond(claim_id)`` — refund the bond after the
-    post-attest delay if no fraud was prosecuted.
-  * ``slash_bad_settlement_evidence(claim_id, fraud_proof, signatures)``
-    — permissionless slash: a watcher proves the requester's evidence
-    is fraudulent; M-of-N committee co-signs the canonical FRAU
-    digest; the bond gets repatriated (watcher share + treasury
-    share).
+FraudProof SCALE discriminants are WrongAmount=0 (u128 LE), TxNotFound=1,
+and WrongBeneficiary=2 ([u8; 28]). FRV2 adds a request identity over the
+requester, normalized u64 submission block, evidence, and settlement mode.
+Rust-generated parity fixtures pin these encodings.
 
-Without a daemon-side autonomous watcher, the slash path is on chain
-but no automated party calls ``slash_bad_settlement_evidence``. This
-module closes that gap. It polls Materios for bonded
-``ClaimSettlementRequests`` rows, independently observes each Cardano
-tx via the existing Ogmios+Kupo follower (same infrastructure the
-settle and expire attestors use), classifies the evidence as fraud
-when it disagrees with reality, signs the canonical FRAU digest with
-the cert-daemon sr25519 committee key, and submits the slash via the
-gateway-mediated multisig aggregator (M-sig envelope).
-
-Fraud classification (per task brief)
--------------------------------------
-For each ``ClaimSettlementRequests`` row with ``bond_amount > 0``:
-
-1. **Look up the Cardano tx** referenced by
-   ``evidence.cardano_tx_hash`` via Ogmios+Kupo (Kupo for tx
-   enumeration, Ogmios for genesis hash + tip + chain-sync block
-   height). If the tx does NOT exist at the claimed depth → fraud
-   variant ``TxNotFound``.
-
-2. **If the tx exists**, parse its outputs. For each output whose
-   payment-key hash matches ``evidence.beneficiary_addr_hash``, sum
-   the lovelace. Compare:
-     * Beneficiary mismatch — the tx pays a DIFFERENT 28-byte
-       payment-key hash. Surface the actual hash via
-       ``WrongBeneficiary { actual_payment_hash }``.
-     * Amount mismatch — the tx pays the expected beneficiary but at
-       a different amount. Surface the actual amount via
-       ``WrongAmount { actual_lovelace }``.
-
-3. **Honest evidence** (tx exists, beneficiary matches, amount matches)
-   — no slash. The settle attestor's normal STCA path handles the
-   close.
-
-Priority order: ``TxNotFound`` takes precedence over the
-field-mismatch variants. If the tx isn't on chain we can't
-meaningfully check fields against it.
-
-Transient-error safety
-----------------------
-A Cardano L1 query that times out or returns an unrecognised shape is
-NOT classified as ``TxNotFound`` — that would be a false positive
-that slashes an honest requester. The watcher logs the transient at
-WARNING and skips the row for the current tick; the next poll cycle
-retries. This is the same fail-safe-on-tooling-error contract the
-settle attestor's ``OBSERVER_UNAVAILABLE`` refusal expresses.
-
-FraudProof SCALE encoding (byte-pinned)
----------------------------------------
-The pallet's ``slash_bad_settlement_evidence_payload`` hashes:
-
-::
-
-    blake2_256(b"FRAU" || materios_chain_id (32B)
-                       || claim_id (32B)
-                       || scale(fraud_proof))
-
-``scale(fraud_proof)`` is the SCALE encoding of the
-``FraudProof`` enum, source variant order
-(``types.rs`` lines 448-464):
-
-   * ``WrongAmount { actual_lovelace: u128 }`` — discriminant 0
-   * ``TxNotFound`` — discriminant 1
-   * ``WrongBeneficiary { actual_payment_hash: [u8; 28] }`` —
-     discriminant 2
-
-Encoding by variant:
-
-   * ``WrongAmount`` → ``[0x00] || u128_le_bytes(actual_lovelace)``
-     (17 bytes total: 1B discriminant + 16B u128 LE).
-   * ``TxNotFound`` → ``[0x01]`` (1 byte).
-   * ``WrongBeneficiary`` →
-     ``[0x02] || actual_payment_hash (28B)`` (29 bytes total).
-
-We hand-roll the encoder because each variant body is < 30 bytes
-and the byte layout is fully specified by SCALE's spec. The unit
-test ``test_fraud_proof_scale_encoding`` pins the discriminants +
-field layout byte-exact so a future variant reorder in the pallet
-will turn the test red before it could ever ship a wrong-discriminant
-slash.
+Cardano query failures remain deferrals. TxNotFound requires a synced Kupo
+follower; a missing response alone never proves fraud.
 """
 
 from __future__ import annotations
@@ -110,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import aiohttp
+from scalecodec.utils.ss58 import ss58_decode
 
 # Reuse the Cardano follower built for the settle path. The slash
 # watcher has the SAME L1 observation needs (tip, genesis, tx slot,
@@ -128,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# FRAU domain tag + FraudProof SCALE encoder.
+# Legacy FRAU domain tag + FraudProof SCALE encoder.
 #
 # PINNED to pallet-intent-settlement::slash_bad_settlement_evidence_payload
 # (lib.rs lines 599-633) and the FraudProof enum (types.rs lines 448-464).
@@ -149,6 +64,7 @@ logger = logging.getLogger(__name__)
 # turn the discriminant-pinning test red before it could ever ship.
 # ---------------------------------------------------------------------------
 TAG_FRAU: bytes = b"FRAU"
+TAG_FRV2: bytes = b"FRV2"
 
 # FraudProof variant discriminants — pinned to the Rust enum order in
 # `pallets/intent-settlement/src/types.rs` lines 448-464. SCALE assigns
@@ -268,7 +184,7 @@ def build_frau_preimage(
     claim_id: bytes,
     fraud_proof: FraudProof,
 ) -> bytes:
-    """Build the FRAU preimage that the pallet's
+    """Build the legacy FRAU preimage that the pallet's
     ``slash_bad_settlement_evidence_payload`` will rebuild at verify
     time.
 
@@ -293,13 +209,7 @@ def build_frau_preimage(
 
 
 def compute_frau_digest(preimage: bytes) -> bytes:
-    """Hash the FRAU preimage with blake2_256 (same hasher as the
-    pallet's ``domain_hash``). Returns 32 bytes.
-
-    No length assertion: unlike STCA/EXPP the FRAU preimage is
-    variant-width (69/85/97 bytes); the right invariant lives in
-    :func:`build_frau_preimage` which validates the components.
-    """
+    """Hash a validated FRAU or FRV2 preimage with blake2_256."""
     return hashlib.blake2b(preimage, digest_size=32).digest()
 
 
@@ -308,8 +218,7 @@ def compute_frau_digest(preimage: bytes) -> bytes:
 #
 # Mirrors :class:`daemon.settle_claim_attestor.PendingSettlementRequest`
 # minus the chain-state ``voucher_digest`` (which the slash path
-# doesn't need — the slash digest binds only chain_id + claim_id +
-# fraud_proof). The dispatcher converts the dicts returned by
+# doesn't need). The dispatcher converts the dicts returned by
 # ``substrate_client.list_pending_settlement_requests`` into this
 # dataclass at the boundary, exactly the same pattern the settle and
 # expire dispatchers use.
@@ -328,9 +237,9 @@ class PendingBondedRequest:
 
     The ``voucher_digest`` field is consumed by the settle attestor but
     NOT by the slash watcher. The pallet's slash dispatch binds the
-    digest to (chain_id, claim_id, fraud_proof) only — the voucher is
-    irrelevant. We accept the field for shape uniformity with the
-    settle path's dict shape but ignore it.
+    digest to the request identity under FRV2; the voucher is
+    irrelevant to both slash protocols. We accept the field for shape
+    uniformity with the settle path's dict shape but ignore it.
 
     The ``bond_amount`` field is the slash trigger. Rows with
     ``bond_amount == 0`` are pre-#84 records or unbonded post-#84
@@ -357,6 +266,47 @@ class PendingBondedRequest:
     bond_amount: int = 0
 
 
+def encode_request_identity(request: PendingBondedRequest) -> bytes:
+    """SCALE(requester[32], submitted_block:u64, evidence, settled_direct)."""
+    requester = request.requester
+    requester_bytes = bytes.fromhex(
+        requester[2:] if requester.startswith("0x") else ss58_decode(requester)
+    )
+    if len(requester_bytes) != 32:
+        raise ValueError("requester must encode to 32 bytes")
+    fields = [requester_bytes]
+    for value, width in (
+        (request.submitted_block, 8), (request.cardano_tx_hash, 32),
+        (request.observed_at_depth, 4), (request.observed_slot, 8),
+        (request.beneficiary_addr_hash, 28), (request.amount_lovelace, 8),
+        (request.mainchain_genesis_hash, 32),
+    ):
+        if width in (28, 32):
+            if not isinstance(value, bytes) or len(value) != width:
+                raise ValueError(f"request field must be {width} bytes")
+            fields.append(value)
+        else:
+            if type(value) is not int or not 0 <= value < 1 << (8 * width):
+                raise ValueError(f"request field must be u{8 * width}")
+            fields.append(value.to_bytes(width, "little"))
+    if type(request.settled_direct) is not bool:
+        raise ValueError("settled_direct must be bool")
+    return b"".join(fields) + bytes([request.settled_direct])
+
+
+def build_frv2_preimage(chain_id: bytes, request: PendingBondedRequest, proof: FraudProof) -> bytes:
+    if len(chain_id) != 32 or len(request.claim_id) != 32:
+        raise ValueError("chain_id and claim_id must be 32 bytes")
+    request_id = hashlib.blake2b(encode_request_identity(request), digest_size=32).digest()
+    return TAG_FRV2 + chain_id + request.claim_id + request_id + encode_fraud_proof(proof)
+
+
+def request_expired(request: PendingBondedRequest, context: dict) -> bool:
+    if type(request.submitted_block) is not int or not 0 <= request.submitted_block < 2**64:
+        raise ValueError("submitted_block must be u64")
+    return request.submitted_block + context["ttl"] < context["block_number"]
+
+
 # ---------------------------------------------------------------------------
 # Classification taxonomy.
 #
@@ -377,6 +327,7 @@ class ClassifierOutcome:
     variants.
     """
     NOT_FRAUD = "not_fraud"
+    DEFERRED = "deferred"
     TRANSIENT_L1_ERROR = "transient_l1_error"
     OBSERVER_UNAVAILABLE = "observer_unavailable"
     # Kupo follower hasn't caught up to request.observed_slot +
@@ -957,7 +908,7 @@ class SlashWatcher:
          independently observes the requested Cardano tx via
          Ogmios+Kupo.
       3. Runs the classifier. None → no slash. Otherwise builds the
-         FRAU preimage, signs blake2_256(preimage) with the
+         runtime-selected preimage, signs blake2_256(preimage) with the
          cert-daemon sr25519 key, assembles an M-sig envelope via
          the gateway aggregator (channel namespace ``slash``), and
          submits ``IntentSettlement::slash_bad_settlement_evidence``.
@@ -1017,6 +968,32 @@ class SlashWatcher:
                 min_signer_threshold = 2
         self.min_signer_threshold = max(1, int(min_signer_threshold or 1))
 
+    async def _runtime_context(self) -> Optional[dict]:
+        try:
+            context = await asyncio.to_thread(self.client.get_slash_runtime_context)
+            if context["protocol"] not in ("FRAU", "FRV2"):
+                raise ValueError("unknown slash protocol")
+            for field, limit in (("block_number", 2**64), ("ttl", 2**32), ("spec_version", 2**32)):
+                if type(context[field]) is not int or not 0 <= context[field] < limit:
+                    raise ValueError(f"invalid {field}")
+            return context
+        except Exception as error:
+            logger.error("slash_watcher: slash runtime unavailable (%s); refusing to sign or submit", type(error).__name__)
+            return None
+
+    async def _request_context(self, request: PendingBondedRequest, verdict: SlashVerdict) -> Optional[dict]:
+        context = await self._runtime_context()
+        if context is None:
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "runtime_unavailable"
+            return None
+        if request_expired(request, context):
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "request_expired"
+            logger.info("slash_watcher: request_expired claim_id=%s", request.claim_id.hex())
+            return None
+        return context
+
     async def process_one(
         self,
         request: PendingBondedRequest,
@@ -1047,6 +1024,9 @@ class SlashWatcher:
         if request.bond_amount <= 0:
             verdict.outcome = ClassifierOutcome.NOT_FRAUD
             verdict.detail = "unbonded_skip"
+            return verdict
+
+        if await self._request_context(request, verdict) is None:
             return verdict
 
         # Observe the Cardano tx. The observer returns either a
@@ -1183,11 +1163,13 @@ class SlashWatcher:
             )
         verdict.fraud_proof = proof
 
-        # Build + sign the FRAU digest.
-        preimage = build_frau_preimage(
-            chain_id=live_chain_id,
-            claim_id=request.claim_id,
-            fraud_proof=proof,
+        context = await self._request_context(request, verdict)
+        if context is None:
+            return verdict
+        preimage = (
+            build_frau_preimage(live_chain_id, request.claim_id, proof)
+            if context["protocol"] == "FRAU"
+            else build_frv2_preimage(live_chain_id, request, proof)
         )
         digest = compute_frau_digest(preimage)
         sig_bytes = self.client.keypair.sign(digest)
@@ -1263,39 +1245,27 @@ class SlashWatcher:
                 f"{self.min_signer_threshold} sigs for "
                 f"{request.claim_id.hex()[:16]}... — submitting slash"
             )
-            async with self._chain_write_lock:
-                try:
-                    ext_hash = await asyncio.to_thread(
-                        self.client.submit_slash_bad_settlement_evidence,
-                        request.claim_id,
-                        proof,
-                        envelope,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"slash_watcher: submit_slash_envelope raised "
-                        f"for {request.claim_id.hex()[:16]}...: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    verdict.detail = f"submit_raised: {type(e).__name__}"
-                    return verdict
         else:
-            async with self._chain_write_lock:
-                try:
-                    ext_hash = await asyncio.to_thread(
-                        self.client.submit_slash_bad_settlement_evidence,
-                        request.claim_id,
-                        proof,
-                        [(pubkey_bytes, sig_bytes)],
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"slash_watcher: submit_slash_1sig raised for "
-                        f"{request.claim_id.hex()[:16]}...: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    verdict.detail = f"submit_raised: {type(e).__name__}"
-                    return verdict
+            envelope = [(pubkey_bytes, sig_bytes)]
+
+        async with self._chain_write_lock:
+            current = await self._request_context(request, verdict)
+            if current is None:
+                return verdict
+            if current["protocol"] != context["protocol"]:
+                verdict.outcome = ClassifierOutcome.DEFERRED
+                verdict.detail = "runtime_changed"
+                logger.warning("slash_watcher: runtime_changed; discarding envelope and retrying next tick")
+                return verdict
+            try:
+                ext_hash = await asyncio.to_thread(
+                    self.client.submit_slash_bad_settlement_evidence,
+                    request.claim_id, proof, envelope,
+                )
+            except Exception as error:
+                logger.warning("slash_watcher: submit_slash raised: %s", type(error).__name__)
+                verdict.detail = f"submit_raised: {type(error).__name__}"
+                return verdict
 
         if not ext_hash:
             logger.warning(
@@ -1331,6 +1301,10 @@ class SlashWatcher:
         if not requests:
             return
 
+        context = await self._runtime_context()
+        if context is None:
+            return
+
         # Convert dicts → PendingBondedRequest at the boundary
         # (identical pattern to the settle / expire attestors). A
         # malformed row is skipped + logged rather than killing the
@@ -1358,6 +1332,8 @@ class SlashWatcher:
             if req.bond_amount <= 0:
                 # Filter early: unbonded rows are not slashable. The
                 # settle attestor handles them via the STCA path.
+                continue
+            if request_expired(req, context):
                 continue
             bonded.append(req)
 
