@@ -8,7 +8,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-TESTS = ['tests/test_slash_runtime.py', 'tests/test_frv2_vectors.py', 'tests/test_settle_supersede.py']
+TESTS = ['tests/test_slash_runtime.py', 'tests/test_frv2_vectors.py', 'tests/test_settle_supersede.py',
+         'tests/test_slash_proof.py', 'tests/test_slash_watcher.py']
 MUTANTS = [
     ('wrong-chain-accepted', 'daemon/substrate_client.py', 'if version["specName"] != "materios":', 'if False:'),
     ('unknown-contract-uses-frau', 'daemon/substrate_client.py', 'if SLASH_PROTOCOLS.get(fingerprint) != expected:', 'if fingerprint in SLASH_PROTOCOLS and SLASH_PROTOCOLS[fingerprint] != expected:'),
@@ -65,6 +66,8 @@ MUTANTS = [
     ('voucher-beneficiary-is-stake-key', 'daemon/substrate_client.py', 'split_type0_address_bytes(raw)[0]', 'split_type0_address_bytes(raw)[1]'),
     ('contract-cache-ignores-code', 'daemon/substrate_client.py', 'if code_hash and cached is not None and cached[0] == code_hash:', 'if cached is not None:'),
     ('cache-hit-skips-spec-name', 'daemon/substrate_client.py', 'if version["specName"] != "materios":', 'if version["specName"] != "materios" and not (self._settlement_contract and self._settlement_contract[0] == code_hash):'),
+    ('failed-lookup-is-absence', 'daemon/settle_claim_attestor.py', '            if matches is None:\n                obs.mismatches.append("kupo_matches_unavailable")', '            if False:\n                obs.mismatches.append("kupo_matches_unavailable")'),
+    ('shape-check-skipped', 'daemon/slash_watcher.py', 'if kupo_shape_error(base.outputs, expected_beneficiary_blake2_224):', 'if False:'),
 ]
 
 

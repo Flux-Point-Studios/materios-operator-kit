@@ -648,241 +648,95 @@ class CardanoSlashObserver(CardanoTxObserver):
         slash_obs.beneficiary_addr_blake2_224 = base.beneficiary_addr_blake2_224
         slash_obs.mainchain_genesis_hash = base.mainchain_genesis_hash
         slash_obs.mismatches = list(base.mismatches)
+        slash_obs.outputs = base.outputs
+        if base.outputs is None:
+            return slash_obs
 
-        # Defensive pre-validation of Kupo output shapes (sec-review
-        # round-1 Vuln 2). The parent observer's amount-sum treats
-        # `value.coins` as 0 when it's not an int (e.g. stringly-typed
-        # `"5000000"` from some Kupo forks). That silently understates
-        # `matched_address_lovelace` and would mis-trigger the
-        # WrongBeneficiary slash path here. Surface the shape error as
-        # a NEW mismatch tag so the dispatcher defers rather than
-        # slashes.
-        #
-        # We do a SEPARATE Kupo fetch (cheap, no chain-write side
-        # effects) so we can inspect the raw output shape without
-        # touching the settle attestor's amount-sum code path. If any
-        # output for the expected beneficiary has a non-int
-        # `value.coins`, append the new mismatch tag and short-circuit
-        # the actual-hash lookup.
-        #
-        # Round-2 sec-review fix: the gate runs whenever the tx
-        # exists (no `kupo_no_matches_for_tx`), NOT only when
-        # `matched_address_lovelace == 0`. Previously the `== 0`
-        # conjunct meant a tx with MULTIPLE beneficiary outputs —
-        # some int-typed and some stringly-typed — bypassed this
-        # check (matched != 0 from the int-typed half), letting the
-        # downstream classifier emit a false-positive
-        # `WrongAmount(actual=undercounted_sum)` slash against an
-        # honest requester. Running the shape check on every
-        # classify-bound observation closes that hole; the wrapper
-        # iterates only the beneficiary-matching outputs so the cost
-        # stays bounded.
-        if "kupo_no_matches_for_tx" not in slash_obs.mismatches:
-            shape_error = await self._kupo_response_has_shape_error(
-                cardano_tx_hash_hex,
-                expected_beneficiary_blake2_224,
+        # Sec-review round-1 Vuln 2 and round 2: the parent's amount sum
+        # counts a non-int ``value.coins`` as 0, which would understate the
+        # payment and mis-trigger WrongAmount or WrongBeneficiary. Every
+        # check reads the same rows the sum did.
+        if kupo_shape_error(base.outputs, expected_beneficiary_blake2_224):
+            slash_obs.mismatches.append("kupo_response_shape_error")
+            return slash_obs
+        if slash_obs.matched_address_lovelace == 0:
+            slash_obs.actual_beneficiary_hash = first_payment_hash(
+                base.outputs, expected_beneficiary_blake2_224,
             )
-            if shape_error:
-                slash_obs.mismatches.append("kupo_response_shape_error")
-                return slash_obs
-
-        # If the tx exists (no kupo_no_matches_for_tx) AND no
-        # lovelace went to the expected beneficiary, walk the outputs
-        # ONE more time to surface the actual payment-hash. We do a
-        # second Kupo fetch rather than thread the matches list back
-        # from the parent class — the parent's logic isn't designed
-        # to expose them, and a second tx lookup is cheap relative
-        # to the slash flow's other I/O.
-        needs_actual_hash = (
-            "kupo_no_matches_for_tx" not in slash_obs.mismatches
-            and slash_obs.matched_address_lovelace == 0
-        )
-        if needs_actual_hash:
-            slash_obs.actual_beneficiary_hash = await self._first_payment_hash(
-                cardano_tx_hash_hex,
-                expected_beneficiary_blake2_224,
-            )
-
         return slash_obs
 
-    async def _kupo_response_has_shape_error(
-        self,
-        cardano_tx_hash_hex: str,
-        expected_beneficiary_blake2_224: bytes,
-    ) -> bool:
-        """Pre-validate Kupo output shapes before downstream code makes
-        a slash decision (sec-review round-1 Vuln 2).
 
-        Returns True if ANY output that pays the expected beneficiary
-        has a non-int ``value.coins`` (e.g. stringly-typed from older
-        Kupo versions / forks). In that case the parent observer would
-        silently treat the output as 0 lovelace and the slash path
-        would mis-trigger WrongBeneficiary on an honest requester.
-
-        Network / decode failures return False (the parent observer
-        will surface its own mismatch tags on the same path) — we only
-        care about the specific stringly-typed-coins shape here.
-        """
+def kupo_shape_error(matches: list, expected_beneficiary_blake2_224: bytes) -> bool:
+    """Whether an output paying the expected beneficiary carries a
+    ``value`` the parent's amount sum cannot read as an int lovelace
+    total (sec-review round-1 Vuln 2): a stringly-typed or boolean
+    ``coins``, no coin field, or a ``value`` that is not a dict."""
+    from daemon.cardano_address import (
+        extract_payment_hash_from_cardano_address,
+    )
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        address = m.get("address")
+        if not isinstance(address, str):
+            continue
         try:
-            async with aiohttp.ClientSession() as session:
-                matches = await self._kupo_get(
-                    session,
-                    "/matches/*",
-                    {"transaction_id": cardano_tx_hash_hex},
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"slash_watcher: _kupo_response_has_shape_error lookup "
-                f"raised {type(e).__name__}: {e}"
-            )
-            return False
-        if not matches:
-            return False
-        from daemon.cardano_address import (
-            extract_payment_hash_from_cardano_address,
-        )
-        for m in matches:
-            if not isinstance(m, dict):
-                continue
-            address = m.get("address")
-            if not isinstance(address, str):
-                continue
-            try:
-                addr_hash = extract_payment_hash_from_cardano_address(
-                    address,
-                )
-            except ValueError:
-                continue
-            if addr_hash != expected_beneficiary_blake2_224:
-                continue
-            value = m.get("value") or {}
-            if not isinstance(value, dict):
-                # Whole `value` field isn't a dict — the parent
-                # observer's `value.coins` access would have silently
-                # short-circuited. Surface as shape error.
-                return True
-            coins = value.get("coins")
-            if coins is None:
-                # Some Kupo builds use `lovelace` instead of `coins`.
-                # Mirror the parent observer's fallback.
-                coins = value.get("lovelace")
-            if coins is None:
-                # No coin field at all — also a shape mismatch the
-                # parent silently treats as 0.
-                return True
-            if not isinstance(coins, int) or isinstance(coins, bool):
-                # Stringly-typed `coins` (the headline bug) or
-                # boolean (accidental Truthy coercion). Either way,
-                # the parent observer silently treats it as 0 and the
-                # slash path mis-triggers.
-                return True
-        return False
+            addr_hash = extract_payment_hash_from_cardano_address(address)
+        except ValueError:
+            continue
+        if addr_hash != expected_beneficiary_blake2_224:
+            continue
+        value = m.get("value") or {}
+        if not isinstance(value, dict):
+            return True
+        coins = value.get("coins")
+        if coins is None:
+            # Some Kupo builds use `lovelace`; mirror the parent's fallback.
+            coins = value.get("lovelace")
+        if coins is None or not isinstance(coins, int) or isinstance(coins, bool):
+            return True
+    return False
 
-    async def _first_payment_hash(
-        self,
-        cardano_tx_hash_hex: str,
-        expected_beneficiary_blake2_224: bytes,
-    ) -> Optional[bytes]:
-        """Return a NON-BENEFICIARY 28-byte payment-key hash via Kupo.
 
-        We deliberately FILTER OUT any output whose computed payment
-        hash equals ``expected_beneficiary_blake2_224`` before picking
-        the first remaining hash (sec-review round-1 Vuln 2). Without
-        this filter, a Kupo response shape error or a stringly-typed
-        ``value.coins`` could let the parent observer report
-        ``matched_address_lovelace == 0`` against a tx that actually
-        paid the beneficiary correctly — and we'd then surface the
-        keeper's CHANGE-output hash as the "actual" payee, slashing
-        an honest requester for ``WrongBeneficiary(change_hash)``.
+def first_payment_hash(matches: list, expected_beneficiary_blake2_224: bytes) -> Optional[bytes]:
+    """The payment-key hash of the first output that does NOT pay the
+    expected beneficiary, or None when no such output decodes.
 
-        Determinism: Kupo doesn't guarantee stable match ordering, so
-        we sort by ``output_index`` ascending (CIP-0019 outputs are
-        contiguously indexed by tx-construction order) with a stable
-        secondary sort by ``address`` to break ties when
-        ``output_index`` is missing or duplicated. This pins
-        cross-watcher determinism on the (rare but valid)
-        legitimate-slash path so the M-of-N envelope can converge.
+    The beneficiary is filtered out first (sec-review round-1 Vuln 2):
+    otherwise a shape error could surface the keeper's change output as
+    the "actual" payee and slash an honest requester for
+    ``WrongBeneficiary(change_hash)``. Outputs are taken in
+    ``output_index`` order, then by address, so every watcher derives the
+    same hash and the M-of-N envelope converges.
+    """
+    from daemon.cardano_address import (
+        extract_payment_hash_from_cardano_address,
+    )
 
-        Returns ``None`` on any error (no non-beneficiary output,
-        decode failure, Kupo unreachable). The dispatcher treats None
-        as "can't construct WrongBeneficiary proof" and defers the
-        slash to the next tick rather than fabricating a hash —
-        :class:`SlashWatcher._process_one_locked` will tag the row
-        with :attr:`ClassifierOutcome.OBSERVER_UNAVAILABLE` so an
-        operator can grep journalctl for the deferred decision.
-        """
-        # Reuse the parent's address-extraction helper.
-        from daemon.cardano_address import (
-            extract_payment_hash_from_cardano_address,
-        )
+    def _sort_key(entry: Any) -> tuple:
+        if not isinstance(entry, dict):
+            return (2**31, "")
+        oi = entry.get("output_index")
+        if not isinstance(oi, int):
+            oi = 2**31 - 1
+        addr = entry.get("address") if isinstance(entry.get("address"), str) else ""
+        return (oi, addr)
+
+    for m in sorted(matches, key=_sort_key):
+        if not isinstance(m, dict):
+            continue
+        address = m.get("address")
+        if not isinstance(address, str):
+            continue
         try:
-            async with aiohttp.ClientSession() as session:
-                matches = await self._kupo_get(
-                    session,
-                    "/matches/*",
-                    {"transaction_id": cardano_tx_hash_hex},
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"slash_watcher: _first_payment_hash Kupo lookup raised "
-                f"{type(e).__name__}: {e}"
-            )
-            return None
-        if not matches:
-            return None
-        # Deterministic ordering: sort by output_index ascending, then
-        # address (stable secondary sort so a missing/duplicate
-        # output_index doesn't break cross-watcher convergence).
-        # Non-dict entries sort last via a high sentinel — they're
-        # filtered out in the loop below anyway.
-
-        def _sort_key(entry: Any) -> tuple:
-            if not isinstance(entry, dict):
-                return (2**31, "")
-            oi = entry.get("output_index")
-            if not isinstance(oi, int):
-                oi = 2**31 - 1
-            addr = entry.get("address") if isinstance(
-                entry.get("address"), str
-            ) else ""
-            return (oi, addr)
-
-        try:
-            sorted_matches = sorted(matches, key=_sort_key)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"slash_watcher: _first_payment_hash sort raised "
-                f"{type(e).__name__}: {e} — falling back to unsorted "
-                f"iteration"
-            )
-            sorted_matches = list(matches)
-        for m in sorted_matches:
-            if not isinstance(m, dict):
-                continue
-            address = m.get("address")
-            if not isinstance(address, str):
-                continue
-            try:
-                candidate_hash = extract_payment_hash_from_cardano_address(
-                    address,
-                )
-            except ValueError:
-                # Skip non-CIP-0019 type-0/6 addresses (script /
-                # enterprise / type-7 etc). Move on to the next
-                # output. None at the end if NONE decode.
-                continue
-            # CRITICAL: filter out the expected beneficiary. Without
-            # this, a Kupo shape error could surface the beneficiary's
-            # own payment hash as "actual" and the dispatcher would
-            # then defer via the FraudProofInvalid-style internal-
-            # consistency check in classify_fraud (actual == stored
-            # short-circuits to no-slash). But if there's ALSO a
-            # change output, we'd return that hash here and slash an
-            # honest requester for WrongBeneficiary(change_hash).
-            if candidate_hash == expected_beneficiary_blake2_224:
-                continue
-            return candidate_hash
-        return None
+            candidate_hash = extract_payment_hash_from_cardano_address(address)
+        except ValueError:
+            # Script, enterprise and other non type-0/6 addresses.
+            continue
+        if candidate_hash == expected_beneficiary_blake2_224:
+            continue
+        return candidate_hash
+    return None
 
 
 # ---------------------------------------------------------------------------

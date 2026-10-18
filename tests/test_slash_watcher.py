@@ -75,6 +75,7 @@ from daemon.slash_watcher import (
     classify_fraud,
     compute_frau_digest,
     encode_fraud_proof,
+    first_payment_hash,
     maybe_create_slash_watcher,
 )
 
@@ -1612,7 +1613,7 @@ class TestKupoResponseShapeError:
 
 
 class TestFirstPaymentHashSkipsBeneficiary:
-    """Vuln 2 — `_first_payment_hash` must FILTER OUT the expected
+    """Vuln 2 — `first_payment_hash` must FILTER OUT the expected
     beneficiary so a keeper's change-output hash can't be surfaced
     as the "actual" payee. Also pins cross-watcher determinism via
     output_index ordering.
@@ -1620,35 +1621,23 @@ class TestFirstPaymentHashSkipsBeneficiary:
 
     def test_first_payment_hash_skips_beneficiary_in_output_set(self):
         """Two outputs: the FIRST is the beneficiary, the SECOND is
-        a change hash. Pre-fix, _first_payment_hash returned the
+        a change hash. Pre-fix, first_payment_hash returned the
         beneficiary's hash (the first one it decoded). Post-fix it
         skips the beneficiary and returns the change hash.
         """
-        observer = CardanoSlashObserver(
-            ogmios_url="http://ogmios.test:1337",
-            kupo_url="http://kupo.test",
-        )
         bene_addr = _make_testnet_addr_with_payment_hash(BENE_HASH_28)
         change_addr = _make_testnet_addr_with_payment_hash(OTHER_HASH_28)
-        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
-            return_value=[
+        rows = [
                 _make_kupo_match(
                     output_index=0, address=bene_addr, coins=5_000_000,
                 ),
                 _make_kupo_match(
                     output_index=1, address=change_addr, coins=2_000_000,
                 ),
-            ]
-        )
-
-        async def driver():
-            return await observer._first_payment_hash(
-                CARDANO_TX_HASH.hex(), BENE_HASH_28,
-            )
-
-        actual = _run(driver())
+        ]
+        actual = first_payment_hash(rows, BENE_HASH_28)
         assert actual == OTHER_HASH_28, (
-            f"_first_payment_hash must SKIP the expected beneficiary "
+            f"first_payment_hash must SKIP the expected beneficiary "
             f"and return the change-output hash; got {actual!r}"
         )
 
@@ -1659,25 +1648,13 @@ class TestFirstPaymentHashSkipsBeneficiary:
         return None (NOT the beneficiary's hash). The dispatcher
         treats None as defer, not slash.
         """
-        observer = CardanoSlashObserver(
-            ogmios_url="http://ogmios.test:1337",
-            kupo_url="http://kupo.test",
-        )
         bene_addr = _make_testnet_addr_with_payment_hash(BENE_HASH_28)
-        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
-            return_value=[
+        rows = [
                 _make_kupo_match(
                     output_index=0, address=bene_addr, coins=5_000_000,
                 ),
-            ]
-        )
-
-        async def driver():
-            return await observer._first_payment_hash(
-                CARDANO_TX_HASH.hex(), BENE_HASH_28,
-            )
-
-        actual = _run(driver())
+        ]
+        actual = first_payment_hash(rows, BENE_HASH_28)
         assert actual is None, (
             f"only-beneficiary input must yield None (defer), not the "
             f"beneficiary's hash; got {actual!r}"
@@ -1689,10 +1666,6 @@ class TestFirstPaymentHashSkipsBeneficiary:
         ascending before iterating — every watcher then picks the
         same actual-hash given the same chain state.
         """
-        observer = CardanoSlashObserver(
-            ogmios_url="http://ogmios.test:1337",
-            kupo_url="http://kupo.test",
-        )
         bene_addr = _make_testnet_addr_with_payment_hash(BENE_HASH_28)
         change_hash_a = bytes.fromhex("aa" * 28)
         change_hash_b = bytes.fromhex("bb" * 28)
@@ -1704,8 +1677,7 @@ class TestFirstPaymentHashSkipsBeneficiary:
         )
         # Mock Kupo returning the outputs in DESCENDING output_index
         # order — the impl must sort ASCENDING before iterating.
-        observer._kupo_get = AsyncMock(  # type: ignore[method-assign]
-            return_value=[
+        rows = [
                 _make_kupo_match(
                     output_index=2, address=change_addr_b, coins=1,
                 ),
@@ -1715,15 +1687,8 @@ class TestFirstPaymentHashSkipsBeneficiary:
                 _make_kupo_match(
                     output_index=0, address=bene_addr, coins=3,
                 ),
-            ]
-        )
-
-        async def driver():
-            return await observer._first_payment_hash(
-                CARDANO_TX_HASH.hex(), BENE_HASH_28,
-            )
-
-        actual = _run(driver())
+        ]
+        actual = first_payment_hash(rows, BENE_HASH_28)
         # Ascending sort → output_index 0 (beneficiary, skipped) →
         # output_index 1 (change_hash_a) → return.
         assert actual == change_hash_a, (

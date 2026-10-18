@@ -1882,3 +1882,22 @@ class TestPendingSettlementRequestBondAmount:
         assert isinstance(captured[0], PendingSettlementRequest)
         assert captured[0].claim_id == CLAIM_ID
         assert captured[0].bond_amount == 1_000_000
+
+
+def test_a_failed_kupo_lookup_is_refused_as_unavailable_not_as_a_missing_tx():
+    observer = CardanoTxObserver(ogmios_url="http://ogmios.test:1337", kupo_url="http://kupo.test")
+    observer._ogmios_rpc = AsyncMock(side_effect=[
+        {"slot": OBSERVED_SLOT + 1000, "id": "ff" * 32}, 1_000_000,
+        {"era": "shelley", "networkMagic": 1, "network": "testnet"},
+    ])
+    observer._kupo_get = AsyncMock(return_value=None)
+    obs = _run(observer.observe(CARDANO_TX_HASH.hex(), BENE_HASH_28))
+    assert obs.mismatches == ["kupo_matches_unavailable"]
+    client = _make_substrate_client_stub()
+    attestor = _make_attestor(substrate_client=client, observer=_make_observer_stub(
+        mismatches=obs.mismatches, matched_lovelace=None, observed_slot=None,
+        genesis_hash=CARDANO_PREPROD_GENESIS_HASH))
+    verdict = _run(attestor.process_one(
+        _default_pending_request(mainchain_genesis_hash=CARDANO_PREPROD_GENESIS_HASH), CHAIN_ID))
+    assert verdict.refusal_reason == RefusalReason.OBSERVER_UNAVAILABLE
+    client.submit_attest_settle.assert_not_called()

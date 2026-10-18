@@ -354,6 +354,8 @@ class CardanoTxObservation:
     beneficiary_addr_blake2_224: Optional[bytes] = None
     mainchain_genesis_hash: Optional[bytes] = None
     mismatches: list[str] = field(default_factory=list)
+    # Kupo's rows for the tx, from the one lookup every check reads.
+    outputs: Optional[list] = None
 
     @property
     def depth(self) -> Optional[int]:
@@ -868,9 +870,15 @@ class CardanoTxObserver:
                 "/matches/*",
                 {"transaction_id": cardano_tx_hash_hex},
             )
+            # A failed lookup proves nothing about the tx; only a
+            # successful empty answer is a candidate for its absence.
+            if matches is None:
+                obs.mismatches.append("kupo_matches_unavailable")
+                return obs
             if not matches:
                 obs.mismatches.append("kupo_no_matches_for_tx")
                 return obs
+            obs.outputs = matches
 
             # Sum lovelace across outputs whose address blake2_224
             # matches ``expected_beneficiary_blake2_224``. Also pin
