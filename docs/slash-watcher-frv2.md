@@ -246,10 +246,13 @@ vector settlement `0757de3` asserts in `integration.rs`.
 ## Rollout order
 
 1. Review and release this operator-kit change.
-2. Deploy it to every active committee daemon (slash watcher and settle
-   attestor run in the same cert-daemon) and to the custody watcher, on
-   Gemtek and Node-3. Verify each detects FRAU, `supersede=False`, TTL 2400
-   and `MinFinalityDepth` 15 on live spec 239.
+2. Deploy it to the cert-daemons that reach Cardano (slash watcher and
+   settle attestor run in the same process): Gemtek and Node-3, the M=2
+   committee for these paths. Deploy it to the custody watcher on node2.
+   Verify each cert-daemon detects FRAU, `supersede=False`, TTL 2400 and
+   `MinFinalityDepth` 15 on live spec 239. Rollback before enactment is the
+   previous image or release; after enactment the previous build refuses
+   to slash (it signs FRAU) and pages on every supersede, so roll forward.
 3. Enact the reviewed runtime (Materios `67ec3d9`, spec 242, transaction
    version 6, settlement `0757de3`). Before enactment, check that its
    metadata carries `SlashSettlementTag` = `FRV2` and fingerprints to the FRV2
