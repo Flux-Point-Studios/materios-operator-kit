@@ -416,7 +416,8 @@ drop-in that points `WorkingDirectory` at it. The `90-insight-0d1d592.conf`
 credentials stay as they are.
 
 ```sh
-# From a verified checkout at $SHA (Gemtek):
+# On Gemtek, from a verified checkout that contains $SHA:
+SHA=<merge sha>
 git -C <checkout> archive "$SHA" | ssh deci@192.168.0.132 \
   "sudo install -d -o root -g root -m 755 /opt/custody-watch/releases/$SHA && sudo tar -x -C /opt/custody-watch/releases/$SHA"
 git -C <checkout> show "$SHA:daemon/custody_rules.py" | sha256sum
