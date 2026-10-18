@@ -143,7 +143,7 @@ def _make_substrate_client_stub(
             return_value=submit_ext_hash
         ),
         get_genesis_hash=MagicMock(return_value=genesis_hex),
-        get_slash_runtime_context=MagicMock(return_value=dict(
+        get_settlement_runtime_context=MagicMock(return_value=dict(
             protocol="FRAU", block_number=101, ttl=2400, spec_version=239,
         )),
         list_pending_settlement_requests=MagicMock(return_value=[]),

@@ -22,12 +22,13 @@ FIXTURES = Path(__file__).parent / 'fixtures' / 'slash_runtime'
 
 def context(protocol='FRAU', block=101, ttl=10):
     return dict(protocol=protocol, block_number=block, ttl=ttl,
-                spec_version=239, block_hash='0x' + 'aa' * 32)
+                spec_version=239, block_hash='0x' + 'aa' * 32,
+                supersede=protocol == 'FRV2', min_finality_depth=15)
 
 
 def setup_watcher(ctx=None, aggregator=None):
     client = _make_substrate_client_stub()
-    client.get_slash_runtime_context = MagicMock(return_value=ctx or context())
+    client.get_settlement_runtime_context = MagicMock(return_value=ctx or context())
     client.keypair = MagicMock(wraps=Keypair.create_from_uri('//Alice'))
     client.keypair.public_key = Keypair.create_from_uri('//Alice').public_key
     observer = SimpleNamespace(observe=AsyncMock(return_value=_make_observation(matched_lovelace=4)))
@@ -115,15 +116,100 @@ def rpc_client(meta=None, spec=239, spec_name='materios'):
 @pytest.mark.parametrize('protocol', ['frau', 'frv2'])
 def test_runtime_detects_exact_metadata_at_head(protocol):
     client = rpc_client(metadata(protocol))
-    result = client.get_slash_runtime_context()
+    result = client.get_settlement_runtime_context()
     assert result == context(protocol.upper()) | {'block_hash': '0x' + 'ab' * 32}
     assert client._call.call_count == 4
 
 
 @pytest.mark.parametrize('protocol', ['frau', 'frv2'])
 def test_captured_runtimes_select_protocol_and_ttl(protocol):
-    context = rpc_client(metadata(protocol, ttl=None)).get_slash_runtime_context()
+    context = rpc_client(metadata(protocol, ttl=None)).get_settlement_runtime_context()
     assert (context['protocol'], context['ttl']) == (protocol.upper(), 2400)
+
+
+def constant(v14, name):
+    return next((c for c in intent_settlement(v14)['constants'] if c['name'] == name), None)
+
+
+def set_constant(v14, name, value):
+    """Replace ``name`` with a ``[u8; len(value)]`` constant, or drop it when ``value`` is None."""
+    pallet = intent_settlement(v14)
+    pallet['constants'] = [c for c in pallet['constants'] if c['name'] != name]
+    if value is not None:
+        array = add_type(v14, {'array': {'len': len(value), 'type': primitive(v14, 'u8')}})
+        pallet['constants'].append({'name': name, 'type': array, 'value': '0x' + value.hex(), 'documentation': []})
+
+
+def test_captured_runtimes_carry_the_reviewed_digest_tags():
+    frau, frv2 = fixture('frau'), fixture('frv2')
+    assert constant(frau, 'SlashSettlementTag') is None
+    assert constant(frau, 'AttestSettleTag') is None
+    assert bytes.fromhex(constant(frv2, 'SlashSettlementTag')['value'][2:]) == b'FRV2'
+    assert bytes.fromhex(constant(frv2, 'AttestSettleTag')['value'][2:]) == b'STCA'
+
+
+def test_slash_tag_and_frv2_pin_select_frv2():
+    assert rpc_client(metadata('frv2')).get_settlement_runtime_context()['protocol'] == 'FRV2'
+
+
+@pytest.mark.parametrize('tag', [b'FRAU', b'FRV3', b'frv2', b'\x00' * 4, b'FRV', b'FRV2\x00'])
+def test_any_other_slash_tag_refuses_and_names_it(tag, caplog):
+    v14 = fixture('frv2')
+    set_constant(v14, 'SlashSettlementTag', tag)
+    with pytest.raises(ValueError, match='settlement runtime'):
+        rpc_client(metadata(v14=v14)).get_settlement_runtime_context()
+    assert f'SlashSettlementTag 0x{tag.hex()}' in caplog.text
+
+
+def test_tagless_runtime_signs_only_on_the_frau_pin():
+    assert rpc_client(metadata('frau')).get_settlement_runtime_context()['protocol'] == 'FRAU'
+    v14 = fixture('frv2')
+    set_constant(v14, 'SlashSettlementTag', None)
+    assert sc.SLASH_PROTOCOLS[sc.slash_contract_fingerprint(v14)] == 'FRV2'
+    with pytest.raises(ValueError, match='settlement runtime'):
+        rpc_client(metadata(v14=v14)).get_settlement_runtime_context()
+
+
+def test_frv2_tag_on_the_frau_contract_refuses():
+    frau_contract = fixture('frv2')
+    intent_settlement(frau_contract)['storage']['entries'].remove(storage_entry(frau_contract, 'SlashedSettlementRequests'))
+    tagged_frau = fixture('frau')
+    set_constant(tagged_frau, 'SlashSettlementTag', b'FRV2')
+    for v14 in (frau_contract, tagged_frau):
+        assert sc.SLASH_PROTOCOLS[sc.slash_contract_fingerprint(v14)] == 'FRAU'
+        with pytest.raises(ValueError, match='settlement runtime'):
+            rpc_client(metadata(v14=v14)).get_settlement_runtime_context()
+
+
+def test_supersede_is_offered_only_by_the_runtime_that_has_it():
+    old = rpc_client(metadata('frau')).get_settlement_runtime_context()
+    new = rpc_client(metadata('frv2')).get_settlement_runtime_context()
+    assert (old['supersede'], old['min_finality_depth']) == (False, 15)
+    assert (new['supersede'], new['min_finality_depth']) == (True, 15)
+
+
+@pytest.mark.parametrize('protocol', ['frau', 'frv2'])
+def test_min_finality_depth_is_read_from_the_head(protocol):
+    v14 = fixture(protocol)
+    constant(v14, 'MinFinalityDepth')['value'] = '0x' + (40).to_bytes(4, 'little').hex()
+    assert rpc_client(metadata(v14=v14)).get_settlement_runtime_context()['min_finality_depth'] == 40
+
+
+def rename_supersede_arg(v14):
+    call_variant(v14, 'supersede_settlement_request')['fields'][2]['name'] = 'attestation_evidence'
+
+
+@pytest.mark.parametrize('edit', [
+    lambda v14: set_constant(v14, 'AttestSettleTag', None),
+    lambda v14: set_constant(v14, 'AttestSettleTag', b'STCB'),
+    rename_supersede_arg,
+    lambda v14: set_constant(v14, 'MinFinalityDepth', b'\x0f\x00'),
+])
+def test_unreviewed_supersede_contract_refuses(edit):
+    v14 = fixture('frv2')
+    edit(v14)
+    with pytest.raises(ValueError, match='settlement runtime'):
+        rpc_client(metadata(v14=v14)).get_settlement_runtime_context()
 
 
 def test_request_scoped_slashes_are_the_only_contract_difference():
@@ -153,7 +239,7 @@ def test_docs_at_every_level_do_not_change_protocol(protocol, docs):
     assert call_variant(v14, 'slash_bad_settlement_evidence')['docs']
     assert ttl_constant(v14)['documentation']
     rewrite_docs(v14, docs)
-    assert rpc_client(metadata(v14=v14)).get_slash_runtime_context()['protocol'] == protocol.upper()
+    assert rpc_client(metadata(v14=v14)).get_settlement_runtime_context()['protocol'] == protocol.upper()
     assert sc.slash_contract_fingerprint(v14) == sc.slash_contract_fingerprint(fixture(protocol))
 
 
@@ -163,7 +249,7 @@ def test_round_one_settlement_docs_keep_frv2():
     round_one = json.loads((FIXTURES / 'frv2_74cd340_docs.json').read_text())
     assert call['docs'] != round_one
     call['docs'] = round_one
-    assert rpc_client(metadata(v14=v14)).get_slash_runtime_context()['protocol'] == 'FRV2'
+    assert rpc_client(metadata(v14=v14)).get_settlement_runtime_context()['protocol'] == 'FRV2'
 
 
 def type_fields(kind, body):
@@ -198,7 +284,7 @@ def renumber(v14, shift):
 def test_type_registry_positions_do_not_change_protocol(protocol):
     v14 = fixture(protocol)
     renumber(v14, 1000)
-    assert rpc_client(metadata(v14=v14)).get_slash_runtime_context()['protocol'] == protocol.upper()
+    assert rpc_client(metadata(v14=v14)).get_settlement_runtime_context()['protocol'] == protocol.upper()
     assert sc.slash_contract_fingerprint(v14) == sc.slash_contract_fingerprint(fixture(protocol))
 
 
@@ -235,7 +321,7 @@ UNRELATED_EDITS = {
 def test_unrelated_metadata_changes_do_not_change_protocol(protocol, edit):
     v14 = fixture(protocol)
     UNRELATED_EDITS[edit](v14)
-    assert rpc_client(metadata(v14=v14)).get_slash_runtime_context()['protocol'] == protocol.upper()
+    assert rpc_client(metadata(v14=v14)).get_settlement_runtime_context()['protocol'] == protocol.upper()
     assert sc.slash_contract_fingerprint(v14) == sc.slash_contract_fingerprint(fixture(protocol))
 
 
@@ -284,8 +370,8 @@ CONTRACT_EDITS = {
 def test_signing_contract_changes_refuse(protocol, edit):
     v14 = fixture(protocol)
     CONTRACT_EDITS[edit](v14)
-    with pytest.raises(ValueError, match='slash runtime'):
-        rpc_client(metadata(v14=v14)).get_slash_runtime_context()
+    with pytest.raises(ValueError, match='settlement runtime'):
+        rpc_client(metadata(v14=v14)).get_settlement_runtime_context()
     changed = sc.slash_contract_fingerprint(v14)
     assert changed != sc.slash_contract_fingerprint(fixture(protocol))
     assert changed not in sc.SLASH_PROTOCOLS
@@ -297,13 +383,13 @@ def test_request_slash_key_change_refuses():
     claim_key = registry_type(v14, layout['key'])['def']['tuple'][0]
     narrow = add_type(v14, {'array': {'len': 28, 'type': primitive(v14, 'u8')}})
     layout['key'] = add_type(v14, {'tuple': [claim_key, narrow]})
-    with pytest.raises(ValueError, match='slash runtime'):
-        rpc_client(metadata(v14=v14)).get_slash_runtime_context()
+    with pytest.raises(ValueError, match='settlement runtime'):
+        rpc_client(metadata(v14=v14)).get_settlement_runtime_context()
 
 
 def test_wrong_chain_spec_refuses():
-    with pytest.raises(ValueError, match='slash runtime'):
-        rpc_client(spec_name='other').get_slash_runtime_context()
+    with pytest.raises(ValueError, match='settlement runtime'):
+        rpc_client(spec_name='other').get_settlement_runtime_context()
 
 
 def make_recursive(v14):
@@ -352,20 +438,20 @@ def test_unknown_metadata_refuses(damage):
         ttl_constant(v14)['value'] = '0x'
     else:
         meta.value[1]['V99'] = meta.value[1].pop('V14')
-    with pytest.raises(ValueError, match='slash runtime'):
-        rpc_client(meta).get_slash_runtime_context()
+    with pytest.raises(ValueError, match='settlement runtime'):
+        rpc_client(meta).get_settlement_runtime_context()
 
 
-@pytest.mark.parametrize('error', [ValueError('unknown slash runtime'), RuntimeError(''), TimeoutError()])
+@pytest.mark.parametrize('error', [ValueError('unknown settlement runtime'), RuntimeError(''), TimeoutError()])
 def test_unavailable_context_does_not_sign_and_alerts(error, caplog):
     watcher, client, observer, req = setup_watcher()
-    client.get_slash_runtime_context.side_effect = error
+    client.get_settlement_runtime_context.side_effect = error
     verdict = asyncio.run(watcher.process_one(req, CHAIN_ID))
     assert verdict.detail == 'runtime_unavailable'
     client.keypair.sign.assert_not_called()
     observer.observe.assert_not_called()
     client.submit_slash_bad_settlement_evidence.assert_not_called()
-    assert 'slash runtime unavailable' in caplog.text
+    assert 'settlement runtime unavailable' in caplog.text
 
 
 @pytest.mark.parametrize('protocol', ['FRAU', 'FRV2'])
@@ -400,9 +486,9 @@ def test_runtime_or_expiry_changes_defer(when, change, caplog):
     watcher, client, observer, req = setup_watcher(aggregator=agg)
     def mutate():
         if change == 'unavailable':
-            client.get_slash_runtime_context.side_effect = ValueError('')
+            client.get_settlement_runtime_context.side_effect = ValueError('')
         else:
-            client.get_slash_runtime_context.return_value = context('FRV2' if change == 'upgrade' else 'FRAU', 111 if change == 'expired' else 102)
+            client.get_settlement_runtime_context.return_value = context('FRV2' if change == 'upgrade' else 'FRAU', 111 if change == 'expired' else 102)
     async def observe(*args):
         if when == 'observe':
             mutate()
@@ -481,23 +567,23 @@ def test_invalid_context_refuses_before_signing(field, value, caplog):
     assert verdict.detail == 'runtime_unavailable'
     client.keypair.sign.assert_not_called()
     client.submit_slash_bad_settlement_evidence.assert_not_called()
-    assert 'slash runtime unavailable' in caplog.text
+    assert 'settlement runtime unavailable' in caplog.text
 
 
 def test_unknown_runtime_stops_entire_tick(caplog):
     watcher, client, observer, req = setup_watcher()
-    client.get_slash_runtime_context.side_effect = ValueError('')
+    client.get_settlement_runtime_context.side_effect = ValueError('')
     client.list_pending_settlement_requests.return_value = [asdict(req)]
     watcher.process_one = AsyncMock()
     asyncio.run(watcher._tick(CHAIN_ID))
     watcher.process_one.assert_not_called()
-    assert 'slash runtime unavailable' in caplog.text
+    assert 'settlement runtime unavailable' in caplog.text
 
 
 def test_zero_ttl_is_read_from_chain_and_only_same_block_is_valid():
-    assert rpc_client(metadata(ttl=0)).get_slash_runtime_context()['ttl'] == 0
+    assert rpc_client(metadata(ttl=0)).get_settlement_runtime_context()['ttl'] == 0
     watcher, client, _, req = setup_watcher(context(block=101, ttl=0))
     assert asyncio.run(watcher.process_one(req, CHAIN_ID)).detail == 'request_expired'
     client.submit_slash_bad_settlement_evidence.assert_not_called()
-    client.get_slash_runtime_context.return_value = context(block=100, ttl=0)
+    client.get_settlement_runtime_context.return_value = context(block=100, ttl=0)
     assert asyncio.run(watcher.process_one(req, CHAIN_ID)).extrinsic_hash

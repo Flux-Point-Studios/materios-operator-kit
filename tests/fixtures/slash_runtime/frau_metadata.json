@@ -10,7 +10,8 @@
   "trimmed_to": {
    "calls": [
     "request_settle",
-    "slash_bad_settlement_evidence"
+    "slash_bad_settlement_evidence",
+    "supersede_settlement_request"
    ],
    "storage": [
     "ClaimSettlementRequests",
@@ -19,7 +20,10 @@
    ],
    "constants": [
     "SettlementRequestTtl",
-    "SlashWatcherShareBps"
+    "SlashWatcherShareBps",
+    "MinFinalityDepth",
+    "SlashSettlementTag",
+    "AttestSettleTag"
    ]
   }
  },
@@ -93,6 +97,22 @@
     "event": null,
     "error": null,
     "constants": [
+     {
+      "name": "MinFinalityDepth",
+      "type": 4,
+      "value": "0x0f000000",
+      "documentation": [
+       " Task #266 (mis-sec P0): minimum Cardano confirmation depth before",
+       " a `request_settle` is eligible to be attested. Default 15 Materios",
+       " blocks (~5 min preprod, ~36 min mainnet — matches the legacy",
+       " keeper rule at `docs/spec-v1.md` L731). Governance-tunable via the",
+       " same path used for `MinSignerThreshold`. The attestor's own",
+       " Cardano-side k=2160-slot rule is enforced off-chain in",
+       " cert-daemon; this constant is the **pallet's** freshness gate",
+       " (attest_settle rejects bundles whose evidence reports",
+       " `observed_at_depth < MinFinalityDepth`)."
+      ]
+     },
      {
       "name": "SettlementRequestTtl",
       "type": 4,

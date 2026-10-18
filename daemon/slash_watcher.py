@@ -970,7 +970,7 @@ class SlashWatcher:
 
     async def _runtime_context(self) -> Optional[dict]:
         try:
-            context = await asyncio.to_thread(self.client.get_slash_runtime_context)
+            context = await asyncio.to_thread(self.client.get_settlement_runtime_context)
             if context["protocol"] not in ("FRAU", "FRV2"):
                 raise ValueError("unknown slash protocol")
             for field, limit in (("block_number", 2**64), ("ttl", 2**32), ("spec_version", 2**32)):
@@ -978,7 +978,7 @@ class SlashWatcher:
                     raise ValueError(f"invalid {field}")
             return context
         except Exception as error:
-            logger.error("slash_watcher: slash runtime unavailable (%s); refusing to sign or submit", type(error).__name__)
+            logger.error("slash_watcher: settlement runtime unavailable (%s); refusing to sign or submit", type(error).__name__)
             return None
 
     async def _request_context(self, request: PendingBondedRequest, verdict: SlashVerdict) -> Optional[dict]:

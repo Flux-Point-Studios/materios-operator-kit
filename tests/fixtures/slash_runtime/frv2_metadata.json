@@ -1,14 +1,15 @@
 {
  "provenance": {
-  "source": "Runtime::metadata_at_version(14), native build of Flux-Point-Studios/materios a9f14a8 (spec_version 240) with pallet-intent-settlement pinned to materios-intent-settlement 5fd5f5428a678fc952163b72813e69a509b74ddb (PR #55 round 2)",
-  "materios_commit": "a9f14a8",
-  "settlement_commit": "5fd5f5428a678fc952163b72813e69a509b74ddb",
-  "spec_version": 240,
-  "metadata_sha256": "dd52593dbc5fe854a94e4aa424bd110039e05229344f1d2899ec2c7ec7a140ba",
+  "source": "Runtime::metadata_at_version(14) under sp_io::TestExternalities, native build of Flux-Point-Studios/materios 67ec3d9 (spec_version 242, transaction_version 6) with pallet-intent-settlement 0757de35efa52d983c9203a683307827d76ae338 (settlement PR #55 merged)",
+  "materios_commit": "67ec3d9",
+  "settlement_commit": "0757de35efa52d983c9203a683307827d76ae338",
+  "spec_version": 242,
+  "metadata_sha256": "0875589b9011e4aebcd88014ab4d0dbba9dc6ac6cc2a499b9154161de123674d",
   "trimmed_to": {
    "calls": [
     "request_settle",
-    "slash_bad_settlement_evidence"
+    "slash_bad_settlement_evidence",
+    "supersede_settlement_request"
    ],
    "storage": [
     "ClaimSettlementRequests",
@@ -17,7 +18,10 @@
    ],
    "constants": [
     "SettlementRequestTtl",
-    "SlashWatcherShareBps"
+    "SlashWatcherShareBps",
+    "MinFinalityDepth",
+    "SlashSettlementTag",
+    "AttestSettleTag"
    ]
   }
  },
@@ -41,7 +45,7 @@
           "Blake2_128Concat"
          ],
          "key": 13,
-         "value": 263
+         "value": 264
         }
        },
        "default": "\u0000",
@@ -81,7 +85,7 @@
           "Blake2_128Concat",
           "Blake2_128Concat"
          ],
-         "key": 265,
+         "key": 266,
          "value": 39
         }
        },
@@ -99,6 +103,22 @@
     "event": null,
     "error": null,
     "constants": [
+     {
+      "name": "MinFinalityDepth",
+      "type": 4,
+      "value": "0x0f000000",
+      "documentation": [
+       " Task #266 (mis-sec P0): minimum Cardano confirmation depth before",
+       " a `request_settle` is eligible to be attested. Default 15 Materios",
+       " blocks (~5 min preprod, ~36 min mainnet — matches the legacy",
+       " keeper rule at `docs/spec-v1.md` L731). Governance-tunable via the",
+       " same path used for `MinSignerThreshold`. The attestor's own",
+       " Cardano-side k=2160-slot rule is enforced off-chain in",
+       " cert-daemon; this constant is the **pallet's** freshness gate",
+       " (attest_settle rejects bundles whose evidence reports",
+       " `observed_at_depth < MinFinalityDepth`)."
+      ]
+     },
      {
       "name": "SettlementRequestTtl",
       "type": 4,
@@ -122,6 +142,22 @@
        " governance-tunable post-launch. Values outside `[0, 10_000]`",
        " are clamped at the call site so a misconfigured runtime can",
        " never pay out more than the bond."
+      ]
+     },
+     {
+      "name": "AttestSettleTag",
+      "type": 18,
+      "value": "0x53544341",
+      "documentation": [
+       " Committee-signed STCA digest for `attest_settle` and `supersede_settlement_request`."
+      ]
+     },
+     {
+      "name": "SlashSettlementTag",
+      "type": 18,
+      "value": "0x46525632",
+      "documentation": [
+       " Committee-signed digest for `slash_bad_settlement_evidence`; `FRV2` binds the request id."
       ]
      }
     ]
@@ -240,6 +276,20 @@
           "docs": []
          }
         ]
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 18,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "array": {
+        "len": 4,
+        "type": 2
        }
       },
       "docs": []
@@ -418,6 +468,50 @@
           ]
          },
          {
+          "name": "supersede_settlement_request",
+          "fields": [
+           {
+            "name": "claim_id",
+            "type": 13,
+            "typeName": "ClaimId",
+            "docs": []
+           },
+           {
+            "name": "settled_direct",
+            "type": 8,
+            "typeName": "bool",
+            "docs": []
+           },
+           {
+            "name": "evidence",
+            "type": 199,
+            "typeName": "SettlementEvidence",
+            "docs": []
+           },
+           {
+            "name": "signatures",
+            "type": 183,
+            "typeName": "Vec<(CommitteePubkey, CommitteeSig)>",
+            "docs": []
+           }
+          ],
+          "index": 22,
+          "docs": [
+           "Settles `claim_id` on M-of-N STCA signatures over evidence the",
+           "committee supplies, displacing a pending request whose evidence",
+           "or settlement mode differs. The displaced bond is refunded, not",
+           "slashed: an unattestable request may be honest but wrong, and no",
+           "fraud is alleged. This clears requests that no `FraudProof` can",
+           "slash, such as a wrong slot or an unreachable depth.",
+           "",
+           "The STCA digest is the one `attest_settle` verifies for a",
+           "request carrying the same evidence. The evidence passes the",
+           "checks `request_settle` applies; a request whose evidence and",
+           "mode already match must be attested instead",
+           "(`SupersedeMatchesRequest`)."
+          ]
+         },
+         {
           "name": "slash_bad_settlement_evidence",
           "fields": [
            {
@@ -466,14 +560,16 @@
            "- Caller binding: the watcher's own pubkey MUST appear in",
            "  the sig bundle (`ensure_threshold_signatures` enforces).",
            "",
-           "On success: the bond is repatriated via",
-           "`Currency::repatriate_reserved` (watcher gets",
-           "`bond * watcher_bps / 10_000`, treasury gets the rest),",
+           "On success: the bond moves out of the requester's",
+           "`SETTLEMENT_BOND_RESERVE_ID` reserve (watcher gets",
+           "`bond * watcher_bps / 10_000`, treasury gets the rest, and a",
+           "shortfall in that reserve is reported in",
+           "`SettlementBondReserveDeficit`),",
            "`SlashedSettlementRequests[claim_id, request_id]` is set, the",
            "`ClaimSettlementRequests` row is removed (so",
            "`attest_settle` errors with `SettlementRequestMissing`),",
-           "and `SettlementBondSlashed` is emitted. Any other request for",
-           "the claim can then be filed and attested."
+           "and `SettlementBondSlashed` is emitted with the amounts moved.",
+           "Any other request for the claim can then be filed and attested."
           ]
          }
         ]
@@ -566,7 +662,7 @@
      }
     },
     {
-     "id": 263,
+     "id": 264,
      "type": {
       "path": [
        "pallet_intent_settlement",
@@ -623,7 +719,7 @@
      }
     },
     {
-     "id": 265,
+     "id": 266,
      "type": {
       "path": [],
       "params": [],

@@ -28,6 +28,45 @@ SLASH_PROTOCOLS = {
     "96dfe9b41a5471b578e065d9e3055a359e27e9a6576f94b1f932bd668219e85c": "FRAU",
     "693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7": "FRV2",
 }
+SUPERSEDE_ARGS = ["claim_id", "settled_direct", "evidence", "signatures"]
+
+
+def select_slash_protocol(fingerprint: str, tag: Optional[bytes]) -> str:
+    """The runtime's ``SlashSettlementTag`` names the protocol and the contract
+    must be that protocol's pin; a runtime without the tag gets FRAU only on
+    the FRAU pin."""
+    if tag is None:
+        expected = "FRAU"
+    elif tag == b"FRV2":
+        expected = "FRV2"
+    else:
+        raise ValueError(f"unknown SlashSettlementTag 0x{tag.hex()}")
+    if SLASH_PROTOCOLS.get(fingerprint) != expected:
+        raise ValueError(f"slash contract {fingerprint} is not the {expected} pin")
+    return expected
+
+
+def supersede_offered(v14: dict, attest_tag: Optional[bytes]) -> bool:
+    """Whether the runtime has the reviewed ``supersede_settlement_request``:
+    these arguments, verified against the STCA digest. Any other shape refuses."""
+    pallet = next(p for p in v14["pallets"] if p["name"] == "IntentSettlement")
+    calls = next(e["type"]["def"] for e in v14["types"]["types"] if e["id"] == pallet["calls"]["ty"])
+    call = next((c for c in calls["variant"]["variants"] if c["name"] == "supersede_settlement_request"), None)
+    if call is None:
+        return False
+    if [field["name"] for field in call["fields"]] != SUPERSEDE_ARGS:
+        raise ValueError("supersede_settlement_request arguments are not the reviewed ones")
+    if attest_tag != b"STCA":
+        shown = "absent" if attest_tag is None else f"0x{attest_tag.hex()}"
+        raise ValueError(f"supersede_settlement_request with AttestSettleTag {shown}, not STCA")
+    return True
+
+
+def _u32_constant(constants: dict, name: str) -> int:
+    raw = constants[name]
+    if len(raw) != 4:
+        raise ValueError(f"{name} is not a u32")
+    return int.from_bytes(raw, "little")
 
 
 def slash_contract_fingerprint(v14: dict) -> str:
@@ -648,8 +687,10 @@ class SubstrateClient:
         (e.g. a chain reset) and self-heal stale daemon state."""
         return self._call("get_block_hash", 0, conn=self._read)
 
-    def get_slash_runtime_context(self) -> dict:
-        """Read the slash protocol and TTL from one head's post-state metadata."""
+    def get_settlement_runtime_context(self) -> dict:
+        """Read the slash protocol, supersede support, TTL and minimum finality
+        depth from one head's post-state metadata. Refuses any runtime outside
+        the reviewed contracts."""
         head = self._call("get_chain_head", conn=self._read)
         version = self._call("get_block_runtime_version", head, conn=self._read)
         block = self._call("get_block_number", head, conn=self._read)
@@ -659,16 +700,19 @@ class SubstrateClient:
         try:
             if version["specName"] != "materios":
                 raise ValueError("unexpected spec name")
-            protocol = SLASH_PROTOCOLS[slash_contract_fingerprint(metadata.value[1]["V14"])]
-            constants = metadata.get_metadata_pallet("IntentSettlement").constants
-            raw_ttl = next(c.constant_value for c in constants if c.name == "SettlementRequestTtl")
-            if len(raw_ttl) != 4:
-                raise ValueError("TTL width is not four bytes")
-            ttl = int.from_bytes(raw_ttl, "little")
+            v14 = metadata.value[1]["V14"]
+            constants = {c.name: bytes(c.constant_value)
+                         for c in metadata.get_metadata_pallet("IntentSettlement").constants}
+            protocol = select_slash_protocol(slash_contract_fingerprint(v14), constants.get("SlashSettlementTag"))
+            supersede = supersede_offered(v14, constants.get("AttestSettleTag"))
+            ttl = _u32_constant(constants, "SettlementRequestTtl")
+            min_finality_depth = _u32_constant(constants, "MinFinalityDepth")
         except (KeyError, TypeError, ValueError, StopIteration, AttributeError) as error:
-            raise ValueError("unknown slash runtime metadata or TTL") from error
-        return dict(block_hash=head, block_number=block, protocol=protocol,
-                    ttl=ttl, spec_version=version["specVersion"])
+            logger.error("settlement runtime at %s refused: %s: %s", head, type(error).__name__, error)
+            raise ValueError("unknown settlement runtime metadata or TTL") from error
+        return dict(block_hash=head, block_number=block, protocol=protocol, ttl=ttl,
+                    spec_version=version["specVersion"], supersede=supersede,
+                    min_finality_depth=min_finality_depth)
 
     # --- Bond helpers (OrinqReceipts pallet) --------------------------------
     # These are used by CertDaemon._ensure_bond() to keep the attestor's

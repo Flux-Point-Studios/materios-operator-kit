@@ -1,18 +1,40 @@
 # Slash signatures across runtime upgrades
 
 The watcher keeps signing FRAU on the current runtime and switches to FRV2
-when the runtime's metadata shows the FRV2 signing contract. No environment
-switch, guessed spec-version threshold, or service restart is required.
+when the runtime's metadata names FRV2 and carries the FRV2 signing contract.
+No environment switch, guessed spec-version threshold, or service restart is
+required.
 
 ## Detection and refusal
 
-`SubstrateClient.get_slash_runtime_context` pins the current best head and
-reads its runtime version, block number and V14 metadata.
-`slash_contract_fingerprint` hashes the slash signing contract out of that
-metadata, and `SLASH_PROTOCOLS` maps the two reviewed contracts to FRAU and
-FRV2. Any other fingerprint, metadata format, missing item, wrong spec name,
-or malformed TTL stops signing and submission with an ERROR:
-`slash runtime unavailable`. Never add a fallback protocol.
+`SubstrateClient.get_settlement_runtime_context` pins the current best head
+and reads its runtime version, block number and V14 metadata. From that one
+metadata it reads the `IntentSettlement` constants and selects the protocol
+with `select_slash_protocol`:
+
+| `SlashSettlementTag` | Contract fingerprint | Protocol |
+| --- | --- | --- |
+| absent | FRAU pin | FRAU |
+| absent | anything else, the FRV2 pin included | refuse |
+| `FRV2` | FRV2 pin | FRV2 |
+| `FRV2` | anything else, the FRAU pin included | refuse |
+| any other value or width | any | refuse, naming the tag |
+
+Live preprod (spec 239) has no tag constants. The spec-242 runtime (Materios
+`67ec3d9`, settlement `0757de3`) exposes all sixteen digest tags; its
+`SlashSettlementTag` is `FRV2` and the pallet's verifier hashes the same
+constant. The tag says which digest to sign; the type-only fingerprint
+cross-checks that the call, request record and request-scoped slash map are
+the reviewed ones.
+
+The same read reports whether the runtime offers `supersede_settlement_request`
+(see [Supersede driver](#supersede-driver)), `SettlementRequestTtl` and
+`MinFinalityDepth`. An unknown tag, a fingerprint outside the table, a
+supersede call with other arguments or an `AttestSettleTag` other than `STCA`,
+a missing item, a wrong spec name, or a constant that is not a u32 stops
+signing and submission. The client logs `settlement runtime at <head>
+refused: <reason>` and each consumer logs `settlement runtime unavailable`.
+Never add a fallback protocol.
 
 ### What is hashed
 
@@ -55,32 +77,36 @@ registry ids differ from spec 239), both keep their fingerprints.
 
 ### Limit
 
-Metadata types do not carry the digest's domain tag or preimage layout, so
-a runtime can change the digest without moving any of the four entries.
-Settlement #55 round 1 (`74cd340`) was such a runtime: it already required
-FRV2, but its contract fingerprint is FRAU's (measured on a real build).
-Hashing docs did not close this gap; it moved only when someone edited the
-comment. The enactment preflight therefore also checks the settlement
-revision (see Rollout). Exposing the digest tag as a pallet constant would
-let the fingerprint include it.
+Metadata types do not carry the digest's preimage layout, so a runtime can
+change the digest without moving any of the four entries. Settlement #55
+round 1 (`74cd340`) was such a runtime: it already required FRV2, but its
+contract fingerprint is FRAU's (measured on a real build). The tag closes the
+selection half of that gap: a tagless runtime is refused unless it is the FRAU
+contract, and FRV2 is selected only when the runtime itself says FRV2. A
+change of layout under an unchanged tag is still invisible to metadata, so
+the enactment preflight keeps checking the settlement revision (see Rollout).
 
 ### Pins and provenance
 
 | Protocol | Fingerprint | Source |
 | --- | --- | --- |
 | FRAU | `96dfe9b41a5471b578e065d9e3055a359e27e9a6576f94b1f932bd668219e85c` | Live preprod spec 239, `state_getMetadata` at block 2330118 (`0x2743fc10…5311`), read-only. A native build of Materios `a9f14a8` (spec 240, settlement `c60b98f`) gives the same value. |
-| FRV2 | `693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7` | Native build of Materios `a9f14a8` with `pallet-intent-settlement` pinned to settlement #55 round 2, `5fd5f5428a678fc952163b72813e69a509b74ddb`. Unchanged with the round-1 slash docs. |
+| FRV2 | `693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7` | Native build of Materios `67ec3d9` (spec 242, transaction version 6, settlement `0757de3`), `Runtime::metadata_at_version(14)` under `sp_io::TestExternalities`. The earlier Materios `a9f14a8` build with settlement `5fd5f54` gives the same value, as does the adoption agent's subwasm read of the spec-242 WASM. |
 
 `tests/fixtures/slash_runtime/{frau,frv2}_metadata.json` hold the
-`IntentSettlement` items the fingerprint reads, plus `request_settle`,
-`BondSlashedRequests` and `SlashWatcherShareBps` as unrelated controls, and
-the types they reach. They are cut from the decoded metadata named in each
-file's `provenance`, which records the SHA-256 of the full metadata.
-Constant values are stored as hex.
+`IntentSettlement` items the fingerprint and context read (the slash and
+supersede calls, `ClaimSettlementRequests`, `SlashedSettlementRequests`,
+`SettlementRequestTtl`, `MinFinalityDepth`, `SlashSettlementTag`,
+`AttestSettleTag`), plus `request_settle`, `BondSlashedRequests` and
+`SlashWatcherShareBps` as unrelated controls, and the types they reach. They
+are cut from the decoded metadata named in each file's `provenance`, which
+records the SHA-256 of the full metadata. Constant values are stored as hex.
+`frv2_metadata.json` is the spec-242 runtime.
 
 To pin a new contract, decode the runtime's metadata with scalecodec's
 `MetadataVersioned` (from `state_getMetadata` on a node running it, or
-natively from `Runtime::metadata_at_version(14)` with `SKIP_WASM_BUILD=1`),
+natively from `Runtime::metadata_at_version(14)` with `SKIP_WASM_BUILD=1`,
+inside `sp_io::TestExternalities` because `MateriosChainId` reads storage),
 pass its `V14` body to `slash_contract_fingerprint`, and add the value only
 after reviewing the new digest against the pallet source.
 
