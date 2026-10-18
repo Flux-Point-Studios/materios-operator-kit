@@ -39,6 +39,19 @@ def decoder():
     return rules.RuntimeDecoder(_read("materios/metadata_spec238.hex.gz").decode())
 
 
+# Spec 242: Materios 67ec3d9 with settlement 0757de3, Runtime::metadata_at_version(14)
+# from a native build. Its pallets, calls, events, errors and signed extensions match
+# the spec-242 WASM's.
+@pytest.fixture(scope="module")
+def decoder_242():
+    return rules.RuntimeDecoder(_read("materios/metadata_spec242.hex.gz").decode())
+
+
+@pytest.fixture(params=["spec238", "spec242"])
+def any_decoder(request):
+    return request.getfixturevalue("decoder" if request.param == "spec238" else "decoder_242")
+
+
 def _block(name: str) -> dict:
     return json.loads(_read(f"materios/{name}"))
 
@@ -628,10 +641,10 @@ def _random_call(rng, calls, depth: int) -> dict:
     return {"call_module": module, "call_function": function, "call_args": args}
 
 
-def test_every_call_in_the_runtime_is_classified_whatever_its_argument_values(decoder):
+def test_every_call_in_the_runtime_is_classified_whatever_its_argument_values(any_decoder):
     import random
 
-    calls = _metadata_calls(decoder)
+    calls = _metadata_calls(any_decoder)
     rng = random.Random(238)
     signers = (ALICE, SUDO_KEY, 7, {"Raw": "\x01"}, None)
     events = {0: ["System.ExtrinsicFailed(dispatch_error=Err)"]}
@@ -904,13 +917,98 @@ def test_every_root_timelock_call_is_critical(function):
     assert finding.severity == rules.CRITICAL
 
 
-def test_every_call_in_the_pinned_runtime_is_in_the_severity_table_or_the_routine_list(decoder):
+def test_every_call_in_the_pinned_runtime_is_in_the_severity_table_or_the_routine_list(any_decoder):
     unlisted = []
-    for module, function, _ in _metadata_calls(decoder):
+    for module, function, _ in _metadata_calls(any_decoder):
         for finding in _classify_extrinsics([_signed(ALICE, module, function)]):
             if "neither the severity table nor the routine list" in finding.render():
                 unlisted.append(f"{module}.{function}")
     assert unlisted == []
+
+
+COMMITTEE_MEMBER = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty"
+EVIDENCE = {
+    "cardano_tx_hash": "0x" + "44" * 32, "observed_at_depth": 15, "observed_slot": 123456,
+    "beneficiary_addr_hash": "0x" + "55" * 28, "amount_lovelace": 5_000_000,
+    "mainchain_genesis_hash": "0x" + "77" * 32,
+}
+
+
+def _signed_hex(decoder, signer: str, module: str, function: str, **args) -> str:
+    """A signed extrinsic encoded against ``decoder``'s runtime, as a block carries it."""
+    ext = decoder._config.create_scale_object("Extrinsic", metadata=decoder._metadata)
+    return ext.encode({
+        "account_id": "0x" + rules.account_bytes(signer).hex(), "signature_version": 1,
+        "signature": "0x" + "cc" * 64, "era": "00", "nonce": 3, "tip": 0,
+        "call_module": module, "call_function": function, "call_args": args,
+    }).to_hex()
+
+
+def _events_hex(decoder, *events) -> str:
+    """``System.Events`` for extrinsic 0, each ``(pallet, event, attributes)``."""
+    records = [{"phase": {"ApplyExtrinsic": 0}, "event": {pallet: {name: attributes}}, "topics": []}
+               for pallet, name, attributes in events]
+    obj = decoder._config.create_scale_object(decoder._events_type, metadata=decoder._metadata)
+    return obj.encode(records).to_hex()
+
+
+def _settlement_error(decoder, name: str) -> dict:
+    pallet = decoder._metadata.get_metadata_pallet("IntentSettlement")
+    index = next(e.value["index"] for e in pallet.errors if e.value["name"] == name)
+    return {"Module": {"index": pallet.value["index"], "error": "0x" + bytes([index, 0, 0, 0]).hex()}}
+
+
+SUPERSEDED = [
+    ("IntentSettlement", "SettlementBondReleased", {"claim_id": "0x" + "22" * 32, "requester": ALICE, "amount": 7}),
+    ("IntentSettlement", "SettlementBondReserveDeficit",
+     {"claim_id": "0x" + "22" * 32, "requester": ALICE, "missing_amount": 1}),
+    ("IntentSettlement", "SettlementRequestSuperseded", {"claim_id": "0x" + "22" * 32, "requester": ALICE}),
+    ("IntentSettlement", "ClaimSettled",
+     {"claim_id": "0x" + "22" * 32, "cardano_tx_hash": "0x" + "44" * 32, "settled_direct": True}),
+    ("System", "ExtrinsicSuccess", {"dispatch_info": {"weight": {"ref_time": 1, "proof_size": 1},
+                                                      "class": "Operational", "pays_fee": "No"}}),
+]
+
+
+def _refused(decoder, error: str):
+    return [("System", "ExtrinsicFailed", {
+        "dispatch_error": _settlement_error(decoder, error),
+        "dispatch_info": {"weight": {"ref_time": 1, "proof_size": 1}, "class": "Operational", "pays_fee": "No"},
+    })]
+
+
+@pytest.mark.parametrize("outcome", ["superseded", "SupersedeMatchesRequest", "FinalityDepthAboveMaximum"])
+@pytest.mark.parametrize("authority", [False, True])
+def test_a_committee_supersede_on_spec_242_pages_nothing(decoder_242, outcome, authority):
+    xt = _signed_hex(decoder_242, COMMITTEE_MEMBER, "IntentSettlement", "supersede_settlement_request",
+                     claim_id="0x" + "22" * 32, settled_direct=True, evidence=EVIDENCE,
+                     signatures=[("0x" + "aa" * 32, "0x" + "bb" * 64)])
+    [decoded] = decoder_242.extrinsics([xt])
+    assert decoded["call"]["call_function"] == "supersede_settlement_request"
+    events = decoder_242.events(_events_hex(
+        decoder_242, *(SUPERSEDED if outcome == "superseded" else _refused(decoder_242, outcome))))
+    authorities = frozenset({rules.account_bytes(COMMITTEE_MEMBER)}) if authority else frozenset()
+    assert rules.classify_materios_block("materios-preprod", 9, [decoded], read_events=lambda: events,
+                                         sudo_key=rules.account_bytes(SUDO_KEY), authorities=authorities) == []
+    assert rules.classify_materios_block("materios-preprod", 9, [decoded], read_events=lambda: None,
+                                         sudo_key=rules.account_bytes(SUDO_KEY), authorities=authorities) == []
+
+
+def test_the_new_settlement_events_and_errors_decode_by_name(decoder_242):
+    assert decoder_242.events(_events_hex(decoder_242, *SUPERSEDED))[0][:4] == [
+        "IntentSettlement.SettlementBondReleased", "IntentSettlement.SettlementBondReserveDeficit",
+        "IntentSettlement.SettlementRequestSuperseded", "IntentSettlement.ClaimSettled",
+    ]
+    for error in ("SupersedeMatchesRequest", "FinalityDepthAboveMaximum"):
+        [failed] = decoder_242.events(_events_hex(decoder_242, *_refused(decoder_242, error)))[0]
+        assert failed.startswith("System.ExtrinsicFailed(dispatch_error=")
+        assert _settlement_error(decoder_242, error)["Module"]["error"] in failed
+
+
+def test_spec_242_adds_supersede_to_the_settlement_calls(decoder, decoder_242):
+    def settlement(d):
+        return {function for module, function, _ in _metadata_calls(d) if module == "IntentSettlement"}
+    assert settlement(decoder_242) - settlement(decoder) == {"supersede_settlement_request"}
 
 
 # --- Cardano ------------------------------------------------------------------
