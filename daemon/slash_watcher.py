@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import time
 from dataclasses import astuple, dataclass
 from typing import Any, Optional, Union
 
@@ -39,6 +40,7 @@ from daemon.settle_claim_attestor import (
     CardanoTxObservation,
     CardanoTxObserver,
     NETWORK_MAGIC_TO_GENESIS_HASH,
+    LOCKED_REREAD_SECONDS,
     checked_runtime_context,
     poll_forever,
     request_expired,
@@ -87,6 +89,25 @@ KUPO_TIP_LAG_MAX_SLOTS: int = 60
 
 # Cardano blocks between the two absence proofs TxNotFound needs.
 TX_ABSENCE_CONFIRM_BLOCKS: int = 10
+
+# Most slots the node's tip may trail the network's current slot, by the wall
+# clock, at each absence proof: a node that is catching up, stalled or on a
+# minority fork has not seen the network's recent transactions.
+CARDANO_TIP_LAG_MAX_SLOTS: int = 300
+
+# Most slots per block, on average, the node's chain may take between the two
+# absence proofs. Preprod and mainnet average 20 (active slot coefficient
+# 0.05); a sparse chain is a minority fork.
+CHAIN_SLOTS_PER_BLOCK_MAX: int = 60
+
+# Per Cardano network (Shelley genesis hash): (slot, unix seconds) at which
+# 1-second slots began. Preprod: systemStart 2022-06-01T00:00:00Z, then 86400
+# Byron slots of 20 s (Ogmios queryNetwork/startTime and
+# queryLedgerState/eraSummaries, read 2026-10-18; Lucid's SLOT_CONFIG_NETWORK
+# agrees). A network without an entry cannot prove a tx absent.
+NETWORK_CLOCKS: dict[bytes, tuple[int, int]] = {
+    CARDANO_PREPROD_GENESIS_HASH: (86400, 1655769600),
+}
 
 # Per Cardano network (Shelley genesis hash), an output reference that was
 # spent long ago. A Kupo that returns it with ``spent_at`` keeps spent outputs
@@ -523,37 +544,19 @@ class CardanoSlashObserver(CardanoTxObserver):
     logic.
     """
 
+    wall_clock = staticmethod(time.time)
+
     async def kupo_checkpoint_slot(self) -> Optional[int]:
-        """Return the Kupo follower's most-recent-checkpoint slot number.
+        """Kupo's most recent checkpoint slot from ``/health``, or None on any
+        error or unexpected shape.
 
-        Used by the slash watcher's classifier (sec-review round-1
-        Vuln 3) to gate the ``TxNotFound`` promotion: an empty Kupo
-        ``/matches`` response is only proof-of-absence if the
-        follower is demonstrably caught up to the requested observation
-        depth + a safety margin (see
-        :data:`KUPO_SYNC_SAFETY_MARGIN_SLOTS`). Otherwise the follower
-        might be mid-resync after an operator restart and we'd burn an
-        honest requester for a false-positive ``TxNotFound``.
+        :meth:`prove_absence` requires it within KUPO_TIP_LAG_MAX_SLOTS of
+        the node's tip before an empty lookup counts as an absence; None
+        defers.
 
-        Returns ``None`` on any error (Kupo unreachable, non-200
-        response, unexpected JSON shape). The dispatcher treats None
-        as "can't prove caught-up" → defer (NOT slash). Same fail-safe
-        contract as :meth:`_first_payment_hash` returning None.
-
-        Kupo 2.x exposes ``/health`` with a JSON body containing
-        ``most_recent_checkpoint`` as either a scalar slot number or a
-        sub-dict carrying ``slot_no``. We parse both shapes
-        defensively to stay forward-compatible.
-
-        Live-prod note (2026-05-15): Kupo 2.9 content-negotiates the
-        ``/health`` response body — without an explicit
-        ``Accept: application/json`` request header it falls back to
-        Prometheus text format (either as 200 with text body or 406
-        depending on version). The slash watcher then can't parse
-        the structured shape, returns None, and the dispatcher defers
-        TxNotFound prosecution per the Vuln 3 fail-safe contract. The
-        ``Accept`` header below is load-bearing — do NOT remove without
-        confirming current Kupo continues to serve JSON by default.
+        Kupo 2.9 content-negotiates ``/health``: without
+        ``Accept: application/json`` it answers in Prometheus text (200 or
+        406), which does not parse. The header is load-bearing.
         """
         url = f"{self.kupo_url}/health"
         try:
@@ -607,28 +610,52 @@ class CardanoSlashObserver(CardanoTxObserver):
                 return "ogmios_genesis_hash_unavailable"
             return await self._coverage_gap(session, genesis)
 
-    async def prove_absence(self, cardano_tx_hash_hex: str) -> tuple[Optional[int], str]:
-        """The Cardano tip height at which a caught-up, fully indexing Kupo
-        returned no output of the tx, or None with the reason.
+    async def _network_tip(self, session: aiohttp.ClientSession) -> tuple[Optional[dict], str]:
+        """The node's tip slot and height, the network it follows, and how
+        many slots the tip trails the network's current slot by the wall
+        clock; or None with the reason."""
+        tip = await self._ogmios_rpc(session, "queryNetwork/tip")
+        height = await self._ogmios_rpc(session, "queryNetwork/blockHeight")
+        if not (isinstance(tip, dict) and type(tip.get("slot")) is int and type(height) is int):
+            return None, "ogmios_tip_unavailable"
+        genesis = await self.get_genesis_hash(session)
+        if genesis is None:
+            return None, "ogmios_genesis_hash_unavailable"
+        clock = NETWORK_CLOCKS.get(genesis)
+        if clock is None:
+            return None, "no_network_clock"
+        shelley_slot, shelley_unix = clock
+        lag = shelley_slot + int(self.wall_clock() - shelley_unix) - tip["slot"]
+        return dict(slot=tip["slot"], height=height, genesis=genesis, lag=lag), "ok"
 
-        Order matters: the tip is read first, then Kupo's checkpoint, which
-        must be within KUPO_TIP_LAG_MAX_SLOTS of it, then the lookup, so the
-        lookup covers at least everything up to that checkpoint.
+    async def network_tip_lag(self) -> Optional[int]:
+        """Slots the node's tip trails the network's current slot, or None."""
+        async with aiohttp.ClientSession() as session:
+            tip, _ = await self._network_tip(session)
+        return None if tip is None else tip["lag"]
+
+    async def prove_absence(self, cardano_tx_hash_hex: str) -> tuple[Optional[tuple[int, int]], str]:
+        """The node's tip (height, slot) at which a caught-up, fully indexing
+        Kupo returned no output of the tx, or None with the reason.
+
+        Order matters: the tip is read first and must be within
+        CARDANO_TIP_LAG_MAX_SLOTS of the network's current slot by the wall
+        clock; then Kupo's checkpoint, which must be within
+        KUPO_TIP_LAG_MAX_SLOTS of that tip; then the lookup, so the lookup
+        covers at least everything up to that checkpoint.
         """
         async with aiohttp.ClientSession() as session:
-            tip = await self._ogmios_rpc(session, "queryNetwork/tip")
-            height = await self._ogmios_rpc(session, "queryNetwork/blockHeight")
-            if not (isinstance(tip, dict) and type(tip.get("slot")) is int and type(height) is int):
-                return None, "ogmios_tip_unavailable"
-            genesis = await self.get_genesis_hash(session)
-            if genesis is None:
-                return None, "ogmios_genesis_hash_unavailable"
+            tip, reason = await self._network_tip(session)
+            if tip is None:
+                return None, reason
+            if tip["lag"] > CARDANO_TIP_LAG_MAX_SLOTS:
+                return None, f"cardano_tip_behind_wallclock:{tip['lag']}>{CARDANO_TIP_LAG_MAX_SLOTS}"
             checkpoint = await self.kupo_checkpoint_slot()
             if checkpoint is None:
                 return None, "kupo_checkpoint_unavailable"
             if checkpoint < tip["slot"] - KUPO_TIP_LAG_MAX_SLOTS:
                 return None, f"kupo_behind_tip:{checkpoint}<{tip['slot']}-{KUPO_TIP_LAG_MAX_SLOTS}"
-            gap = await self._coverage_gap(session, genesis)
+            gap = await self._coverage_gap(session, tip["genesis"])
             if gap is not None:
                 return None, f"kupo_coverage:{gap}"
             matches = await self._kupo_get(session, f"/matches/*@{cardano_tx_hash_hex}", {})
@@ -636,7 +663,7 @@ class CardanoSlashObserver(CardanoTxObserver):
                 return None, "kupo_matches_unavailable"
             if matches:
                 return None, "tx_found"
-            return height, "absent"
+            return (tip["height"], tip["slot"]), "absent"
 
     async def observe(  # type: ignore[override]
         self,
@@ -844,9 +871,9 @@ class SlashWatcher:
                 )
                 min_signer_threshold = 2
         self.min_signer_threshold = max(1, int(min_signer_threshold or 1))
-        # Pending request (as a tuple) -> Cardano tip height of its tx's
-        # first proven absence.
-        self._absences: dict[tuple, int] = {}
+        # Pending request (as a tuple) -> Cardano tip (height, slot) of its
+        # tx's first proven absence.
+        self._absences: dict[tuple, tuple[int, int]] = {}
         # Last logged runtime-context error and Kupo coverage gap, so each
         # change is logged once.
         self._context_error: Optional[str] = None
@@ -866,10 +893,18 @@ class SlashWatcher:
 
     async def _report_status(self) -> None:
         """Reads the runtime context, which the client announces once per
-        runtime, and whether Kupo can prove fraud, logged when it changes and
-        exported as ``slash_kupo_coverage_ok``. Runs every poll, pending
-        requests or not."""
+        runtime; how far the node's tip trails the network, exported as
+        ``slash_cardano_tip_lag_slots``; and whether Kupo can prove fraud,
+        logged when it changes and exported as ``slash_kupo_coverage_ok``.
+        Runs every poll, pending requests or not."""
         await self._runtime_context()
+        try:
+            lag = await self.observer.network_tip_lag()
+        except Exception as error:  # noqa: BLE001
+            logger.warning("slash_watcher: reading the Cardano tip raised %s", type(error).__name__)
+            lag = None
+        if lag is not None:
+            health_server.update_metrics(slash_cardano_tip_lag_slots=lag)
         try:
             gap = await self.observer.kupo_coverage_gap()
         except Exception as error:  # noqa: BLE001
@@ -900,18 +935,55 @@ class SlashWatcher:
 
     async def _confirm_absence(self, request: PendingBondedRequest) -> tuple[bool, str]:
         """Whether the tx of ``request`` was proven absent twice, at Cardano
-        tip heights at least TX_ABSENCE_CONFIRM_BLOCKS apart. A tx seen in
-        between restarts the count; a replacement request starts its own."""
+        tip heights at least TX_ABSENCE_CONFIRM_BLOCKS apart, over a chain no
+        sparser than CHAIN_SLOTS_PER_BLOCK_MAX slots per block. A tx seen in
+        between, here or by an observation, restarts the count, as does a
+        sparse chain; a replacement request starts its own."""
         key = astuple(request)
-        height, reason = await self.observer.prove_absence(request.cardano_tx_hash.hex())
-        if height is None:
+        proof, reason = await self.observer.prove_absence(request.cardano_tx_hash.hex())
+        if proof is None:
             if reason == "tx_found":
                 self._absences.pop(key, None)
             return False, reason
-        first = self._absences.setdefault(key, height)
-        if height - first < TX_ABSENCE_CONFIRM_BLOCKS:
-            return False, f"absence_unconfirmed:first_height={first},height={height}"
-        return True, f"absent_from_height={first}_to_{height}"
+        height, slot = proof
+        first_height, first_slot = self._absences.setdefault(key, proof)
+        blocks = height - first_height
+        if blocks < TX_ABSENCE_CONFIRM_BLOCKS:
+            return False, f"absence_unconfirmed:first_height={first_height},height={height}"
+        if slot - first_slot > CHAIN_SLOTS_PER_BLOCK_MAX * blocks:
+            self._absences[key] = proof
+            return False, f"cardano_chain_sparse:{slot - first_slot}_slots_over_{blocks}_blocks"
+        return True, f"absent_from_height={first_height}_to_{height}"
+
+    async def _still_current(self, request: PendingBondedRequest, verdict: SlashVerdict, context: dict) -> bool:
+        """Whether the bundle signed under ``context`` may still be submitted:
+        the runtime and protocol are unchanged, the request is in its slash
+        window, and the claim still holds that request. A FRAU digest does not
+        name the request, so a bundle must go only against the row it was
+        signed for."""
+        current = await self._request_context(request, verdict)
+        if current is None:
+            return False
+        if current["protocol"] != context["protocol"]:
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "runtime_changed"
+            logger.warning("slash_watcher: runtime_changed; discarding envelope and retrying next tick")
+            return False
+        try:
+            pending = await asyncio.to_thread(self.client.get_settlement_request, request.claim_id)
+        except Exception as error:  # noqa: BLE001
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "request_unreadable"
+            logger.warning("slash_watcher: rereading claim %s... raised %s; not slashing",
+                           request.claim_id.hex()[:16], type(error).__name__)
+            return False
+        if pending is None or PendingBondedRequest(**pending) != request:
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "request_changed"
+            logger.warning("slash_watcher: claim %s... no longer holds the request the bundle was signed for",
+                           request.claim_id.hex()[:16])
+            return False
+        return True
 
     async def process_one(
         self,
@@ -971,6 +1043,9 @@ class SlashWatcher:
             verdict.outcome = ClassifierOutcome.TRANSIENT_L1_ERROR
             verdict.detail = f"observer_raised: {type(e).__name__}"
             return verdict
+
+        if observation.outputs:
+            self._absences.pop(astuple(request), None)
 
         # Only `kupo_no_matches_for_tx` (a successful, empty lookup) can lead
         # to a proof; any other tag is an incomplete observation.
@@ -1142,29 +1217,14 @@ class SlashWatcher:
             envelope = [(pubkey_bytes, sig_bytes)]
 
         async with self._chain_write_lock:
-            current = await self._request_context(request, verdict)
-            if current is None:
-                return verdict
-            if current["protocol"] != context["protocol"]:
-                verdict.outcome = ClassifierOutcome.DEFERRED
-                verdict.detail = "runtime_changed"
-                logger.warning("slash_watcher: runtime_changed; discarding envelope and retrying next tick")
-                return verdict
-            # A FRAU digest does not name the request, so the bundle must go
-            # only against the row it was signed for.
             try:
-                pending = await asyncio.to_thread(self.client.get_settlement_request, request.claim_id)
-            except Exception as error:  # noqa: BLE001
+                current = await asyncio.wait_for(self._still_current(request, verdict, context),
+                                                 LOCKED_REREAD_SECONDS)
+            except asyncio.TimeoutError:
                 verdict.outcome = ClassifierOutcome.DEFERRED
-                verdict.detail = "request_unreadable"
-                logger.warning("slash_watcher: rereading claim %s... raised %s; not slashing",
-                               request.claim_id.hex()[:16], type(error).__name__)
+                verdict.detail = "reread_timed_out"
                 return verdict
-            if pending is None or PendingBondedRequest(**pending) != request:
-                verdict.outcome = ClassifierOutcome.DEFERRED
-                verdict.detail = "request_changed"
-                logger.warning("slash_watcher: claim %s... no longer holds the request the bundle was signed for",
-                               request.claim_id.hex()[:16])
+            if not current:
                 return verdict
             try:
                 ext_hash = await asyncio.to_thread(
@@ -1393,6 +1453,9 @@ __all__ = [
     "FRAUD_DISCRIMINANT_WRONG_BENEFICIARY",
     "KUPO_TIP_LAG_MAX_SLOTS",
     "TX_ABSENCE_CONFIRM_BLOCKS",
+    "CARDANO_TIP_LAG_MAX_SLOTS",
+    "CHAIN_SLOTS_PER_BLOCK_MAX",
+    "NETWORK_CLOCKS",
     "SPENT_CANARIES",
     "WrongAmount",
     "TxNotFound",

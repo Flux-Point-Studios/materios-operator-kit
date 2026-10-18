@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from substrateinterface import Keypair
 
+from daemon import health_server
 from daemon import slash_watcher as sw
 from daemon.settle_claim_attestor import CARDANO_PREPROD_GENESIS_HASH, CARDANO_PREVIEW_GENESIS_HASH
 from tests.test_slash_watcher import (
@@ -79,6 +80,9 @@ CANARY_TX, CANARY_INDEX = sw.SPENT_CANARIES[CARDANO_PREPROD_GENESIS_HASH]
 SPENT = {"slot_no": 10608917, "header_hash": "cd" * 32}
 TX_LOOKUP = f"/matches/*@{CARDANO_TX_HASH.hex()}"
 CANARY = [dict(transaction_id=CANARY_TX, output_index=CANARY_INDEX, spent_at=SPENT)]
+# Ogmios queryNetwork/startTime and eraSummaries on preprod: 2022-06-01T00:00:00Z,
+# 86400 Byron slots of 20 s, then 1 s slots.
+PREPROD_CLOCK = (86400, 1654041600 + 86400 * 20)
 
 
 class Cardano:
@@ -90,6 +94,9 @@ class Cardano:
         self.patterns = patterns
         self.canary = canary
         self.tip_slot, self.tip_height = TIP_SLOT, TIP_HEIGHT
+        # The network's current slot by the wall clock; a healthy node's tip
+        # trails it by a block or so.
+        self.wall_slot = TIP_SLOT + 20
         self.checkpoint = checkpoint
         self.magic = magic
         self.reads = []
@@ -119,9 +126,10 @@ class Cardano:
         self.reads.append("/health")
         return self.tip_slot if self.checkpoint is None else self.checkpoint
 
-    def advance(self, blocks):
+    def advance(self, blocks, slots_per_block=20):
         self.tip_height += blocks
-        self.tip_slot += 20 * blocks
+        self.tip_slot += slots_per_block * blocks
+        self.wall_slot += slots_per_block * blocks
         self.reads.clear()
 
 
@@ -131,6 +139,8 @@ def scripted(cardano):
     obs._kupo_get = AsyncMock(side_effect=cardano.kupo)
     obs.kupo_checkpoint_slot = AsyncMock(side_effect=cardano.health)
     obs.get_block_height_by_hash = AsyncMock(return_value=TIP_HEIGHT - 20)
+    shelley_slot, shelley_unix = PREPROD_CLOCK
+    obs.wall_clock = lambda: shelley_unix + cardano.wall_slot - shelley_slot + 0.5
     return obs
 
 
@@ -237,7 +247,8 @@ def test_a_present_tx_is_proven_wrong_from_a_kupo_that_indexes_everything(fraud,
     assert {"/patterns", f"/matches/{CANARY_INDEX}@{CANARY_TX}"} <= set(cardano.reads)
 
 
-def test_a_network_without_a_spent_canary_cannot_prove_absence():
+def test_a_network_without_a_spent_canary_cannot_prove_absence(monkeypatch):
+    monkeypatch.setitem(sw.NETWORK_CLOCKS, CARDANO_PREVIEW_GENESIS_HASH, PREPROD_CLOCK)
     cardano = Cardano(magic=2)
     slash_watcher, client = watcher(scripted(cardano))
     request = bonded_request(mainchain_genesis_hash=CARDANO_PREVIEW_GENESIS_HASH)
@@ -307,3 +318,97 @@ def test_every_tx_lookup_uses_the_output_reference_index():
     obs = asyncio.run(scripted(cardano).observe(CARDANO_TX_HASH.hex(), BENE_HASH_28))
     assert obs.mismatches == [] and obs.matched_address_lovelace == AMOUNT_LOVELACE
     assert cardano.reads.count(TX_LOOKUP) == 1
+
+
+# --- the node must be on the network's chain, at the network's time ----------
+
+
+def test_the_network_clock_is_pinned_per_cardano_genesis():
+    assert sw.NETWORK_CLOCKS == {CARDANO_PREPROD_GENESIS_HASH: PREPROD_CLOCK}
+
+
+def test_a_node_behind_the_network_proves_nothing():
+    """materios review of 219176c: the shared node is catching up, its tip
+    still before the honest tx's slot, while Kupo keeps pace with it."""
+    cardano = Cardano()
+    cardano.tip_slot = OBSERVED_SLOT - 3000
+    cardano.tip_height = 900_000
+    slash_watcher, client = watcher(scripted(cardano))
+    request = bonded_request()
+    for _ in range(3):
+        verdict = run(slash_watcher, request)
+        assert verdict.fraud_proof is None
+        assert "cardano_tip_behind_wallclock" in verdict.detail
+        cardano.advance(sw.TX_ABSENCE_CONFIRM_BLOCKS)
+    client.keypair.sign.assert_not_called()
+
+
+@pytest.mark.parametrize("lag, fresh", [(sw.CARDANO_TIP_LAG_MAX_SLOTS, True), (sw.CARDANO_TIP_LAG_MAX_SLOTS + 1, False)])
+def test_the_tip_may_trail_the_wall_clock_by_the_bound(lag, fresh):
+    cardano = Cardano()
+    cardano.wall_slot = cardano.tip_slot + lag
+    slash_watcher, _ = watcher(scripted(cardano))
+    detail = run(slash_watcher, bonded_request()).detail
+    assert ("absence_unconfirmed" in detail) is fresh
+    assert ("cardano_tip_behind_wallclock" in detail) is not fresh
+
+
+def test_a_network_without_a_pinned_clock_proves_nothing(monkeypatch):
+    monkeypatch.setitem(sw.SPENT_CANARIES, CARDANO_PREVIEW_GENESIS_HASH, (CANARY_TX, CANARY_INDEX))
+    cardano = Cardano(magic=2)
+    slash_watcher, client = watcher(scripted(cardano))
+    request = bonded_request(mainchain_genesis_hash=CARDANO_PREVIEW_GENESIS_HASH)
+    for _ in range(2):
+        assert "no_network_clock" in run(slash_watcher, request).detail
+        cardano.advance(sw.TX_ABSENCE_CONFIRM_BLOCKS)
+    client.keypair.sign.assert_not_called()
+
+
+def test_a_sparse_chain_between_the_proofs_restarts_the_count():
+    """A minority fork advances, but far more slowly than the network."""
+    cardano = Cardano()
+    slash_watcher, client = watcher(scripted(cardano))
+    request = bonded_request()
+    run(slash_watcher, request)
+    cardano.advance(sw.TX_ABSENCE_CONFIRM_BLOCKS, slots_per_block=200)
+    assert "cardano_chain_sparse" in run(slash_watcher, request).detail
+    client.keypair.sign.assert_not_called()
+    # The count restarted at the sparse proof; dense blocks since then prove it.
+    cardano.advance(sw.TX_ABSENCE_CONFIRM_BLOCKS)
+    assert isinstance(run(slash_watcher, request).fraud_proof, sw.TxNotFound)
+
+
+@pytest.mark.parametrize("slots_per_block, dense", [(sw.CHAIN_SLOTS_PER_BLOCK_MAX, True),
+                                                    (sw.CHAIN_SLOTS_PER_BLOCK_MAX + 1, False)])
+def test_the_chain_between_the_proofs_may_average_the_bound(slots_per_block, dense):
+    cardano = Cardano()
+    slash_watcher, client = watcher(scripted(cardano))
+    request = bonded_request()
+    run(slash_watcher, request)
+    cardano.advance(sw.TX_ABSENCE_CONFIRM_BLOCKS, slots_per_block=slots_per_block)
+    verdict = run(slash_watcher, request)
+    assert isinstance(verdict.fraud_proof, sw.TxNotFound) is dense
+    assert signed(client) == int(dense)
+
+
+def test_a_tx_seen_by_the_observation_restarts_the_count():
+    tx = [paying(BENE_HASH_28, AMOUNT_LOVELACE)]
+    cardano = Cardano()
+    slash_watcher, client = watcher(scripted(cardano))
+    request = bonded_request()
+    assert "absence_unconfirmed" in run(slash_watcher, request).detail
+    cardano.advance(1)
+    cardano.tx_rows = tx
+    assert run(slash_watcher, request).outcome == sw.ClassifierOutcome.NOT_FRAUD
+    cardano.advance(sw.TX_ABSENCE_CONFIRM_BLOCKS)
+    cardano.tx_rows = []
+    assert "absence_unconfirmed" in run(slash_watcher, request).detail
+    client.keypair.sign.assert_not_called()
+
+
+def test_the_watcher_exports_how_far_the_node_trails_the_network():
+    cardano = Cardano()
+    cardano.wall_slot = cardano.tip_slot + 37
+    slash_watcher, _ = watcher(scripted(cardano))
+    asyncio.run(slash_watcher._report_status())
+    assert health_server._metrics["slash_cardano_tip_lag_slots"] == 37

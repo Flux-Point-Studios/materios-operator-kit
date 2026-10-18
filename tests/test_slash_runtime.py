@@ -769,3 +769,21 @@ def test_the_pending_request_is_reread_under_the_write_lock():
     watcher._chain_write_lock = Lock()
     client.get_settlement_request.side_effect = lambda claim_id: locked and asdict(req)
     assert asyncio.run(watcher.process_one(req, CHAIN_ID)).extrinsic_hash
+
+
+def test_rereads_under_the_write_lock_are_bounded(monkeypatch):
+    """Receipt certificates wait on the same lock."""
+    import time as clock
+    monkeypatch.setattr(sw, 'LOCKED_REREAD_SECONDS', 0.2)
+    watcher, client, _, req = setup_watcher(context('FRAU'))
+    client.get_settlement_request.side_effect = lambda claim_id: clock.sleep(1) or asdict(req)
+    lock = watcher._chain_write_lock
+
+    async def run():
+        started = clock.monotonic()
+        verdict = await watcher.process_one(req, CHAIN_ID)
+        return verdict, clock.monotonic() - started, lock.locked()
+    verdict, elapsed, held = asyncio.run(run())
+    assert verdict.detail == 'reread_timed_out'
+    assert elapsed < 0.8 and not held
+    client.submit_slash_bad_settlement_evidence.assert_not_called()

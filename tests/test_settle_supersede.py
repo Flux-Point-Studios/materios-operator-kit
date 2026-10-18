@@ -539,3 +539,21 @@ def test_a_failed_listing_keeps_every_backoff():
     att.client.list_pending_settlement_requests.side_effect = TimeoutError("rpc")
     asyncio.run(att._tick(CHAIN_ID))
     assert att._supersede_backoff == before
+
+
+def test_supersede_rereads_under_the_write_lock_are_bounded(monkeypatch):
+    import time as clock
+    monkeypatch.setattr(sca, "LOCKED_REREAD_SECONDS", 0.2)
+    request = junk_request()
+    chain = Chain(request, committee=(ALICE,), threshold=1)
+    att = attestor(chain.client(ALICE))
+    att.client.get_settlement_request.side_effect = lambda claim: clock.sleep(1) or asdict(request)
+
+    async def run():
+        started = clock.monotonic()
+        verdict = await att.process_one(request, CHAIN_ID)
+        return verdict, clock.monotonic() - started, att._chain_write_lock.locked()
+    verdict, elapsed, held = asyncio.run(run())
+    assert verdict.supersede == "reread_timed_out"
+    assert elapsed < 0.8 and not held
+    att.client.submit_supersede_settlement_request.assert_not_called()

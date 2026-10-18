@@ -308,6 +308,11 @@ def request_expired(request: Any, context: dict) -> bool:
 # Longest wait between genesis reads while they keep failing.
 GENESIS_RETRY_MAX_SECONDS = 300
 
+# Longest a slash or supersede may hold the shared write lock re-reading chain
+# state before it submits; receipt certificates wait on the same lock. Past
+# it the submission is deferred to the next poll.
+LOCKED_REREAD_SECONDS = 15
+
 
 async def poll_forever(
     name: str,
@@ -1510,6 +1515,29 @@ class SettleClaimAttestor:
             return context
         return None
 
+    async def _still_supersedable(
+        self, request: PendingSettlementRequest, verdict: AttestationVerdict
+    ) -> Optional[dict]:
+        """The head's runtime context when ``request`` is still pending,
+        unchanged and supersedable; otherwise None, with the reason in the
+        verdict."""
+        current = await self._supersede_context(request, verdict)
+        if current is None:
+            return None
+        try:
+            pending = await asyncio.to_thread(self.client.get_settlement_request, request.claim_id)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "settle_attestor: rereading claim_id=%s... raised %s; not superseding",
+                request.claim_id.hex()[:16], type(error).__name__,
+            )
+            verdict.supersede = "request_unreadable"
+            return None
+        if pending is None or PendingSettlementRequest(**pending) != request:
+            verdict.supersede = "request_changed"
+            return None
+        return current
+
     async def _supersede(
         self,
         request: PendingSettlementRequest,
@@ -1581,21 +1609,12 @@ class SettleClaimAttestor:
             )
             return verdict
         async with self._chain_write_lock:
-            current = await self._supersede_context(request, verdict)
-            if current is None:
-                return verdict
             try:
-                pending = await asyncio.to_thread(self.client.get_settlement_request, claim)
-                unchanged = pending is not None and PendingSettlementRequest(**pending) == request
-            except Exception as error:  # noqa: BLE001
-                logger.warning(
-                    "settle_attestor: rereading claim_id=%s... raised %s; not superseding",
-                    claim.hex()[:16], type(error).__name__,
-                )
-                verdict.supersede = "request_unreadable"
+                current = await asyncio.wait_for(self._still_supersedable(request, verdict), LOCKED_REREAD_SECONDS)
+            except asyncio.TimeoutError:
+                verdict.supersede = "reread_timed_out"
                 return verdict
-            if not unchanged:
-                verdict.supersede = "request_changed"
+            if current is None:
                 return verdict
             try:
                 ext_hash = await asyncio.to_thread(

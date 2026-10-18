@@ -131,6 +131,14 @@ submits only if it is the row the bundle was signed for. A FRAU digest does
 not name the request, so without this a bundle signed for one request could
 slash its replacement.
 
+Receipt-certificate submissions wait on that same lock. The slash and
+supersede rereads under it (the runtime context, then the pending request:
+up to about six Materios RPCs, each with a 30 s budget) are therefore capped
+at `LOCKED_REREAD_SECONDS` (15 s). Past it the submission is deferred to the
+next poll (`reread_timed_out`), and the RPC finishes off the lock. A lock
+holder can thus delay receipt certificates by at most 15 s plus its own
+submission.
+
 The settle, expire and slash loops share one poll loop. A failed read of the
 genesis hash is logged and retried after a delay that doubles from the poll
 interval up to 300 s, and a failed tick is logged; neither ends the loop. A
@@ -203,7 +211,9 @@ the pallet fails a whole bundle on one non-member or one bad signature, so
 every envelope (attest, supersede, expire, slash) admits a peer row only when
 its key is in `OrinqReceipts.CommitteeMembers`, read when the envelope is
 assembled, and it is a raw sr25519 signature over the local digest. An
-unreadable committee admits no peer. Once the envelope reaches `MinSignerThreshold`, the
+unreadable committee admits no peer. The board itself still accepts unbounded
+rows from any key, so a flood can delay assembly; that is gateway-side
+(materios-gateway#37). Once the envelope reaches `MinSignerThreshold`, the
 attestor takes the shared write lock, re-reads the runtime context and the
 pending request, and submits only if the request is unchanged, unexpired and
 still supersedable. A peer that already superseded leaves no request, so the
@@ -245,14 +255,38 @@ watcher signs only what its Cardano view can prove.
   per Shelley genesis) is an output created and spent at preprod slot
   10608917, so it also proves Kupo has indexed that far back. A network
   without a canary, mainnet today, cannot prove fraud.
-- **TxNotFound needs two absence proofs.** Each proof reads the Ogmios tip,
-  then Kupo's checkpoint, which must be within `KUPO_TIP_LAG_MAX_SLOTS` (60)
-  of that tip, then the coverage checks, then the lookup, which must succeed
-  and be empty. The requester's slot plays no part. The two proofs must be
-  at least `TX_ABSENCE_CONFIRM_BLOCKS` (10) Cardano blocks apart; a tx seen in
-  between restarts the count, and a replacement request starts its own.
+- **TxNotFound needs two absence proofs from a node on the network's chain.**
+  Ogmios and Kupo follow one local node, so agreeing with each other proves
+  nothing about the network. Each proof:
+  1. reads the node's tip, which must trail the network's current slot, by
+     the wall clock, by at most `CARDANO_TIP_LAG_MAX_SLOTS` (300). The
+     network clock is pinned per Shelley genesis in `NETWORK_CLOCKS`; a
+     network without an entry proves nothing (see the table below);
+  2. reads Kupo's checkpoint, which must be within `KUPO_TIP_LAG_MAX_SLOTS`
+     (60) of that tip;
+  3. runs the coverage checks;
+  4. runs the lookup, which must succeed and be empty.
+
+  The two proofs must be at least `TX_ABSENCE_CONFIRM_BLOCKS` (10) Cardano
+  blocks apart, and the node's chain between them may average at most
+  `CHAIN_SLOTS_PER_BLOCK_MAX` (60) slots per block. Preprod and mainnet
+  average 20; a sparser chain is a minority fork, and the count restarts at
+  that proof. Any sighting of the tx restarts the count, whether in a proof's
+  lookup or in an observation. A replacement request starts its own count.
+  The requester's slot plays no part.
+
   Ogmios has no historical tx lookup and no daemon has an Insight or Koios
-  endpoint configured, so the second proof is a second Kupo lookup.
+  endpoint configured, so the second proof is a second Kupo lookup. The
+  wall-clock and density checks make that second lookup mean "the network
+  moved on and the tx still is not there", not only "this node moved on".
+  The daemon host's clock must be NTP-synchronised. A clock running ahead
+  only makes the node look behind, so the proof is refused; a clock running
+  behind by more than the bound weakens the check.
+
+| Network | `NETWORK_CLOCKS` entry (slot, unix) | Source |
+| --- | --- | --- |
+| preprod (`162d29c4…bd86`) | (86400, 1655769600): 1-second slots from slot 86400 | Ogmios `queryNetwork/startTime` = 2022-06-01T00:00:00Z and `queryLedgerState/eraSummaries` (Byron: 86400 slots of 20 s, then 1 s in every era) on Node-3, read 2026-10-18; the live tip then trailed the wall clock by 17 slots. Lucid's `SLOT_CONFIG_NETWORK` (zeroSlot 86400, zeroTime 1655769600000) agrees. |
+| mainnet, preview | none | Not pinned: neither has a spent canary either. Add both entries, read from the network's own Ogmios, before slashing there. |
 
 ### The deployed Kupo cannot prove fraud yet
 
@@ -326,13 +360,51 @@ keys.
 ### 0. Enable slashing (infrastructure, optional)
 
 Without this the new daemons sign no slash (see above); attest, expire and
-supersede work either way. On Node-3:
+supersede work either way. Do it only with a release that carries the
+node-freshness gates. Every running cert-daemon must export
+`slash_cardano_tip_lag_slots`, and its value must stay below 300:
+
+```sh
+curl -s 127.0.0.1:8080/metrics | grep slash_cardano_tip_lag_slots    # Node-3; Gemtek: 127.0.0.1:8081
+```
+
+A daemon without that metric predates the gates. Do not point it at `:1444`.
+
+Before switching, watch the replica for a while: its checkpoint should match
+the Ogmios tip.
+
+```sh
+for i in $(seq 30); do
+  curl -s -H 'Accept: application/json' http://192.168.0.133:1444/health | python3 -c 'import json,sys; print(json.load(sys.stdin)["most_recent_checkpoint"])'
+  curl -s -X POST -H 'content-type: application/json' -d '{"jsonrpc":"2.0","method":"queryNetwork/tip"}' http://192.168.0.133:1337 \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["slot"])'
+  sleep 60
+done
+```
+
+Then, on Node-3:
 
 ```sh
 sudo ufw allow from 172.17.0.0/16 to any port 1444 proto tcp comment 'Docker -> kupo-preprod-all-ro for slash proofs'
 ```
 
 Then use `http://192.168.0.133:1444` as `KUPO_URL` in steps 1 and 2.
+
+`KUPO_URL` is shared, so this also moves settle and expire attestation on
+both daemons to the read-only replica, a Kupo v2.12 that indexes every
+preprod address:
+
+- The attestors then see payouts to addresses the four validation patterns
+  miss.
+- Attestation then depends on the replica's writer (`kupo-preprod-all`, on
+  Node-3's node socket) keeping up. If it stalls or lags, both daemons refuse
+  to attest (`tx_not_found` or `observer_unavailable`) until it catches up.
+  Nothing wrong is signed, but settlement stops on both at once.
+- Only the slash path checks Kupo's freshness against the tip; the
+  attestors rely on depth.
+- To back out, set `KUPO_URL` back to `:1442` with the step 1 and 2
+  commands. Attestation returns to the four validation patterns and fraud
+  proofs are refused again.
 
 ### 1. Node-3 cert-daemon (standalone container)
 
@@ -361,15 +433,15 @@ Verify:
 ```sh
 sudo docker logs --since 10m cert-daemon-preprod 2>&1 \
   | grep -E 'settlement runtime|slash_watcher: (started|Kupo)|settle_attestor: started|expire_attestor: started'
-curl -s 127.0.0.1:8080/metrics | grep -E 'settlement_|slash_kupo_coverage_ok'
+curl -s 127.0.0.1:8080/metrics | grep -E 'settlement_|slash_kupo_coverage_ok|slash_cardano_tip_lag_slots'
 ```
 
 Expect `settlement runtime spec=239 (code 0xef23631b…): protocol=FRAU
 supersede=False fingerprint=96dfe9b4…e85c ttl=2400 min_finality_depth=15`,
 the metrics `settlement_slash_protocol 1`, `settlement_supersede_offered 0`,
-`settlement_runtime_spec_version 239`, and `slash_kupo_coverage_ok 0` on
-`:1442` (with the `cannot prove fraud (patterns_without_*:4)` WARNING) or
-`1` on `:1444`.
+`settlement_runtime_spec_version 239`, `slash_cardano_tip_lag_slots`
+below 300, and `slash_kupo_coverage_ok 0` on `:1442` (with the `cannot prove
+fraud (patterns_without_*:4)` WARNING) or `1` on `:1444`.
 
 Rollback before enactment:
 
