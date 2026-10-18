@@ -454,3 +454,29 @@ def test_voucher_beneficiary_is_the_payment_key_hash_the_pallet_checks(address, 
     voucher = client.get_voucher(CLAIM_ID)
     assert voucher.get("beneficiary_addr_blake2_224") == beneficiary
     assert voucher["amount_lovelace"] == AMOUNT_LOVELACE
+
+
+def test_the_supersede_call_encodes_against_the_spec_242_runtime():
+    import gzip
+    from pathlib import Path
+    from daemon.custody_rules import RuntimeDecoder
+
+    metadata = gzip.decompress(
+        (Path(__file__).parent / "fixtures/custody/materios/metadata_spec242.hex.gz").read_bytes()).decode()
+    runtime = RuntimeDecoder(metadata)
+    client = rpc({
+        "compose_call": "call",
+        "create_signed_extrinsic": "xt",
+        "submit_extrinsic": Receipt(is_success=True, extrinsic_hash="0x" + "5e" * 32),
+    })
+    client.submit_supersede_settlement_request(CLAIM_ID, True, CORRECT, ENVELOPE)
+    composed = client._call.call_args_list[0].kwargs
+    call = runtime._config.create_scale_object("Call", metadata=runtime._metadata)
+    data = call.encode({"call_module": composed["call_module"], "call_function": composed["call_function"],
+                        "call_args": composed["call_params"]})
+    assert data.to_hex()[:6] == "0x1316"  # IntentSettlement (19), call 22
+    decoded = runtime._config.create_scale_object("Call", data=data, metadata=runtime._metadata).decode()
+    args = {a["name"]: a["value"] for a in decoded["call_args"]}
+    assert args["evidence"] == SUPERSEDE_PARAMS["evidence"]
+    assert args["settled_direct"] is True
+    assert [tuple(pair) for pair in args["signatures"]] == SUPERSEDE_PARAMS["signatures"]
