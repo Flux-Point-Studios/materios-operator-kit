@@ -4,7 +4,7 @@
     {
       "id": "daemon-core",
       "name": "Daemon core",
-      "desc": "Shared runtime plumbing for every operator-kit daemon module: configuration, the Substrate chain client (bounded per-call timeout and reconnect, raw reads that never derive a signer), data models, Cardano address decoding, the health server, heartbeat reporting and Discord delivery.",
+      "desc": "Shared runtime plumbing for every operator-kit daemon module: configuration, the Substrate chain client (bounded per-call timeout and reconnect, raw reads that never derive a signer, one submission path for committee-signed settlement calls, and the settlement runtime context read once per runtime code), data models, Cardano address decoding, the health server, heartbeat reporting and Discord delivery.",
       "kind": "toolkit",
       "paths": [
         "daemon/config.py",
@@ -94,7 +94,7 @@
     {
       "id": "settlement-attestors",
       "name": "Settlement attestors",
-      "desc": "Settle-claim and expire-policy attestors that read Cardano state and attest outcomes on chain.",
+      "desc": "Settle-claim and expire-policy attestors that read Cardano state and attest outcomes on chain. On a runtime with the reviewed supersede_settlement_request, settle attestors replace an unexpired request they refuse for a wrong slot or an unreached depth with the evidence they observed (the request's transaction, voucher amount and beneficiary, Kupo's slot, the runtime MinFinalityDepth), aggregating STCA signatures through the gateway and backing off per claim after a failed submission.",
       "kind": "agent",
       "paths": [
         "daemon/settle_claim_attestor.py",
@@ -102,6 +102,7 @@
       ],
       "consumes": [
         "orinq-receipts-pallet",
+        "blob-gateway-api",
         "daemon-core"
       ],
       "status": "live"

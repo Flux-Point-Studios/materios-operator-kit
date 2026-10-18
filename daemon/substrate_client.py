@@ -17,6 +17,7 @@ from daemon.voucher_canonicalize import (
     AddressDecodeError,
     ChainIdentity,
     compute_voucher_digest_with_address,
+    split_type0_address_bytes,
 )
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ SLASH_PROTOCOLS = {
     "693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7": "FRV2",
 }
 SUPERSEDE_ARGS = ["claim_id", "settled_direct", "evidence", "signatures"]
+RUNTIME_CODE_KEY = "0x" + b":code".hex()
 
 
 def select_slash_protocol(fingerprint: str, tag: Optional[bytes]) -> str:
@@ -250,6 +252,18 @@ def _to_bytes_exact(val, expected_len: int) -> bytes:
     return raw
 
 
+def _signature_params(sigs: list) -> list[tuple[str, str]]:
+    """A ``Vec<(CommitteePubkey, CommitteeSig)>`` argument, checked for width."""
+    if not sigs:
+        raise ValueError("sigs must be non-empty")
+    for i, (pub, sig) in enumerate(sigs):
+        if len(pub) != 32:
+            raise ValueError(f"sigs[{i}].pubkey must be 32 bytes, got {len(pub)}")
+        if len(sig) != 64:
+            raise ValueError(f"sigs[{i}].sig must be 64 bytes, got {len(sig)}")
+    return [("0x" + pub.hex(), "0x" + sig.hex()) for pub, sig in sigs]
+
+
 def _maybe_bytes32(val) -> Optional[bytes]:
     """Best-effort `_to_bytes32` — returns None on undecodable / missing input.
 
@@ -347,6 +361,8 @@ class SubstrateClient:
         # is a property aliasing the write conn for backward compatibility.
         self._write = _WsConn("write")
         self._read = _WsConn("read")
+        # (runtime code hash, its settlement contract) from the last metadata read.
+        self._settlement_contract: Optional[tuple[str, dict]] = None
         # Bounded-timeout + reconnect knobs (tasks #288 + #156). Each is
         # overridable via env so operators can tune in prod without a
         # re-deploy; the defaults are conservative.
@@ -690,29 +706,44 @@ class SubstrateClient:
     def get_settlement_runtime_context(self) -> dict:
         """Read the slash protocol, supersede support, TTL and minimum finality
         depth from one head's post-state metadata. Refuses any runtime outside
-        the reviewed contracts."""
+        the reviewed contracts.
+
+        Metadata is a function of the runtime code alone, so its parse is kept
+        for the ``:code`` hash at the head and redone once that hash changes."""
         head = self._call("get_chain_head", conn=self._read)
         version = self._call("get_block_runtime_version", head, conn=self._read)
         block = self._call("get_block_number", head, conn=self._read)
-        # get_constant/get_metadata_call_function select the parent's runtime
-        # in substrate-interface 1.x, which is stale at an upgrade block.
-        metadata = self._call("get_block_metadata", head, conn=self._read)
+        code_hash = self._call(
+            "rpc_request", "state_getStorageHash", [RUNTIME_CODE_KEY, head], conn=self._read
+        ).get("result")
         try:
             if version["specName"] != "materios":
                 raise ValueError("unexpected spec name")
-            v14 = metadata.value[1]["V14"]
-            constants = {c.name: bytes(c.constant_value)
-                         for c in metadata.get_metadata_pallet("IntentSettlement").constants}
-            protocol = select_slash_protocol(slash_contract_fingerprint(v14), constants.get("SlashSettlementTag"))
-            supersede = supersede_offered(v14, constants.get("AttestSettleTag"))
-            ttl = _u32_constant(constants, "SettlementRequestTtl")
-            min_finality_depth = _u32_constant(constants, "MinFinalityDepth")
+            cached = self._settlement_contract
+            if code_hash and cached is not None and cached[0] == code_hash:
+                contract = cached[1]
+            else:
+                contract = self._read_settlement_contract(head)
+                if code_hash:
+                    self._settlement_contract = (code_hash, contract)
         except (KeyError, TypeError, ValueError, StopIteration, AttributeError) as error:
             logger.error("settlement runtime at %s refused: %s: %s", head, type(error).__name__, error)
             raise ValueError("unknown settlement runtime metadata or TTL") from error
-        return dict(block_hash=head, block_number=block, protocol=protocol, ttl=ttl,
-                    spec_version=version["specVersion"], supersede=supersede,
-                    min_finality_depth=min_finality_depth)
+        return dict(block_hash=head, block_number=block, spec_version=version["specVersion"], **contract)
+
+    def _read_settlement_contract(self, head: str) -> dict:
+        # get_constant/get_metadata_call_function select the parent's runtime
+        # in substrate-interface 1.x, which is stale at an upgrade block.
+        metadata = self._call("get_block_metadata", head, conn=self._read)
+        v14 = metadata.value[1]["V14"]
+        constants = {c.name: bytes(c.constant_value)
+                     for c in metadata.get_metadata_pallet("IntentSettlement").constants}
+        return dict(
+            protocol=select_slash_protocol(slash_contract_fingerprint(v14), constants.get("SlashSettlementTag")),
+            supersede=supersede_offered(v14, constants.get("AttestSettleTag")),
+            ttl=_u32_constant(constants, "SettlementRequestTtl"),
+            min_finality_depth=_u32_constant(constants, "MinFinalityDepth"),
+        )
 
     # --- Bond helpers (OrinqReceipts pallet) --------------------------------
     # These are used by CertDaemon._ensure_bond() to keep the attestor's
@@ -971,57 +1002,76 @@ class SubstrateClient:
                 claim_id_b = _to_bytes32(key.value)
             except (ValueError, TypeError):
                 continue
-            record = value.value if hasattr(value, "value") else value
-            if not isinstance(record, dict):
-                continue
-            evidence = record.get("evidence") or {}
-            if not isinstance(evidence, dict):
-                continue
-            voucher_digest = self.get_voucher_digest(claim_id_b)
-            if voucher_digest is None:
-                logger.info(
-                    f"settle_request {claim_id_b.hex()[:16]}... has no "
-                    f"matching voucher — dropping (chain invariant "
-                    f"violation, see pallet docs)"
-                )
-                continue
-            try:
-                out.append({
-                    "claim_id": claim_id_b,
-                    "requester": str(record.get("requester")),
-                    "submitted_block": int(record.get("submitted_block", 0)),
-                    "settled_direct": bool(record.get("settled_direct", False)),
-                    "cardano_tx_hash": _to_bytes32(
-                        evidence.get("cardano_tx_hash")
-                    ),
-                    "observed_at_depth": int(
-                        evidence.get("observed_at_depth", 0)
-                    ),
-                    "observed_slot": int(evidence.get("observed_slot", 0)),
-                    "beneficiary_addr_hash": _to_bytes_exact(
-                        evidence.get("beneficiary_addr_hash"), 28
-                    ),
-                    "amount_lovelace": int(
-                        evidence.get("amount_lovelace", 0)
-                    ),
-                    "mainchain_genesis_hash": _to_bytes32(
-                        evidence.get("mainchain_genesis_hash")
-                    ),
-                    "voucher_digest": voucher_digest,
-                    # Task #84-watcher: surface the bond amount so the
-                    # slash watcher can gate on `bond_amount > 0`.
-                    # Pre-spec-225 rows decode as 0 via the additive
-                    # SCALE migration baked into spec-225.
-                    "bond_amount": int(record.get("bond_amount", 0) or 0),
-                })
-            except (ValueError, TypeError, KeyError) as e:
-                logger.warning(
-                    f"list_pending_settlement_requests: malformed row "
-                    f"for claim {claim_id_b.hex()[:16]}...: "
-                    f"{type(e).__name__}: {e}"
-                )
-                continue
+            row = self._settlement_request_row(claim_id_b, value)
+            if row is not None:
+                out.append(row)
         return out
+
+    def get_settlement_request(self, claim_id: bytes) -> Optional[dict]:
+        """``ClaimSettlementRequests[claim_id]`` in the row shape of
+        :meth:`list_pending_settlement_requests`, or None when no request is
+        pending (or its voucher is gone)."""
+        value = self._call(
+            "query",
+            module="IntentSettlement",
+            storage_function="ClaimSettlementRequests",
+            params=["0x" + claim_id.hex()],
+        )
+        if value is None or value.value is None:
+            return None
+        return self._settlement_request_row(claim_id, value)
+
+    def _settlement_request_row(self, claim_id_b: bytes, value: Any) -> Optional[dict]:
+        record = value.value if hasattr(value, "value") else value
+        if not isinstance(record, dict):
+            return None
+        evidence = record.get("evidence") or {}
+        if not isinstance(evidence, dict):
+            return None
+        voucher_digest = self.get_voucher_digest(claim_id_b)
+        if voucher_digest is None:
+            logger.info(
+                f"settle_request {claim_id_b.hex()[:16]}... has no "
+                f"matching voucher — dropping (chain invariant "
+                f"violation, see pallet docs)"
+            )
+            return None
+        try:
+            return {
+                "claim_id": claim_id_b,
+                "requester": str(record.get("requester")),
+                "submitted_block": int(record.get("submitted_block", 0)),
+                "settled_direct": bool(record.get("settled_direct", False)),
+                "cardano_tx_hash": _to_bytes32(
+                    evidence.get("cardano_tx_hash")
+                ),
+                "observed_at_depth": int(
+                    evidence.get("observed_at_depth", 0)
+                ),
+                "observed_slot": int(evidence.get("observed_slot", 0)),
+                "beneficiary_addr_hash": _to_bytes_exact(
+                    evidence.get("beneficiary_addr_hash"), 28
+                ),
+                "amount_lovelace": int(
+                    evidence.get("amount_lovelace", 0)
+                ),
+                "mainchain_genesis_hash": _to_bytes32(
+                    evidence.get("mainchain_genesis_hash")
+                ),
+                "voucher_digest": voucher_digest,
+                # Task #84-watcher: surface the bond amount so the
+                # slash watcher can gate on `bond_amount > 0`.
+                # Pre-spec-225 rows decode as 0 via the additive
+                # SCALE migration baked into spec-225.
+                "bond_amount": int(record.get("bond_amount", 0) or 0),
+            }
+        except (ValueError, TypeError, KeyError) as e:
+            logger.warning(
+                f"list_pending_settlement_requests: malformed row "
+                f"for claim {claim_id_b.hex()[:16]}...: "
+                f"{type(e).__name__}: {e}"
+            )
+            return None
 
     def get_chain_identity(self) -> Optional[ChainIdentity]:
         """Read the four IntentSettlement chain-identity constants via
@@ -1290,12 +1340,18 @@ class SubstrateClient:
                 )
             except (ValueError, TypeError):
                 pass
-        # If the pallet stores the raw address but not the hash, the
-        # cert-daemon's cross-check skips this voucher field rather
-        # than computing a hash that might disagree with the pallet's
-        # canonical form. The chain-state voucher digest binding
-        # (fact 8) is the authoritative guard; this fact 6
-        # cross-check is purely advisory.
+        elif "beneficiary_cardano_addr" in v:
+            # The payment-key hash request_settle and supersede check: a
+            # 57-byte type-0 address, header 0x01. Any other shape is left
+            # out rather than guessed.
+            try:
+                raw = _to_bytes_exact(v["beneficiary_cardano_addr"], 57)
+                out["beneficiary_addr_blake2_224"] = split_type0_address_bytes(raw)[0]
+            except (ValueError, TypeError, AddressDecodeError) as e:
+                logger.warning(
+                    f"voucher {claim_id.hex()[:16]}... beneficiary is not a "
+                    f"type-0 address ({type(e).__name__}); leaving it out"
+                )
         return out
 
     def get_min_finality_depth(self) -> Optional[int]:
@@ -1334,30 +1390,23 @@ class SubstrateClient:
         Kept for back-compat with single-threshold test chains
         (``MinSignerThreshold == 1``).
         """
-        if len(claim_id) != 32:
-            raise ValueError(f"claim_id must be 32 bytes, got {len(claim_id)}")
-        if len(my_pubkey) != 32:
-            raise ValueError(
-                f"my_pubkey must be 32 bytes, got {len(my_pubkey)}"
-            )
-        if len(my_sig) != 64:
-            raise ValueError(f"my_sig must be 64 bytes, got {len(my_sig)}")
+        return self.submit_attest_settle_envelope(claim_id, [(my_pubkey, my_sig)])
+
+    def _submit_settlement_call(self, function: str, params: dict, subject: str) -> Optional[str]:
+        """Compose, sign and submit ``IntentSettlement::<function>``. Returns the
+        extrinsic hash on inclusion. A dispatch the runtime refuses returns None
+        at once: its invariant errors (``SettlementRequestMissing``,
+        ``AlreadySettled``, ``FraudProofInvalid`` …) do not change on retry, and
+        the caller retries on a later tick. Transport errors retry up to
+        ``tx_max_retries`` times."""
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
             try:
                 call = self._call(
                     "compose_call",
                     call_module="IntentSettlement",
-                    call_function="attest_settle",
-                    call_params={
-                        "claim_id": "0x" + claim_id.hex(),
-                        "signatures": [
-                            (
-                                "0x" + my_pubkey.hex(),
-                                "0x" + my_sig.hex(),
-                            )
-                        ],
-                    },
+                    call_function=function,
+                    call_params=params,
                 )
                 extrinsic = self._call(
                     "create_signed_extrinsic",
@@ -1368,16 +1417,7 @@ class SubstrateClient:
                     extrinsic, wait_for_inclusion=True,
                 )
                 if not receipt.is_success:
-                    last_error = str(receipt.error_message)
-                    logger.warning(
-                        f"attest_settle failed for "
-                        f"{claim_id.hex()[:16]}...: {last_error}"
-                    )
-                    # Non-retryable: the pallet's invariant errors
-                    # (SettlementRequestMissing, AlreadySettled, etc.)
-                    # won't resolve on retry — return None so the
-                    # caller treats this attempt as terminal for the
-                    # tick.
+                    logger.warning(f"{function} failed for {subject}: {receipt.error_message}")
                     return None
                 ext_hash = (
                     getattr(receipt, "extrinsic_hash", None)
@@ -1387,21 +1427,15 @@ class SubstrateClient:
                 return str(ext_hash) if ext_hash else None
             except SubstrateRequestException as e:
                 last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"attest_settle attempt {attempt + 1} raised: {e}"
-                )
+                logger.warning(f"{function} attempt {attempt + 1} raised: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
             except Exception as e:  # noqa: BLE001
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"attest_settle unexpected error for "
-                    f"{claim_id.hex()[:16]}...: {e}"
-                )
+                logger.warning(f"{function} unexpected error for {subject}: {type(e).__name__}: {e}")
                 return None
-        logger.warning(
-            f"attest_settle gave up after {self.config.tx_max_retries} "
-            f"attempts for {claim_id.hex()[:16]}...: {last_error}"
+        logger.error(
+            f"{function} gave up after {self.config.tx_max_retries} "
+            f"attempts for {subject}: {last_error}"
         )
         return None
 
@@ -1433,66 +1467,11 @@ class SubstrateClient:
         """
         if len(claim_id) != 32:
             raise ValueError(f"claim_id must be 32 bytes, got {len(claim_id)}")
-        if not sigs:
-            raise ValueError("sigs must be non-empty")
-        for i, (pub, sig) in enumerate(sigs):
-            if len(pub) != 32:
-                raise ValueError(f"sigs[{i}].pubkey must be 32 bytes, got {len(pub)}")
-            if len(sig) != 64:
-                raise ValueError(f"sigs[{i}].sig must be 64 bytes, got {len(sig)}")
-        sigs_param = [("0x" + pub.hex(), "0x" + sig.hex()) for pub, sig in sigs]
-        last_error: Optional[str] = None
-        for attempt in range(self.config.tx_max_retries):
-            try:
-                call = self._call(
-                    "compose_call",
-                    call_module="IntentSettlement",
-                    call_function="attest_settle",
-                    call_params={
-                        "claim_id": "0x" + claim_id.hex(),
-                        "signatures": sigs_param,
-                    },
-                )
-                extrinsic = self._call(
-                    "create_signed_extrinsic",
-                    call=call, keypair=self.keypair,
-                )
-                receipt = self._call(
-                    "submit_extrinsic",
-                    extrinsic, wait_for_inclusion=True,
-                )
-                if not receipt.is_success:
-                    last_error = str(receipt.error_message)
-                    logger.warning(
-                        f"attest_settle_envelope failed for "
-                        f"{claim_id.hex()[:16]}... (sigs={len(sigs)}): "
-                        f"{last_error}"
-                    )
-                    return None
-                ext_hash = (
-                    getattr(receipt, "extrinsic_hash", None)
-                    or getattr(receipt, "block_hash", None)
-                    or ""
-                )
-                return str(ext_hash) if ext_hash else None
-            except SubstrateRequestException as e:
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"attest_settle_envelope attempt {attempt + 1} raised: {e}"
-                )
-                if attempt < self.config.tx_max_retries - 1:
-                    time.sleep(2 ** attempt)
-            except Exception as e:  # noqa: BLE001
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"attest_settle_envelope attempt {attempt + 1} unexpected: {e}"
-                )
-                return None
-        logger.error(
-            f"attest_settle_envelope gave up after {self.config.tx_max_retries} "
-            f"attempts for {claim_id.hex()[:16]}...: {last_error}"
+        return self._submit_settlement_call(
+            "attest_settle",
+            {"claim_id": "0x" + claim_id.hex(), "signatures": _signature_params(sigs)},
+            f"{claim_id.hex()[:16]}... (sigs={len(sigs)})",
         )
-        return None
 
     def submit_attest_expire_policy_envelope(
         self,
@@ -1503,68 +1482,11 @@ class SubstrateClient:
         attested-expire path. Same envelope contract."""
         if len(intent_id) != 32:
             raise ValueError(f"intent_id must be 32 bytes, got {len(intent_id)}")
-        if not sigs:
-            raise ValueError("sigs must be non-empty")
-        for i, (pub, sig) in enumerate(sigs):
-            if len(pub) != 32:
-                raise ValueError(f"sigs[{i}].pubkey must be 32 bytes, got {len(pub)}")
-            if len(sig) != 64:
-                raise ValueError(f"sigs[{i}].sig must be 64 bytes, got {len(sig)}")
-        sigs_param = [("0x" + pub.hex(), "0x" + sig.hex()) for pub, sig in sigs]
-        last_error: Optional[str] = None
-        for attempt in range(self.config.tx_max_retries):
-            try:
-                call = self._call(
-                    "compose_call",
-                    call_module="IntentSettlement",
-                    call_function="attest_expire_policy",
-                    call_params={
-                        "intent_id": "0x" + intent_id.hex(),
-                        "signatures": sigs_param,
-                    },
-                )
-                extrinsic = self._call(
-                    "create_signed_extrinsic",
-                    call=call, keypair=self.keypair,
-                )
-                receipt = self._call(
-                    "submit_extrinsic",
-                    extrinsic, wait_for_inclusion=True,
-                )
-                if not receipt.is_success:
-                    last_error = str(receipt.error_message)
-                    logger.warning(
-                        f"attest_expire_policy_envelope failed for "
-                        f"{intent_id.hex()[:16]}... (sigs={len(sigs)}): "
-                        f"{last_error}"
-                    )
-                    return None
-                ext_hash = (
-                    getattr(receipt, "extrinsic_hash", None)
-                    or getattr(receipt, "block_hash", None)
-                    or ""
-                )
-                return str(ext_hash) if ext_hash else None
-            except SubstrateRequestException as e:
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"attest_expire_policy_envelope attempt {attempt + 1} raised: {e}"
-                )
-                if attempt < self.config.tx_max_retries - 1:
-                    time.sleep(2 ** attempt)
-            except Exception as e:  # noqa: BLE001
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"attest_expire_policy_envelope attempt {attempt + 1} "
-                    f"unexpected: {e}"
-                )
-                return None
-        logger.error(
-            f"attest_expire_policy_envelope gave up after "
-            f"{self.config.tx_max_retries} attempts for "
-            f"{intent_id.hex()[:16]}...: {last_error}"
+        return self._submit_settlement_call(
+            "attest_expire_policy",
+            {"intent_id": "0x" + intent_id.hex(), "signatures": _signature_params(sigs)},
+            f"{intent_id.hex()[:16]}... (sigs={len(sigs)})",
         )
-        return None
 
     # --- Slash helpers (task #84-watcher) -----------------------------------
     # spec-225 ships `slash_bad_settlement_evidence(claim_id, fraud_proof,
@@ -1619,17 +1541,7 @@ class SubstrateClient:
         )
         if len(claim_id) != 32:
             raise ValueError(f"claim_id must be 32 bytes, got {len(claim_id)}")
-        if not sigs:
-            raise ValueError("sigs must be non-empty")
-        for i, (pub, sig) in enumerate(sigs):
-            if len(pub) != 32:
-                raise ValueError(
-                    f"sigs[{i}].pubkey must be 32 bytes, got {len(pub)}"
-                )
-            if len(sig) != 64:
-                raise ValueError(
-                    f"sigs[{i}].sig must be 64 bytes, got {len(sig)}"
-                )
+        sigs_param = _signature_params(sigs)
         # Map the typed FraudProof to substrate-interface's enum-dict
         # form. Variant names match the Rust enum (types.rs lines
         # 448-464) — substrate-interface re-encodes them from the
@@ -1658,68 +1570,50 @@ class SubstrateClient:
                 f"submit_slash_bad_settlement_evidence: unknown "
                 f"FraudProof variant {type(fraud_proof).__name__}"
             )
-        sigs_param = [
-            ("0x" + pub.hex(), "0x" + sig.hex()) for pub, sig in sigs
-        ]
-        last_error: Optional[str] = None
-        for attempt in range(self.config.tx_max_retries):
-            try:
-                call = self._call(
-                    "compose_call",
-                    call_module="IntentSettlement",
-                    call_function="slash_bad_settlement_evidence",
-                    call_params={
-                        "claim_id": "0x" + claim_id.hex(),
-                        "fraud_proof": fraud_proof_param,
-                        "signatures": sigs_param,
-                    },
-                )
-                extrinsic = self._call(
-                    "create_signed_extrinsic",
-                    call=call, keypair=self.keypair,
-                )
-                receipt = self._call(
-                    "submit_extrinsic",
-                    extrinsic, wait_for_inclusion=True,
-                )
-                if not receipt.is_success:
-                    last_error = str(receipt.error_message)
-                    logger.warning(
-                        f"slash_bad_settlement_evidence failed for "
-                        f"{claim_id.hex()[:16]}... (sigs={len(sigs)}): "
-                        f"{last_error}"
-                    )
-                    # Non-retryable: FraudProofInvalid / BondNotReserved
-                    # / FraudThresholdNotMet won't resolve on retry — the
-                    # caller treats None as terminal for this tick.
-                    return None
-                ext_hash = (
-                    getattr(receipt, "extrinsic_hash", None)
-                    or getattr(receipt, "block_hash", None)
-                    or ""
-                )
-                return str(ext_hash) if ext_hash else None
-            except SubstrateRequestException as e:
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"slash_bad_settlement_evidence attempt {attempt + 1} "
-                    f"raised: {e}"
-                )
-                if attempt < self.config.tx_max_retries - 1:
-                    time.sleep(2 ** attempt)
-            except Exception as e:  # noqa: BLE001
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"slash_bad_settlement_evidence unexpected error for "
-                    f"{claim_id.hex()[:16]}...: {e}"
-                )
-                return None
-        logger.error(
-            f"slash_bad_settlement_evidence gave up after "
-            f"{self.config.tx_max_retries} attempts for "
-            f"{claim_id.hex()[:16]}...: {last_error}"
+        return self._submit_settlement_call(
+            "slash_bad_settlement_evidence",
+            {
+                "claim_id": "0x" + claim_id.hex(),
+                "fraud_proof": fraud_proof_param,
+                "signatures": sigs_param,
+            },
+            f"{claim_id.hex()[:16]}... (sigs={len(sigs)})",
         )
-        return None
+
+    def submit_supersede_settlement_request(
+        self,
+        claim_id: bytes,
+        settled_direct: bool,
+        evidence: Any,
+        sigs: list,  # list[tuple[bytes, bytes]]: (pubkey, sig)
+    ) -> Optional[str]:
+        """Submit ``IntentSettlement::supersede_settlement_request(claim_id,
+        settled_direct, evidence, signatures)`` (spec 242, call index 22).
+
+        ``evidence`` is a :class:`daemon.settle_claim_attestor.SettlementEvidence`
+        and ``sigs`` the STCA envelope over it, which must include this
+        client's own key. Returns the extrinsic hash on inclusion, None when
+        the runtime refuses it.
+        """
+        if len(claim_id) != 32:
+            raise ValueError(f"claim_id must be 32 bytes, got {len(claim_id)}")
+        return self._submit_settlement_call(
+            "supersede_settlement_request",
+            {
+                "claim_id": "0x" + claim_id.hex(),
+                "settled_direct": bool(settled_direct),
+                "evidence": {
+                    "cardano_tx_hash": "0x" + _to_bytes_exact(evidence.cardano_tx_hash, 32).hex(),
+                    "observed_at_depth": int(evidence.observed_at_depth),
+                    "observed_slot": int(evidence.observed_slot),
+                    "beneficiary_addr_hash": "0x" + _to_bytes_exact(evidence.beneficiary_addr_hash, 28).hex(),
+                    "amount_lovelace": int(evidence.amount_lovelace),
+                    "mainchain_genesis_hash": "0x" + _to_bytes_exact(evidence.mainchain_genesis_hash, 32).hex(),
+                },
+                "signatures": _signature_params(sigs),
+            },
+            f"{claim_id.hex()[:16]}... (sigs={len(sigs)})",
+        )
 
     def get_min_signer_threshold(self) -> int:
         """Read ``IntentSettlement::MinSignerThreshold`` (governance-set;
@@ -1975,78 +1869,7 @@ class SubstrateClient:
         ``submit_attest_expire_policy_envelope`` paired with the gateway
         aggregator for chains where ``MinSignerThreshold >= 2``.
         """
-        if len(intent_id) != 32:
-            raise ValueError(
-                f"intent_id must be 32 bytes, got {len(intent_id)}"
-            )
-        if len(my_pubkey) != 32:
-            raise ValueError(
-                f"my_pubkey must be 32 bytes, got {len(my_pubkey)}"
-            )
-        if len(my_sig) != 64:
-            raise ValueError(f"my_sig must be 64 bytes, got {len(my_sig)}")
-        last_error: Optional[str] = None
-        for attempt in range(self.config.tx_max_retries):
-            try:
-                call = self._call(
-                    "compose_call",
-                    call_module="IntentSettlement",
-                    call_function="attest_expire_policy",
-                    call_params={
-                        "intent_id": "0x" + intent_id.hex(),
-                        "signatures": [
-                            (
-                                "0x" + my_pubkey.hex(),
-                                "0x" + my_sig.hex(),
-                            )
-                        ],
-                    },
-                )
-                extrinsic = self._call(
-                    "create_signed_extrinsic",
-                    call=call, keypair=self.keypair,
-                )
-                receipt = self._call(
-                    "submit_extrinsic",
-                    extrinsic, wait_for_inclusion=True,
-                )
-                if not receipt.is_success:
-                    last_error = str(receipt.error_message)
-                    logger.warning(
-                        f"attest_expire_policy failed for "
-                        f"{intent_id.hex()[:16]}...: {last_error}"
-                    )
-                    # Non-retryable: the pallet's invariant errors
-                    # (ExpiryRequestMissing, IntentNotEligibleForExpiry,
-                    # etc.) won't resolve on retry — return None so the
-                    # caller treats this attempt as terminal for the
-                    # tick.
-                    return None
-                ext_hash = (
-                    getattr(receipt, "extrinsic_hash", None)
-                    or getattr(receipt, "block_hash", None)
-                    or ""
-                )
-                return str(ext_hash) if ext_hash else None
-            except SubstrateRequestException as e:
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"attest_expire_policy attempt {attempt + 1} raised: {e}"
-                )
-                if attempt < self.config.tx_max_retries - 1:
-                    time.sleep(2 ** attempt)
-            except Exception as e:  # noqa: BLE001
-                last_error = f"{type(e).__name__}: {e}"
-                logger.warning(
-                    f"attest_expire_policy unexpected error for "
-                    f"{intent_id.hex()[:16]}...: {e}"
-                )
-                return None
-        logger.warning(
-            f"attest_expire_policy gave up after {self.config.tx_max_retries} "
-            f"attempts for {intent_id.hex()[:16]}...: {last_error}"
-        )
-        return None
+        return self.submit_attest_expire_policy_envelope(intent_id, [(my_pubkey, my_sig)])
 
     def get_block_events(self, block_number: int) -> list:
         block_hash = self._call("get_block_hash", block_number, conn=self._read)

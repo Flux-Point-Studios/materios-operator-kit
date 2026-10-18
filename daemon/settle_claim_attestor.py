@@ -53,6 +53,9 @@ Mapping to design memo
   spec-207 batching ceiling).
 - Refusal logic: if any of the eight facts disagree, REFUSE to sign and
   log the specific mismatch (memo §2.4 — "bound to a verifiable fact").
+- Supersede: on a runtime with ``supersede_settlement_request``, a request
+  refused for a wrong slot or an unreached depth is replaced with the
+  evidence this attestor observed (``SettleClaimAttestor._supersede``).
 - Reuse: same sr25519 committee key as availability_cert +
   TEE-evidence paths (memo §0 compounding-leverage statement).
 """
@@ -63,7 +66,7 @@ import asyncio
 import hashlib
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Optional
 
 import aiohttp
@@ -254,6 +257,73 @@ def compute_stca_digest(preimage: bytes) -> bytes:
             f"preimage must be {STCA_PREIMAGE_LEN} bytes, got {len(preimage)}"
         )
     return hashlib.blake2b(preimage, digest_size=32).digest()
+
+
+@dataclass(frozen=True)
+class SettlementEvidence:
+    """The pallet's ``SettlementEvidence``, in its field order."""
+    cardano_tx_hash: bytes
+    observed_at_depth: int
+    observed_slot: int
+    beneficiary_addr_hash: bytes
+    amount_lovelace: int
+    mainchain_genesis_hash: bytes
+
+    @classmethod
+    def of(cls, request: Any) -> "SettlementEvidence":
+        return cls(**{f.name: getattr(request, f.name) for f in fields(cls)})
+
+
+def stca_digest(
+    chain_id: bytes,
+    claim_id: bytes,
+    voucher_digest: bytes,
+    settled_direct: bool,
+    evidence: SettlementEvidence,
+) -> bytes:
+    """The STCA digest ``attest_settle`` and ``supersede_settlement_request``
+    verify for ``evidence`` and settlement mode."""
+    return compute_stca_digest(build_stca_preimage(
+        chain_id=chain_id,
+        claim_id=claim_id,
+        voucher_digest=voucher_digest,
+        cardano_tx_hash=evidence.cardano_tx_hash,
+        settled_direct=settled_direct,
+        beneficiary_addr_blake2_224=evidence.beneficiary_addr_hash,
+        amount_lovelace=evidence.amount_lovelace,
+        observed_at_depth=evidence.observed_at_depth,
+        observed_slot=evidence.observed_slot,
+        mainchain_genesis_hash=evidence.mainchain_genesis_hash,
+    ))
+
+
+def request_expired(request: Any, context: dict) -> bool:
+    """Whether ``request`` is past ``SettlementRequestTtl``. As in the pallet,
+    block ``submitted_block + ttl`` is still fresh."""
+    if type(request.submitted_block) is not int or not 0 <= request.submitted_block < 2**64:
+        raise ValueError("submitted_block must be u64")
+    return request.submitted_block + context["ttl"] < context["block_number"]
+
+
+# Blocks a claim waits after its first failed supersede; each further failure
+# doubles the wait, capped at SettlementRequestTtl.
+SUPERSEDE_BACKOFF_BLOCKS = 10
+_CONTEXT_LIMITS = (
+    ("block_number", 2**64), ("ttl", 2**32), ("spec_version", 2**32), ("min_finality_depth", 2**32),
+)
+
+
+def checked_runtime_context(context: dict) -> dict:
+    """``context`` from ``get_settlement_runtime_context`` when every field has
+    its runtime type; ValueError otherwise."""
+    if context["protocol"] not in ("FRAU", "FRV2"):
+        raise ValueError("unknown slash protocol")
+    if type(context["supersede"]) is not bool:
+        raise ValueError("invalid supersede")
+    for name, limit in _CONTEXT_LIMITS:
+        if type(context[name]) is not int or not 0 <= context[name] < limit:
+            raise ValueError(f"invalid {name}")
+    return context
 
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1070,8 @@ class AttestationVerdict:
     refusal_reason: Optional[str] = None
     refusal_detail: Optional[str] = None
     extrinsic_hash: Optional[str] = None
+    # Outcome of superseding a refused request, None when none was tried.
+    supersede: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1153,8 @@ class SettleClaimAttestor:
                 )
                 min_signer_threshold = 2
         self.min_signer_threshold = max(1, int(min_signer_threshold or 1))
+        # claim_id -> (consecutive failed supersedes, first block to retry at)
+        self._supersede_backoff: dict[bytes, tuple[int, int]] = {}
 
     async def process_one(
         self, request: PendingSettlementRequest, live_chain_id: bytes
@@ -1150,6 +1224,11 @@ class SettleClaimAttestor:
             self._log_refusal(verdict)
             return verdict
 
+        checked = await self._check_voucher(request, verdict)
+        if checked is None:
+            return verdict
+        voucher_digest, voucher = checked
+
         # Fact 3: slot matches.
         if obs.observed_slot != request.observed_slot:
             verdict.refusal_reason = RefusalReason.SLOT_MISMATCH
@@ -1158,7 +1237,7 @@ class SettleClaimAttestor:
                 f"vs evidence_slot={request.observed_slot}"
             )
             self._log_refusal(verdict)
-            return verdict
+            return await self._supersede(request, obs, voucher_digest, voucher, live_chain_id, verdict)
 
         # Fact 2: finality depth. We use the cert-daemon's OWN observed
         # depth, not the requester's claim — the requester's value is
@@ -1188,7 +1267,7 @@ class SettleClaimAttestor:
                 f"(reality has not caught up to pinned depth)"
             )
             self._log_refusal(verdict)
-            return verdict
+            return await self._supersede(request, obs, voucher_digest, voucher, live_chain_id, verdict)
         if obs.depth < self.min_finality_depth:
             verdict.refusal_reason = RefusalReason.FINALITY_BELOW_MIN
             verdict.refusal_detail = (
@@ -1198,9 +1277,94 @@ class SettleClaimAttestor:
             self._log_refusal(verdict)
             return verdict
 
-        # Fact 8: voucher_digest pulled FROM CHAIN STATE — never from
-        # the request. This is the recycling-attack guard (memo §3.2
-        # and §2.4 row A5).
+        # All eight facts agree. Task #287: the digest commits to the
+        # REQUEST-pinned depth and slot, which the pallet rebuilds at
+        # verify time; the checks above confirmed reality has reached them.
+        digest = stca_digest(
+            live_chain_id, request.claim_id, voucher_digest,
+            request.settled_direct, SettlementEvidence.of(request),
+        )
+        envelope = await self._signatures(request.claim_id, digest)
+        if len(envelope) < self.min_signer_threshold:
+            logger.info(
+                f"settle_attestor: {len(envelope)}/{self.min_signer_threshold} "
+                f"sigs assembled for claim_id="
+                f"{request.claim_id.hex()[:16]}... — deferring submit "
+                f"until more peers share. Next tick will retry."
+            )
+            verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
+            verdict.refusal_detail = (
+                f"awaiting_peer_sigs:{len(envelope)}/"
+                f"{self.min_signer_threshold}"
+            )
+            return verdict
+        async with self._chain_write_lock:
+            try:
+                if self._single_signer:
+                    ext_hash = await asyncio.to_thread(
+                        self.client.submit_attest_settle,
+                        request.claim_id,
+                        *envelope[0],
+                    )
+                else:
+                    ext_hash = await asyncio.to_thread(
+                        self.client.submit_attest_settle_envelope,
+                        request.claim_id,
+                        envelope,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"settle_attestor: attest_settle submission raised for "
+                    f"{request.claim_id.hex()[:16]}...: "
+                    f"{type(e).__name__}: {e}"
+                )
+                verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
+                verdict.refusal_detail = f"submit_raised: {type(e).__name__}"
+                return verdict
+
+        if not ext_hash:
+            logger.warning(
+                f"settle_attestor: submit_attest_settle returned empty hash "
+                f"for {request.claim_id.hex()[:16]}... — retryable"
+            )
+            verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
+            verdict.refusal_detail = "submit_no_hash"
+            return verdict
+
+        verdict.signed = True
+        verdict.extrinsic_hash = ext_hash
+        logger.info(
+            f"settle_attestor: attest_settle OK for "
+            f"claim_id={request.claim_id.hex()[:16]}... "
+            f"cardano_tx={cardano_tx_hex[:16]}... "
+            f"depth={obs.depth} ext_hash={ext_hash[:18]}..."
+        )
+        return verdict
+
+    @property
+    def _single_signer(self) -> bool:
+        return self.aggregator is None or self.min_signer_threshold <= 1
+
+    async def _signatures(self, claim_id: bytes, digest: bytes) -> list[tuple[bytes, bytes]]:
+        """This attestor's signature over ``digest``, joined at M > 1 with the
+        peer signatures the gateway holds for that same digest."""
+        sig = self.client.keypair.sign(digest)
+        pubkey = self.client.keypair.public_key
+        if self._single_signer:
+            return [(pubkey, sig)]
+        async with aiohttp.ClientSession() as session:
+            return await self.aggregator.assemble_envelope(
+                session, kind="settle", key=claim_id, digest=digest,
+                my_pubkey=pubkey, my_sig=sig,
+            )
+
+    async def _check_voucher(
+        self, request: PendingSettlementRequest, verdict: AttestationVerdict
+    ) -> Optional[tuple[bytes, Optional[dict]]]:
+        """Facts 8 and 6: the voucher digest from chain state, never from the
+        request (the recycling guard, memo §3.2 / §2.4 row A5), and the
+        voucher's amount and beneficiary where chain state shows them.
+        Returns ``(voucher_digest, voucher)``, or None with the refusal logged."""
         try:
             on_chain_voucher_digest = await asyncio.to_thread(
                 self.client.get_voucher_digest, request.claim_id
@@ -1212,18 +1376,13 @@ class SettleClaimAttestor:
                 f"{type(e).__name__}: {e}"
             )
             self._log_refusal(verdict)
-            return verdict
+            return None
         if on_chain_voucher_digest is None:
             verdict.refusal_reason = RefusalReason.VOUCHER_DIGEST_MISMATCH
             verdict.refusal_detail = "no_voucher_for_claim_id"
             self._log_refusal(verdict)
-            return verdict
+            return None
         if on_chain_voucher_digest != request.voucher_digest:
-            # Should be impossible if the dispatcher fed us the chain
-            # value, but defense-in-depth: the value WE sign comes
-            # from chain state, not from request.voucher_digest. If
-            # they disagree refuse loudly because someone (a buggy
-            # SDK?) tried to lie.
             verdict.refusal_reason = RefusalReason.VOUCHER_DIGEST_MISMATCH
             verdict.refusal_detail = (
                 f"chain_state_voucher_digest="
@@ -1231,13 +1390,7 @@ class SettleClaimAttestor:
                 f"vs request.voucher_digest={request.voucher_digest.hex()[:16]}..."
             )
             self._log_refusal(verdict)
-            return verdict
-
-        # Fact 6 (voucher consistency) — pallet enforces these on
-        # request_settle today (memo §3.6 errors). Cert-daemon does
-        # the parallel cross-check so it can produce a structured
-        # refusal log when the pallet's check would also fire. We
-        # query the voucher fields directly.
+            return None
         try:
             voucher = await asyncio.to_thread(
                 self.client.get_voucher, request.claim_id
@@ -1263,7 +1416,7 @@ class SettleClaimAttestor:
                     f"vs evidence_amount={request.amount_lovelace}"
                 )
                 self._log_refusal(verdict)
-                return verdict
+                return None
             if (
                 isinstance(v_addr_hash, (bytes, bytearray))
                 and bytes(v_addr_hash) != request.beneficiary_addr_hash
@@ -1275,118 +1428,130 @@ class SettleClaimAttestor:
                     f"{request.beneficiary_addr_hash.hex()[:16]}..."
                 )
                 self._log_refusal(verdict)
-                return verdict
+                return None
+        return on_chain_voucher_digest, voucher
 
-        # All eight facts agree. Build the STCA preimage, sign, submit.
-        # Task #287: the preimage commits to the REQUEST-pinned depth +
-        # slot, NOT our fresh local observation. Reasoning:
-        #   - The pallet rebuilds the STCA preimage at verify time using
-        #     `request.observed_at_depth` and `request.observed_slot`
-        #     (the values pinned by //Alice at request_settle time).
-        #   - Daemon's job is to (a) INDEPENDENTLY verify reality matches
-        #     those pinned values (depth check at line 1164 above; slot
-        #     check at line 1142 above) and (b) sign over the EXACT same
-        #     bytes the pallet sees. Signing over fresh obs.depth would
-        #     produce a digest the pallet can't reproduce → InvalidSig.
-        preimage = build_stca_preimage(
-            chain_id=live_chain_id,
-            claim_id=request.claim_id,
-            voucher_digest=on_chain_voucher_digest,
-            cardano_tx_hash=request.cardano_tx_hash,
-            settled_direct=request.settled_direct,
-            beneficiary_addr_blake2_224=request.beneficiary_addr_hash,
-            amount_lovelace=request.amount_lovelace,
-            observed_at_depth=int(request.observed_at_depth),
-            observed_slot=int(request.observed_slot),
-            mainchain_genesis_hash=request.mainchain_genesis_hash,
-        )
-        digest = compute_stca_digest(preimage)
-        sig_bytes = self.client.keypair.sign(digest)
-        pubkey_bytes = self.client.keypair.public_key
-
-        # Task #286: assemble an M-sig envelope via the gateway aggregator
-        # if one is configured. Without it (legacy / threshold=1 chains)
-        # fall back to the 1-sig submit path.
-        if self.aggregator is not None and self.min_signer_threshold > 1:
-            async with aiohttp.ClientSession() as session:
-                envelope = await self.aggregator.assemble_envelope(
-                    session,
-                    kind="settle",
-                    key=request.claim_id,
-                    digest=digest,
-                    my_pubkey=pubkey_bytes,
-                    my_sig=sig_bytes,
-                )
-            if len(envelope) < self.min_signer_threshold:
-                logger.info(
-                    f"settle_attestor: {len(envelope)}/{self.min_signer_threshold} "
-                    f"sigs assembled for claim_id="
-                    f"{request.claim_id.hex()[:16]}... — deferring submit "
-                    f"until more peers share. Next tick will retry."
-                )
-                verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
-                verdict.refusal_detail = (
-                    f"awaiting_peer_sigs:{len(envelope)}/"
-                    f"{self.min_signer_threshold}"
-                )
-                return verdict
-            logger.info(
-                f"settle_attestor: assembled {len(envelope)}/"
-                f"{self.min_signer_threshold} sigs for "
-                f"{request.claim_id.hex()[:16]}... — submitting envelope"
+    async def _supersede_context(
+        self, request: PendingSettlementRequest, verdict: AttestationVerdict
+    ) -> Optional[dict]:
+        """The head's runtime context when a supersede of ``request`` may be
+        signed or sent now; otherwise None, with the reason in the verdict."""
+        try:
+            context = checked_runtime_context(
+                await asyncio.to_thread(self.client.get_settlement_runtime_context)
             )
-            async with self._chain_write_lock:
-                try:
-                    ext_hash = await asyncio.to_thread(
-                        self.client.submit_attest_settle_envelope,
-                        request.claim_id,
-                        envelope,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"settle_attestor: submit_attest_settle_envelope "
-                        f"raised for {request.claim_id.hex()[:16]}...: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
-                    verdict.refusal_detail = f"submit_raised: {type(e).__name__}"
-                    return verdict
+        except Exception as error:  # noqa: BLE001
+            logger.error(
+                "settle_attestor: settlement runtime unavailable (%s); not superseding",
+                type(error).__name__,
+            )
+            verdict.supersede = "runtime_unavailable"
+            return None
+        if not context["supersede"]:
+            verdict.supersede = "supersede_unsupported"
+        elif request_expired(request, context):
+            verdict.supersede = "request_expired"
+        elif context["block_number"] < self._supersede_backoff.get(request.claim_id, (0, 0))[1]:
+            verdict.supersede = "backoff"
         else:
-            # 1-sig fallback (test chains with MinSignerThreshold == 1).
-            async with self._chain_write_lock:
-                try:
-                    ext_hash = await asyncio.to_thread(
-                        self.client.submit_attest_settle,
-                        request.claim_id,
-                        pubkey_bytes,
-                        sig_bytes,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"settle_attestor: submit_attest_settle raised for "
-                        f"{request.claim_id.hex()[:16]}...: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
-                    verdict.refusal_detail = f"submit_raised: {type(e).__name__}"
-                    return verdict
+            return context
+        return None
 
-        if not ext_hash:
-            logger.warning(
-                f"settle_attestor: submit_attest_settle returned empty hash "
-                f"for {request.claim_id.hex()[:16]}... — retryable"
-            )
-            verdict.refusal_reason = RefusalReason.OBSERVER_UNAVAILABLE
-            verdict.refusal_detail = "submit_no_hash"
+    async def _supersede(
+        self,
+        request: PendingSettlementRequest,
+        obs: CardanoTxObservation,
+        voucher_digest: bytes,
+        voucher: Optional[dict],
+        live_chain_id: bytes,
+        verdict: AttestationVerdict,
+    ) -> AttestationVerdict:
+        """Replace a request this attestor refused with the evidence it observed.
+
+        Reached only after the genesis, transaction, amount and voucher digest
+        checks passed. The evidence keeps the request's transaction, amount,
+        beneficiary and network, takes the slot Kupo reports, and claims the
+        runtime's ``MinFinalityDepth`` once the observed depth reaches it and
+        this attestor's own floor; the voucher must show the same amount and
+        beneficiary. Every honest attestor derives the same bytes, so their
+        STCA signatures aggregate. Nothing is signed for an expired request, a
+        runtime without the reviewed supersede, or a claim backing off after a
+        failed supersede.
+        """
+        claim = request.claim_id
+        context = await self._supersede_context(request, verdict)
+        if context is None:
             return verdict
-
-        verdict.signed = True
+        floor = max(context["min_finality_depth"], self.min_finality_depth)
+        if obs.depth is None or obs.depth < floor:
+            verdict.supersede = f"unverified:depth={obs.depth}<{floor}"
+            return verdict
+        if voucher is None or (
+            voucher.get("amount_lovelace"), voucher.get("beneficiary_addr_blake2_224")
+        ) != (request.amount_lovelace, request.beneficiary_addr_hash):
+            verdict.supersede = "unverified:voucher"
+            return verdict
+        # Differs from the request: a slot mismatch changes the slot, and an
+        # undershot depth exceeds the observed depth, so it exceeds this one.
+        evidence = replace(
+            SettlementEvidence.of(request),
+            observed_at_depth=context["min_finality_depth"],
+            observed_slot=obs.observed_slot,
+        )
+        digest = stca_digest(live_chain_id, claim, voucher_digest, request.settled_direct, evidence)
+        envelope = await self._signatures(claim, digest)
+        if len(envelope) < self.min_signer_threshold:
+            verdict.supersede = f"awaiting_peer_sigs:{len(envelope)}/{self.min_signer_threshold}"
+            logger.info(
+                "settle_attestor: supersede of claim_id=%s... %s",
+                claim.hex()[:16], verdict.supersede,
+            )
+            return verdict
+        async with self._chain_write_lock:
+            current = await self._supersede_context(request, verdict)
+            if current is None:
+                return verdict
+            try:
+                pending = await asyncio.to_thread(self.client.get_settlement_request, claim)
+                unchanged = pending is not None and PendingSettlementRequest(**pending) == request
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "settle_attestor: rereading claim_id=%s... raised %s; not superseding",
+                    claim.hex()[:16], type(error).__name__,
+                )
+                verdict.supersede = "request_unreadable"
+                return verdict
+            if not unchanged:
+                verdict.supersede = "request_changed"
+                return verdict
+            try:
+                ext_hash = await asyncio.to_thread(
+                    self.client.submit_supersede_settlement_request,
+                    claim, request.settled_direct, evidence, envelope,
+                )
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "settle_attestor: supersede_settlement_request raised for claim_id=%s...: %s",
+                    claim.hex()[:16], type(error).__name__,
+                )
+                ext_hash = None
+            if not ext_hash:
+                failures = self._supersede_backoff.get(claim, (0, 0))[0] + 1
+                delay = min(SUPERSEDE_BACKOFF_BLOCKS * 2 ** (failures - 1), current["ttl"])
+                self._supersede_backoff[claim] = (failures, current["block_number"] + delay)
+                verdict.supersede = "submit_failed"
+                logger.warning(
+                    "settle_attestor: supersede of claim_id=%s... failed (%d in a row); next try at block %d",
+                    claim.hex()[:16], failures, current["block_number"] + delay,
+                )
+                return verdict
+        self._supersede_backoff.pop(claim, None)
+        verdict.supersede = "superseded"
         verdict.extrinsic_hash = ext_hash
         logger.info(
-            f"settle_attestor: attest_settle OK for "
-            f"claim_id={request.claim_id.hex()[:16]}... "
-            f"cardano_tx={cardano_tx_hex[:16]}... "
-            f"depth={obs.depth} ext_hash={ext_hash[:18]}..."
+            "settle_attestor: superseded claim_id=%s... with slot=%d depth=%d sigs=%d ext_hash=%s",
+            claim.hex()[:16], evidence.observed_slot, evidence.observed_at_depth,
+            len(envelope), ext_hash[:18],
         )
         return verdict
 
@@ -1415,6 +1580,9 @@ class SettleClaimAttestor:
                 f"{type(e).__name__}: {e}"
             )
             return
+        pending = {r.get("claim_id") for r in requests if isinstance(r, dict)}
+        for claim in set(self._supersede_backoff) - pending:
+            del self._supersede_backoff[claim]
         if not requests:
             return
         logger.info(

@@ -145,6 +145,7 @@ def _make_substrate_client_stub(
         get_genesis_hash=MagicMock(return_value=genesis_hex),
         get_settlement_runtime_context=MagicMock(return_value=dict(
             protocol="FRAU", block_number=101, ttl=2400, spec_version=239,
+            supersede=False, min_finality_depth=15,
         )),
         list_pending_settlement_requests=MagicMock(return_value=[]),
     )

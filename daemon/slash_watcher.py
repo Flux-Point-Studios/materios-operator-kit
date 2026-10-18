@@ -37,6 +37,8 @@ from daemon.settle_claim_attestor import (
     CardanoTxObservation,
     CardanoTxObserver,
     NETWORK_MAGIC_TO_GENESIS_HASH,
+    checked_runtime_context,
+    request_expired,
 )
 
 logger = logging.getLogger(__name__)
@@ -299,12 +301,6 @@ def build_frv2_preimage(chain_id: bytes, request: PendingBondedRequest, proof: F
         raise ValueError("chain_id and claim_id must be 32 bytes")
     request_id = hashlib.blake2b(encode_request_identity(request), digest_size=32).digest()
     return TAG_FRV2 + chain_id + request.claim_id + request_id + encode_fraud_proof(proof)
-
-
-def request_expired(request: PendingBondedRequest, context: dict) -> bool:
-    if type(request.submitted_block) is not int or not 0 <= request.submitted_block < 2**64:
-        raise ValueError("submitted_block must be u64")
-    return request.submitted_block + context["ttl"] < context["block_number"]
 
 
 # ---------------------------------------------------------------------------
@@ -970,13 +966,7 @@ class SlashWatcher:
 
     async def _runtime_context(self) -> Optional[dict]:
         try:
-            context = await asyncio.to_thread(self.client.get_settlement_runtime_context)
-            if context["protocol"] not in ("FRAU", "FRV2"):
-                raise ValueError("unknown slash protocol")
-            for field, limit in (("block_number", 2**64), ("ttl", 2**32), ("spec_version", 2**32)):
-                if type(context[field]) is not int or not 0 <= context[field] < limit:
-                    raise ValueError(f"invalid {field}")
-            return context
+            return checked_runtime_context(await asyncio.to_thread(self.client.get_settlement_runtime_context))
         except Exception as error:
             logger.error("slash_watcher: settlement runtime unavailable (%s); refusing to sign or submit", type(error).__name__)
             return None

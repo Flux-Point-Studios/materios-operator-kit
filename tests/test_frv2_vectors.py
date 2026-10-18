@@ -79,3 +79,18 @@ def test_bond_and_voucher_are_not_part_of_request_identity():
 def test_invalid_identity_refuses(field, value):
     with pytest.raises(ValueError):
         sw.encode_request_identity(replace(request(VECTORS[0]), **{field: value}))
+
+
+def test_merged_settlement_vector():
+    """Settlement 0757de3 asserts this digest in integration.rs and publishes
+    both values in docs/settlement-genesis-safety.md."""
+    merged = sw.PendingBondedRequest(
+        claim_id=b'\xe7' * 32, requester=ss58_encode(b'\x77' * 32, ss58_format=42), submitted_block=102,
+        settled_direct=False, cardano_tx_hash=b'\x33' * 32, observed_at_depth=15, observed_slot=123,
+        beneficiary_addr_hash=b'\x22' * 28, amount_lovelace=1000, mainchain_genesis_hash=b'\x65' * 32,
+        voucher_digest=b'v' * 32, bond_amount=500,
+    )
+    request_id = hashlib.blake2b(sw.encode_request_identity(merged), digest_size=32).hexdigest()
+    assert request_id == '0f3f88da7a6b6fe85f3e57ad2dcdad53516b8d2490dfd2cc7980c891db39d12e'
+    digest = sw.compute_frau_digest(sw.build_frv2_preimage(b'\x73' * 32, merged, sw.TxNotFound()))
+    assert digest.hex() == 'a99ffae513bd71d6be7825c6bd7853f816fbf6ec22d1f24b7e312a7926e92437'

@@ -149,6 +149,61 @@ the runtime/TTL.
 The digest continues to use live `chain_getBlockHash(0)`. It does not use
 the `MateriosChainId` constant or an environment-supplied chain ID.
 
+## Supersede driver
+
+Some unattestable requests cannot be slashed: no `FraudProof` covers a wrong
+`observed_slot` or a depth the transaction has not reached. On the spec-242
+runtime `supersede_settlement_request` (call 22) settles such a claim on
+evidence the committee supplies, refunds the displaced bond, and verifies the
+same STCA digest `attest_settle` verifies for a request carrying that
+evidence. At M > 1 the settle attestors drive it.
+
+`SettleClaimAttestor` runs its usual checks in order: Cardano network, the
+transaction found by Kupo, the amount paid to the beneficiary, the voucher
+digest from chain state, then slot and depth. A request refused for
+`slot_mismatch` or `depth_undershoot` has passed everything before it, so its
+transaction is real and pays the voucher. The attestor then supersedes only
+when all of these hold:
+
+- the head's context says the runtime offers the reviewed supersede (call
+  arguments `claim_id, settled_direct, evidence, signatures` and
+  `AttestSettleTag` = `STCA`); live spec 239 does not, so nothing happens there;
+- the request is unexpired (`submitted_block + SettlementRequestTtl >= head`);
+- the claim is not backing off after a failed supersede;
+- the observed depth reaches both the runtime's `MinFinalityDepth` and the
+  attestor's own floor;
+- the chain-state voucher shows the request's amount and beneficiary payment
+  key (the 57-byte type-0 address split the pallet uses).
+
+The evidence it signs keeps the request's transaction, amount, beneficiary,
+network and settlement mode, takes the slot Kupo reports, and claims exactly
+`MinFinalityDepth`. Every honest attestor derives the same bytes, so their
+signatures aggregate. It always differs from the request: a slot mismatch
+changes the slot, and an undershot depth exceeds the observed depth.
+
+Signatures go to the existing `settle` bulletin-board channel under the claim
+id. The gateway keys rows by digest, so supersede and attest signatures sit
+side by side and the aggregator returns only those over the local digest; no
+gateway change is needed. Once the envelope reaches `MinSignerThreshold`, the
+attestor takes the shared write lock, re-reads the runtime context and the
+pending request, and submits only if the request is unchanged, unexpired and
+still supersedable. A peer that already superseded leaves no request, so the
+attestor stops with `request_changed` instead of sending a duplicate. A failed
+submission backs the claim off 10 blocks, doubling per consecutive failure up
+to the TTL, and the backoff is dropped once the claim leaves the pending set.
+The pallet charges no fee for supersede (`Pays::No`), and these rules also
+keep failed extrinsics out of blocks. The context parse is cached per
+`:code` hash, so a flood of junk requests costs three small RPCs a read, not a
+metadata download each.
+
+Out of reach: a request whose transaction does not exist, or pays another
+amount. The attestor knows no correct transaction for that claim, so it
+neither attests nor supersedes; the request waits out its TTL or is slashed
+when bonded. STCA does not bind a transaction to one claim, so two claims with
+the same beneficiary and amount can be settled by one payout. That holds for
+`attest_settle` today; supersede signs only what `attest_settle` would sign
+for a request carrying the same evidence and adds no new reach.
+
 ## Rust provenance and validation
 
 `tests/fixtures/frv2/generate.rs` calls the pallet's own
@@ -172,26 +227,35 @@ nice -n 10 python3 -B -m pytest -q -p no:cacheprovider
 nice -n 10 python3 scripts/check-slash-mutations.py
 ```
 
-The mutation harness checks unknown-contract and malformed-context refusals,
-each part of the contract fingerprint (docs excluded; call index, argument
-types, variant indexes, array lengths, request record, request-scoped slashes
-and TTL type included; no fingerprint for recursive or unsupported types),
-TTL source/width/boundary, expiry filtering, post-observation and post-lock
-checks, protocol-change rejection, peer-digest filtering and request encoding.
-It runs isolated copies and rejects surviving or invalid mutants.
+The mutation harness checks the tag table (an unknown tag, a tagless FRV2
+contract and a tag without its pin all refuse), the supersede contract check,
+unknown-contract and malformed-context refusals, each part of the contract
+fingerprint (docs excluded; call index, argument types, variant indexes, array
+lengths, request record, request-scoped slashes and TTL type included; no
+fingerprint for recursive or unsupported types), the per-code cache, TTL and
+`MinFinalityDepth` sources and widths, expiry filtering, post-observation and
+post-lock checks, protocol-change rejection, peer-digest filtering, request
+encoding, and each supersede guard (runtime support, expiry, backoff and its
+doubling and cap, depth floors, voucher, signed slot and depth, quorum, the
+lock-time re-reads). It runs isolated copies and rejects surviving or invalid
+mutants.
+
+`test_merged_settlement_vector` checks the Python FRV2 digest against the
+vector settlement `0757de3` asserts in `integration.rs`.
 
 ## Rollout order
 
 1. Review and release this operator-kit change.
-2. Deploy the release to both active slash watchers: Gemtek and Node-3.
-   Verify both detect FRAU and the live TTL before enactment.
-3. Enact the reviewed runtime containing settlement #55 and the live-genesis
-   chain-ID fix. Before enactment, check both: the runtime pins
-   `pallet-intent-settlement` at `5fd5f54` (or at a revision whose fingerprint
-   and vectors were re-derived here), and its metadata fingerprints to the
-   FRV2 pin. The fingerprint alone cannot tell a digest change that leaves
-   types untouched (see Limit). After enactment, verify both watchers detect
-   FRV2 and can converge on the same request digest.
+2. Deploy it to every active committee daemon (slash watcher and settle
+   attestor run in the same cert-daemon) and to the custody watcher, on
+   Gemtek and Node-3. Verify each detects FRAU, `supersede=False`, TTL 2400
+   and `MinFinalityDepth` 15 on live spec 239.
+3. Enact the reviewed runtime (Materios `67ec3d9`, spec 242, transaction
+   version 6, settlement `0757de3`). Before enactment, check that its
+   metadata carries `SlashSettlementTag` = `FRV2` and fingerprints to the FRV2
+   pin; the tag cannot reveal a layout change under an unchanged tag (see
+   Limit), so also check the settlement revision. After enactment, verify
+   every daemon detects FRV2 and `supersede=True`.
 
 This PR does not deploy or restart services. The draft PR with green CI is
 the implementation handoff; materios performs the cross-model review.

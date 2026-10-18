@@ -94,18 +94,28 @@ def metadata(protocol='frau', ttl=10, v14=None):
     return result
 
 
-def rpc_client(meta=None, spec=239, spec_name='materios'):
+HEAD = '0x' + 'ab' * 32
+CODE = '0x' + 'c0' * 32
+
+
+def rpc_client(meta=None, spec=239, spec_name='materios', code=CODE):
+    """A client whose node serves ``head`` (metadata, ``:code`` hash) at one head."""
     client = object.__new__(SubstrateClient)
     client._read = object()
+    client._settlement_contract = None
+    client.head = SimpleNamespace(meta=meta or metadata(), code=code)
     def call(method, *args, **kwargs):
         assert kwargs['conn'] is client._read
         if method == 'get_chain_head':
-            return '0x' + 'ab' * 32
-        assert args == ('0x' + 'ab' * 32,), 'all reads must use the same head'
+            return HEAD
+        if method == 'rpc_request':
+            assert args == ('state_getStorageHash', ['0x3a636f6465', HEAD]), 'the code hash must be read at the head'
+            return {'jsonrpc': '2.0', 'result': client.head.code}
+        assert args == (HEAD,), 'all reads must use the same head'
         if method == 'get_block_runtime_version':
             return {'specName': spec_name, 'specVersion': spec}
         if method == 'get_block_metadata':
-            return meta or metadata()
+            return client.head.meta
         if method == 'get_block_number':
             return 101
         raise AssertionError(method)
@@ -113,12 +123,57 @@ def rpc_client(meta=None, spec=239, spec_name='materios'):
     return client
 
 
+def methods(client):
+    return [c.args[0] for c in client._call.call_args_list]
+
+
 @pytest.mark.parametrize('protocol', ['frau', 'frv2'])
 def test_runtime_detects_exact_metadata_at_head(protocol):
     client = rpc_client(metadata(protocol))
     result = client.get_settlement_runtime_context()
-    assert result == context(protocol.upper()) | {'block_hash': '0x' + 'ab' * 32}
-    assert client._call.call_count == 4
+    assert result == context(protocol.upper()) | {'block_hash': HEAD}
+    assert methods(client) == ['get_chain_head', 'get_block_runtime_version', 'get_block_number',
+                               'rpc_request', 'get_block_metadata']
+
+
+def test_one_runtime_code_is_parsed_once_and_an_upgrade_is_parsed_again():
+    client = rpc_client(metadata('frau'))
+    assert client.get_settlement_runtime_context()['protocol'] == 'FRAU'
+    client._call.reset_mock()
+    assert client.get_settlement_runtime_context()['protocol'] == 'FRAU'
+    assert 'get_block_metadata' not in methods(client)
+    client.head = SimpleNamespace(meta=metadata('frv2'), code='0x' + 'c1' * 32)
+    upgraded = client.get_settlement_runtime_context()
+    assert (upgraded['protocol'], upgraded['supersede']) == ('FRV2', True)
+    assert methods(client).count('get_block_metadata') == 1
+
+
+@pytest.mark.parametrize('code', [None, ''])
+def test_without_a_code_hash_every_read_parses_metadata(code):
+    client = rpc_client(metadata('frv2'), code=code)
+    for _ in range(2):
+        assert client.get_settlement_runtime_context()['protocol'] == 'FRV2'
+    assert methods(client).count('get_block_metadata') == 2
+
+
+def test_a_refused_runtime_is_not_remembered():
+    v14 = fixture('frv2')
+    set_constant(v14, 'SlashSettlementTag', b'FRV3')
+    client = rpc_client(metadata(v14=v14))
+    for _ in range(2):
+        with pytest.raises(ValueError, match='settlement runtime'):
+            client.get_settlement_runtime_context()
+    assert methods(client).count('get_block_metadata') == 2
+
+
+def test_the_spec_name_is_checked_on_every_read():
+    client = rpc_client(metadata('frau'))
+    client.get_settlement_runtime_context()
+    client._call.side_effect = (lambda call: lambda method, *a, **kw: (
+        {'specName': 'other', 'specVersion': 239} if method == 'get_block_runtime_version' else call(method, *a, **kw)
+    ))(client._call.side_effect)
+    with pytest.raises(ValueError, match='settlement runtime'):
+        client.get_settlement_runtime_context()
 
 
 @pytest.mark.parametrize('protocol', ['frau', 'frv2'])
@@ -558,6 +613,7 @@ def test_partial_rollout_defers_then_recovers(caplog):
     ('protocol', 'FRV3'), ('protocol', ''), ('protocol', None),
     ('ttl', None), ('ttl', ''), ('ttl', True), ('ttl', -1), ('ttl', 2**32),
     ('block_number', ''), ('block_number', -1), ('spec_version', None),
+    ('supersede', None), ('supersede', 1), ('min_finality_depth', None), ('min_finality_depth', 2**32),
 ])
 def test_invalid_context_refuses_before_signing(field, value, caplog):
     ctx = context()
