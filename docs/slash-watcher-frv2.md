@@ -251,8 +251,9 @@ vector settlement `0757de3` asserts in `integration.rs`.
    committee for these paths. Deploy it to the custody watcher on node2.
    Verify each cert-daemon detects FRAU, `supersede=False`, TTL 2400 and
    `MinFinalityDepth` 15 on live spec 239. Rollback before enactment is the
-   previous image or release; after enactment the previous build refuses
-   to slash (it signs FRAU) and pages on every supersede, so roll forward.
+   previous image or release. After enactment the previous builds' slashes
+   fail (they sign FRAU), their attestors cannot supersede and the previous
+   custody watcher pages on every supersede, so roll forward instead.
 3. Enact the reviewed runtime (Materios `67ec3d9`, spec 242, transaction
    version 6, settlement `0757de3`). Before enactment, check that its
    metadata carries `SlashSettlementTag` = `FRV2` and fingerprints to the FRV2
