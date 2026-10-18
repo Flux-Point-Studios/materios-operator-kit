@@ -1177,6 +1177,8 @@ class TestSlashDispatchAgainstRealAggregator:
         # In-proc gateway that mirrors the production
         # /v2/multisig_sigs/{kind}/{key} contract.
         store: dict = {}
+        peers = [Keypair.create_from_uri("//Bob"), Keypair.create_from_uri("//Charlie")]
+        committee = frozenset({Keypair.create_from_uri("//Alice").public_key, *(p.public_key for p in peers)})
 
         async def post_handler(request):
             kind = request.match_info["kind"]
@@ -1191,19 +1193,12 @@ class TestSlashDispatchAgainstRealAggregator:
             kind = request.match_info["kind"]
             key = request.match_info["key"]
             digest = request.query.get("digest")
-            sigs = []
-            # Seed two peer sigs at the same digest so the daemon
+            # Two committee peers signed the same digest, so the daemon
             # crosses the M=3 threshold after adding its own.
-            sigs.append({
-                "pubkey": ("01" * 32),
-                "sig": ("01" * 64),
-                "digest": digest,
-            })
-            sigs.append({
-                "pubkey": ("02" * 32),
-                "sig": ("02" * 64),
-                "digest": digest,
-            })
+            sigs = [
+                {"pubkey": peer.public_key.hex(), "sig": peer.sign(bytes.fromhex(digest)).hex(), "digest": digest}
+                for peer in peers
+            ]
             # Include the daemon's own sig if it has posted.
             for (k, key_h, dig_h, pub_h), sig_h in store.items():
                 if k != kind or key_h != key:
@@ -1241,7 +1236,7 @@ class TestSlashDispatchAgainstRealAggregator:
                 port = site._server.sockets[0].getsockname()[1]
                 base_url = f"http://127.0.0.1:{port}"
                 # Real aggregator — no stubs.
-                aggregator = MultisigAggregator(gateway_url=base_url)
+                aggregator = MultisigAggregator(gateway_url=base_url, committee=lambda: committee)
 
                 client = _make_substrate_client_stub(
                     submit_ext_hash="0x" + ("cc" * 32),

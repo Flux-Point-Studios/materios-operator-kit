@@ -130,7 +130,7 @@ def test_two_attestors_supersede_a_junk_request_at_m2():
         await alice._tick(CHAIN_ID)
         return alice, bob
 
-    alice, bob = asyncio.run(_with_gateway(run))
+    alice, bob = asyncio.run(_with_gateway(run, committee=chain.committee))
     assert chain.settled == {CLAIM_ID: (CORRECT, request.settled_direct)}
     [(caller, _, _, evidence, envelope)] = chain.submissions
     assert caller == BOB.public_key
@@ -138,6 +138,25 @@ def test_two_attestors_supersede_a_junk_request_at_m2():
     for side in (alice, bob):
         side.client.submit_attest_settle.assert_not_called()
         side.client.submit_attest_settle_envelope.assert_not_called()
+
+
+def test_an_outsider_signature_on_the_bulletin_board_does_not_block_the_supersede():
+    request = junk_request()
+    chain = Chain(request)
+    outsider = Keypair.create_from_uri("//Mallory")
+
+    async def run(gw, agg, session):
+        alice = attestor(chain.client(ALICE), agg, threshold=2)
+        bob = attestor(chain.client(BOB), agg, threshold=2)
+        await alice.process_one(request, CHAIN_ID)
+        # Anyone can read the digest and post a valid signature of their own.
+        [(kind, key, digest, _)] = list(gw.store)
+        gw.store[(kind, key, digest, outsider.public_key.hex())] = outsider.sign(bytes.fromhex(digest)).hex()
+        return await bob.process_one(request, CHAIN_ID)
+
+    assert asyncio.run(_with_gateway(run, committee=chain.committee)).supersede == "superseded"
+    [(_, _, _, _, envelope)] = chain.submissions
+    assert {pub for pub, _ in envelope} == {ALICE.public_key, BOB.public_key}
 
 
 @pytest.mark.parametrize("junk", [
@@ -281,7 +300,7 @@ def test_no_duplicate_submission_once_a_peer_has_superseded():
         # Alice still holds the stale row; her envelope is complete now.
         return await alice.process_one(request, CHAIN_ID)
 
-    verdict = asyncio.run(_with_gateway(run))
+    verdict = asyncio.run(_with_gateway(run, committee=chain.committee))
     assert verdict.supersede == "request_changed"
     assert len(chain.submissions) == 1
 

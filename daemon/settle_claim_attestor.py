@@ -1750,7 +1750,9 @@ def maybe_create_settle_claim_attestor(
     gateway_url = (getattr(config, "blob_gateway_url", "") or "").strip()
     if gateway_url:
         from daemon.multisig_aggregator import MultisigAggregator
-        aggregator = MultisigAggregator(gateway_url=gateway_url)
+        aggregator = MultisigAggregator(
+            gateway_url=gateway_url, committee=substrate_client.get_committee_pubkeys,
+        )
         logger.info(
             f"settle_attestor: multisig aggregator wired (gateway={gateway_url})"
         )

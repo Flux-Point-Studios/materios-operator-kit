@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.exceptions import SubstrateRequestException
+from substrateinterface.utils.ss58 import ss58_decode
 
 from daemon import health_server
 from daemon.config import DaemonConfig
@@ -249,6 +250,14 @@ def _to_bytes_exact(val, expected_len: int) -> bytes:
         raise ValueError(
             f"expected {expected_len}-byte value, got {len(raw)} bytes"
         )
+    return raw
+
+
+def _account_id_bytes(account: str) -> bytes:
+    """An AccountId32 from its SS58 or 0x-hex form."""
+    raw = bytes.fromhex(account[2:] if account.startswith("0x") else ss58_decode(account))
+    if len(raw) != 32:
+        raise ValueError("account id must be 32 bytes")
     return raw
 
 
@@ -877,6 +886,13 @@ class SubstrateClient:
         forever — same wedge class as the poll loop (task #288).
         """
         return self._call("query", "OrinqReceipts", "CommitteeMembers", conn=self._read)
+
+    def get_committee_pubkeys(self) -> frozenset[bytes]:
+        """The committee keys settlement signatures must come from: the raw
+        32 bytes of each ``OrinqReceipts.CommitteeMembers`` account, which the
+        runtime's committee adapter uses as the pubkey."""
+        members = self.get_committee_members()
+        return frozenset(_account_id_bytes(m) for m in (members.value if hasattr(members, "value") else members))
 
     def submit_join_committee(self):
         """Submit ``OrinqReceipts.join_committee()`` and return the included

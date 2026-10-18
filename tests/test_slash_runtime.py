@@ -607,7 +607,8 @@ def test_partial_rollout_defers_then_recovers(caplog):
         envelope = client.submit_slash_bad_settlement_evidence.call_args.args[2]
         assert len(envelope) == 2
         assert all(Keypair(public_key=pub, ss58_format=42).verify(new_digest, sig) for pub, sig in envelope)
-    asyncio.run(_with_gateway(run))
+    asyncio.run(_with_gateway(run, committee=frozenset(
+        {Keypair.create_from_uri('//Alice').public_key, Keypair.create_from_uri('//Bob').public_key})))
 
 
 @pytest.mark.parametrize('field,value', [

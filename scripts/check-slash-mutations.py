@@ -9,7 +9,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ['tests/test_slash_runtime.py', 'tests/test_frv2_vectors.py', 'tests/test_settle_supersede.py',
-         'tests/test_slash_proof.py', 'tests/test_slash_watcher.py']
+         'tests/test_slash_proof.py', 'tests/test_slash_watcher.py', 'tests/test_multisig_aggregator.py',
+         'tests/test_settlement_submits.py']
 MUTANTS = [
     ('wrong-chain-accepted', 'daemon/substrate_client.py', 'if version["specName"] != "materios":', 'if False:'),
     ('unknown-contract-uses-frau', 'daemon/substrate_client.py', 'if SLASH_PROTOCOLS.get(fingerprint) != expected:', 'if fingerprint in SLASH_PROTOCOLS and SLASH_PROTOCOLS[fingerprint] != expected:'),
@@ -83,6 +84,11 @@ MUTANTS = [
     ('coverage-skipped-for-present-tx', 'daemon/slash_watcher.py', 'gap = await self.observer.kupo_coverage_gap()', 'gap = None'),
     ('network-check-off', 'daemon/slash_watcher.py', 'and observation.mainchain_genesis_hash != request.mainchain_genesis_hash', 'and False'),
     ('tx-lookup-scans', 'daemon/settle_claim_attestor.py', 'session, f"/matches/*@{cardano_tx_hash_hex}", {},', 'session, "/matches/*", {"transaction_id": cardano_tx_hash_hex},'),
+    ('envelope-admits-non-members', 'daemon/multisig_aggregator.py', 'if pub in committee and _verifies(pub, sig, digest):', 'if _verifies(pub, sig, digest):'),
+    ('envelope-admits-unverified', 'daemon/multisig_aggregator.py', 'if pub in committee and _verifies(pub, sig, digest):', 'if pub in committee:'),
+    ('envelope-wrapped-bytes-accepted', 'daemon/multisig_aggregator.py', 'return sr25519.verify(sig, digest, pubkey)', 'return sr25519.verify(sig, digest, pubkey) or sr25519.verify(sig, b"<Bytes>" + digest + b"</Bytes>", pubkey)'),
+    ('unreadable-committee-admits-all', 'daemon/multisig_aggregator.py', '            committee = frozenset()\n', '            committee = frozenset(pub for pub, _ in await self.fetch_envelope(session, kind=kind, key=key, digest=digest))\n'),
+    ('committee-from-stake-key', 'daemon/substrate_client.py', 'raw = bytes.fromhex(account[2:] if account.startswith("0x") else ss58_decode(account))', 'raw = bytes(32)'),
 ]
 
 

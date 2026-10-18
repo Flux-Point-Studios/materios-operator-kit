@@ -183,8 +183,12 @@ changes the slot, and an undershot depth exceeds the observed depth.
 
 Signatures go to the existing `settle` bulletin-board channel under the claim
 id. The gateway keys rows by digest, so supersede and attest signatures sit
-side by side and the aggregator returns only those over the local digest; no
-gateway change is needed. Once the envelope reaches `MinSignerThreshold`, the
+side by side; no gateway change is needed. Anyone can post to the board, and
+the pallet fails a whole bundle on one non-member or one bad signature, so
+every envelope (attest, supersede, expire, slash) admits a peer row only when
+its key is in `OrinqReceipts.CommitteeMembers`, read when the envelope is
+assembled, and it is a raw sr25519 signature over the local digest. An
+unreadable committee admits no peer. Once the envelope reaches `MinSignerThreshold`, the
 attestor takes the shared write lock, re-reads the runtime context and the
 pending request, and submits only if the request is unchanged, unexpired and
 still supersedable. A peer that already superseded leaves no request, so the

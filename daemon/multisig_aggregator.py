@@ -27,10 +27,12 @@ existing 1-sig path (a no-op until manual aggregation runs).
 """
 
 from __future__ import annotations
+import asyncio
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import aiohttp
+import sr25519
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,14 @@ KIND_SLASH = "slash"
 _ALLOWED_KINDS = (KIND_SETTLE, KIND_EXPIRE, KIND_SLASH)
 
 
+def _verifies(pubkey: bytes, sig: bytes, digest: bytes) -> bool:
+    """A raw sr25519 signature over ``digest``, as the pallet verifies it."""
+    try:
+        return sr25519.verify(sig, digest, pubkey)
+    except ValueError:
+        return False
+
+
 class MultisigAggregator:
     """Async client for the gateway-mediated sig bulletin board.
 
@@ -70,10 +80,12 @@ class MultisigAggregator:
         self,
         *,
         gateway_url: str,
+        committee: Callable[[], frozenset[bytes]],
         timeout_seconds: float = 10.0,
     ) -> None:
         # Strip trailing slash so we can join with `/v2/...` cleanly.
         self.base_url = gateway_url.rstrip("/")
+        self._committee = committee
         self._timeout = aiohttp.ClientTimeout(total=timeout_seconds)
 
     def _url(self, kind: str, key: bytes) -> str:
@@ -212,30 +224,42 @@ class MultisigAggregator:
         my_pubkey: bytes,
         my_sig: bytes,
     ) -> list[tuple[bytes, bytes]]:
-        """Convenience: POST our own sig, GET peer sigs, fold our own
-        entry in (in case the gateway is temporarily inconsistent),
-        dedupe by pubkey, sort by pubkey for deterministic envelope.
+        """POST our own signature, GET the peers', and return our entry plus
+        every peer signature the pallet would accept, sorted by pubkey.
 
-        Returns the final envelope. Caller checks ``len(envelope) >=
-        threshold`` before submitting.
+        The gateway accepts anyone's signature, and the pallet fails a whole
+        bundle on a single non-member or invalid signature, so a peer row
+        counts only when its key is in the current committee and it is a
+        raw sr25519 signature over ``digest``. An unreadable committee
+        admits no peer. Caller checks ``len(envelope) >= threshold``.
         """
         await self.share_sig(
             session, kind=kind, key=key, digest=digest,
             pubkey=my_pubkey, sig=my_sig,
         )
-        peer = await self.fetch_envelope(session, kind=kind, key=key, digest=digest)
-        # Always include our own entry — the gateway might not have
-        # persisted yet (transport bounce), or the GET might race the
-        # POST. Cheap to be defensive.
-        seen = {pub for pub, _ in peer}
-        if my_pubkey not in seen:
-            peer.append((my_pubkey, my_sig))
-        # Deterministic order: pallet rejects on `DuplicateSigner` already
-        # (we deduped by pubkey above) but a canonical ordering also helps
-        # peer daemons that re-derive the same envelope land on the same
-        # extrinsic hash.
-        peer.sort(key=lambda kv: kv[0])
-        return peer
+        try:
+            committee = await asyncio.to_thread(self._committee)
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                f"multisig_aggregator: committee unreadable ({type(error).__name__}); "
+                f"admitting no peer signature for {kind}/{key.hex()[:16]}…"
+            )
+            committee = frozenset()
+        envelope = {my_pubkey: my_sig}
+        dropped = 0
+        for pub, sig in await self.fetch_envelope(session, kind=kind, key=key, digest=digest):
+            if pub in envelope:
+                continue
+            if pub in committee and _verifies(pub, sig, digest):
+                envelope[pub] = sig
+            else:
+                dropped += 1
+        if dropped:
+            logger.warning(
+                f"multisig_aggregator: dropped {dropped} signature(s) for {kind}/{key.hex()[:16]}… "
+                f"from non-members or not over the digest"
+            )
+        return sorted(envelope.items())
 
     def find_my_sig(
         self,

@@ -1335,7 +1335,9 @@ def maybe_create_slash_watcher(
     gateway_url = (getattr(config, "blob_gateway_url", "") or "").strip()
     if gateway_url:
         from daemon.multisig_aggregator import MultisigAggregator
-        aggregator = MultisigAggregator(gateway_url=gateway_url)
+        aggregator = MultisigAggregator(
+            gateway_url=gateway_url, committee=substrate_client.get_committee_pubkeys,
+        )
         logger.info(
             f"slash_watcher: multisig aggregator wired (gateway={gateway_url})"
         )

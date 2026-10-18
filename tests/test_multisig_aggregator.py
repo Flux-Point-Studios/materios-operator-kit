@@ -11,7 +11,9 @@ import asyncio
 
 import aiohttp
 import pytest
+import sr25519
 from aiohttp import web
+from substrateinterface import Keypair
 
 from daemon.multisig_aggregator import (
     KIND_EXPIRE,
@@ -81,13 +83,14 @@ async def _start_gateway(gw: FakeGateway) -> tuple[web.AppRunner, int]:
     return runner, port
 
 
-async def _with_gateway(coro_factory):
+async def _with_gateway(coro_factory, committee=frozenset()):
     """Spin up gateway + aggregator, run a coroutine that takes
-    (gw, agg, session), tear down. Returns whatever the coro returned."""
+    (gw, agg, session), tear down. Returns whatever the coro returned.
+    ``committee`` is the set of pubkeys the chain would accept."""
     gw = FakeGateway()
     runner, port = await _start_gateway(gw)
     try:
-        agg = MultisigAggregator(gateway_url=f"http://127.0.0.1:{port}")
+        agg = MultisigAggregator(gateway_url=f"http://127.0.0.1:{port}", committee=lambda: committee)
         async with aiohttp.ClientSession() as session:
             return await coro_factory(gw, agg, session)
     finally:
@@ -254,24 +257,83 @@ def test_fetch_envelope_returns_empty_on_http_error():
     asyncio.run(_with_gateway(run))
 
 
+ALICE, BOB, CHARLIE, DAVE = (Keypair.create_from_uri(f"//{n}") for n in ("Alice", "Bob", "Charlie", "Dave"))
+CLAIM = bytes.fromhex("aa" * 32)
+DIGEST = bytes.fromhex("11" * 32)
+
+
+def _post(gw, keypair, digest=DIGEST, sig=None):
+    sig = keypair.sign(digest) if sig is None else sig
+    gw.store[("settle", CLAIM.hex(), digest.hex(), keypair.public_key.hex())] = sig.hex()
+
+
 def test_assemble_envelope_adds_local_sig_then_dedupes():
     async def run(gw, agg, session):
-        gw.store[("settle", "aa" * 32, "11" * 32, "01" * 32)] = "02" * 64
-        my_pub = bytes.fromhex("03" * 32)
-        my_sig = bytes.fromhex("04" * 64)
+        _post(gw, BOB)
+        _post(gw, ALICE)
         env = await agg.assemble_envelope(
-            session, kind=KIND_SETTLE,
-            key=bytes.fromhex("aa" * 32),
-            digest=bytes.fromhex("11" * 32),
-            my_pubkey=my_pub, my_sig=my_sig,
+            session, kind=KIND_SETTLE, key=CLAIM, digest=DIGEST,
+            my_pubkey=ALICE.public_key, my_sig=ALICE.sign(DIGEST),
         )
-        assert len(env) == 2
-        pubkeys = [p for p, _ in env]
-        assert pubkeys == sorted(pubkeys)
-        pubkey_set = {p for p, _ in env}
-        assert my_pub in pubkey_set
-        assert bytes.fromhex("01" * 32) in pubkey_set
-    asyncio.run(_with_gateway(run))
+        assert [p for p, _ in env] == sorted([ALICE.public_key, BOB.public_key])
+    asyncio.run(_with_gateway(run, committee=frozenset({ALICE.public_key, BOB.public_key})))
+
+
+def test_assemble_envelope_keeps_only_committee_signatures_over_the_digest():
+    """Anyone can post to the bulletin board, and the pallet fails the whole
+    bundle on one non-member or one bad signature."""
+    committee = frozenset({ALICE.public_key, BOB.public_key, DAVE.public_key})
+
+    async def run(gw, agg, session):
+        _post(gw, BOB)
+        _post(gw, CHARLIE)  # valid, not a member
+        _post(gw, DAVE, sig=DAVE.sign(bytes.fromhex("22" * 32)))  # a member's signature over another digest
+        env = await agg.assemble_envelope(
+            session, kind=KIND_SETTLE, key=CLAIM, digest=DIGEST,
+            my_pubkey=ALICE.public_key, my_sig=ALICE.sign(DIGEST),
+        )
+        assert [p for p, _ in env] == sorted([ALICE.public_key, BOB.public_key])
+        assert all(sr25519.verify(sig, DIGEST, pub) for pub, sig in env)
+    asyncio.run(_with_gateway(run, committee=committee))
+
+
+def test_a_malformed_member_signature_is_dropped_not_raised():
+    async def run(gw, agg, session):
+        _post(gw, BOB, sig=b"\x01" * 64)
+        env = await agg.assemble_envelope(
+            session, kind=KIND_SETTLE, key=CLAIM, digest=DIGEST,
+            my_pubkey=ALICE.public_key, my_sig=ALICE.sign(DIGEST),
+        )
+        assert [p for p, _ in env] == [ALICE.public_key]
+    asyncio.run(_with_gateway(run, committee=frozenset({ALICE.public_key, BOB.public_key})))
+
+
+def test_a_signature_over_wrapped_bytes_is_not_a_signature_over_the_digest():
+    """substrate-interface's Keypair.verify also accepts ``<Bytes>digest</Bytes>``;
+    the pallet does not."""
+    async def run(gw, agg, session):
+        _post(gw, BOB, sig=BOB.sign(b"<Bytes>" + DIGEST + b"</Bytes>"))
+        env = await agg.assemble_envelope(
+            session, kind=KIND_SETTLE, key=CLAIM, digest=DIGEST,
+            my_pubkey=ALICE.public_key, my_sig=ALICE.sign(DIGEST),
+        )
+        assert [p for p, _ in env] == [ALICE.public_key]
+    asyncio.run(_with_gateway(run, committee=frozenset({ALICE.public_key, BOB.public_key})))
+
+
+def test_an_unreadable_committee_admits_no_peer():
+    def unreadable():
+        raise TimeoutError("rpc")
+
+    async def run(gw, agg, session):
+        _post(gw, BOB)
+        agg._committee = unreadable
+        env = await agg.assemble_envelope(
+            session, kind=KIND_SETTLE, key=CLAIM, digest=DIGEST,
+            my_pubkey=ALICE.public_key, my_sig=ALICE.sign(DIGEST),
+        )
+        assert [p for p, _ in env] == [ALICE.public_key]
+    asyncio.run(_with_gateway(run, committee=frozenset({ALICE.public_key, BOB.public_key})))
 
 
 def test_assemble_envelope_includes_self_even_if_post_fails():
@@ -311,7 +373,7 @@ def test_expire_kind_routes_independently():
 
 def test_find_my_sig():
     """Pure-Python helper — no fixture needed."""
-    agg = MultisigAggregator(gateway_url="http://unused")
+    agg = MultisigAggregator(gateway_url="http://unused", committee=frozenset)
     env = [
         (bytes.fromhex("01" * 32), bytes.fromhex("a1" * 64)),
         (bytes.fromhex("02" * 32), bytes.fromhex("a2" * 64)),

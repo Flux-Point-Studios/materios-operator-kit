@@ -100,3 +100,32 @@ def test_malformed_envelopes_never_reach_the_chain(method, sigs):
     with pytest.raises(ValueError):
         getattr(c, method)(ID[:31], [(PUB, SIG)])
     c._call.assert_not_called()
+
+
+def test_committee_pubkeys_are_the_raw_account_bytes_of_the_orinq_committee():
+    alice, bob = Keypair.create_from_uri("//Alice"), Keypair.create_from_uri("//Bob")
+    c = object.__new__(SubstrateClient)
+    c._read = object()
+    c._call = MagicMock(return_value=SimpleNamespace(value=[alice.ss58_address, "0x" + bob.public_key.hex()]))
+    assert c.get_committee_pubkeys() == frozenset({alice.public_key, bob.public_key})
+    assert c._call.call_args.args == ("query", "OrinqReceipts", "CommitteeMembers")
+    assert c._call.call_args.kwargs == {"conn": c._read}
+
+
+@pytest.mark.parametrize("factory", ["settle", "expire", "slash"])
+def test_every_attestor_reads_the_committee_its_envelopes_are_checked_against(factory, monkeypatch):
+    from daemon.expire_policy_attestor import maybe_create_expire_policy_attestor
+    from daemon.settle_claim_attestor import maybe_create_settle_claim_attestor
+    from daemon.slash_watcher import maybe_create_slash_watcher
+    create = {"settle": maybe_create_settle_claim_attestor, "expire": maybe_create_expire_policy_attestor,
+              "slash": maybe_create_slash_watcher}[factory]
+    monkeypatch.setenv("KUPO_URL", "http://kupo.test")
+    client = MagicMock()
+    client.get_min_signer_threshold.return_value = 2
+    client.get_min_finality_depth.return_value = 15
+    config = SimpleNamespace(ogmios_url="http://ogmios.test", kupo_url="http://kupo.test",
+                             blob_gateway_url="http://gateway.test")
+    import asyncio
+    attestor = create(config, client, asyncio.Lock())
+    client.get_committee_pubkeys.return_value = frozenset({b"\x01" * 32})
+    assert attestor.aggregator._committee() == frozenset({b"\x01" * 32})
