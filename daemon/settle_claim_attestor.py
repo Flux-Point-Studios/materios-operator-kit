@@ -67,7 +67,7 @@ import hashlib
 import logging
 import os
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
 
@@ -303,6 +303,53 @@ def request_expired(request: Any, context: dict) -> bool:
     if type(request.submitted_block) is not int or not 0 <= request.submitted_block < 2**64:
         raise ValueError("submitted_block must be u64")
     return request.submitted_block + context["ttl"] < context["block_number"]
+
+
+# Longest wait between genesis reads while they keep failing.
+GENESIS_RETRY_MAX_SECONDS = 300
+
+
+async def poll_forever(
+    name: str,
+    client: Any,
+    poll_interval: int,
+    running: Callable[[], bool],
+    tick: Callable[[bytes], Awaitable[None]],
+) -> None:
+    """Every ``poll_interval`` seconds, read the live genesis hash (the chain id
+    every committee digest binds) and run ``tick`` with it. A failed read is
+    logged and retried after a delay that doubles up to
+    GENESIS_RETRY_MAX_SECONDS; a failed tick is logged. Neither ends the loop."""
+    failures = 0
+    while running():
+        delay = poll_interval
+        try:
+            live = await asyncio.to_thread(client.get_genesis_hash)
+        except Exception as error:  # noqa: BLE001
+            failures += 1
+            delay = min(poll_interval * 2 ** failures, GENESIS_RETRY_MAX_SECONDS)
+            logger.error("%s: reading the genesis hash raised %s (%d in a row); retrying in %ss",
+                         name, type(error).__name__, failures, delay)
+        else:
+            failures = 0
+            if not live:
+                logger.info("%s: substrate genesis not yet available — skipping tick", name)
+            else:
+                try:
+                    chain_id = bytes.fromhex(live.removeprefix("0x"))
+                except ValueError:
+                    chain_id = b""
+                if len(chain_id) != 32:
+                    logger.warning("%s: malformed live genesis %r — skipping tick", name, live)
+                else:
+                    try:
+                        await tick(chain_id)
+                    except Exception as error:  # noqa: BLE001
+                        logger.error("%s: tick raised %s: %s", name, type(error).__name__, error, exc_info=True)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            break
 
 
 # Blocks a claim waits after its first failed supersede; each further failure
@@ -1637,39 +1684,7 @@ class SettleClaimAttestor:
         await asyncio.gather(*coros, return_exceptions=True)
 
     async def _run_forever(self) -> None:
-        while self._running:
-            live_chain_id_hex = await asyncio.to_thread(
-                self.client.get_genesis_hash
-            )
-            if not live_chain_id_hex:
-                logger.info(
-                    "settle_attestor: substrate genesis not yet available "
-                    "— skipping tick"
-                )
-            else:
-                try:
-                    chain_id = bytes.fromhex(
-                        live_chain_id_hex.removeprefix("0x")
-                    )
-                except ValueError:
-                    logger.warning(
-                        f"settle_attestor: malformed live genesis "
-                        f"{live_chain_id_hex!r} — skipping tick"
-                    )
-                    chain_id = b""
-                if len(chain_id) == 32:
-                    try:
-                        await self._tick(chain_id)
-                    except Exception as e:  # noqa: BLE001
-                        logger.error(
-                            f"settle_attestor: tick raised "
-                            f"{type(e).__name__}: {e}",
-                            exc_info=True,
-                        )
-            try:
-                await asyncio.sleep(self._poll_interval)
-            except asyncio.CancelledError:
-                break
+        await poll_forever("settle_attestor", self.client, self._poll_interval, lambda: self._running, self._tick)
 
     def start(self) -> None:
         """Schedule the background loop on the running event loop.

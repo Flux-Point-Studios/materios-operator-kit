@@ -40,6 +40,7 @@ from daemon.settle_claim_attestor import (
     CardanoTxObserver,
     NETWORK_MAGIC_TO_GENESIS_HASH,
     checked_runtime_context,
+    poll_forever,
     request_expired,
 )
 
@@ -312,6 +313,14 @@ def build_frv2_preimage(chain_id: bytes, request: PendingBondedRequest, proof: F
         raise ValueError("chain_id and claim_id must be 32 bytes")
     request_id = hashlib.blake2b(encode_request_identity(request), digest_size=32).digest()
     return TAG_FRV2 + chain_id + request.claim_id + request_id + encode_fraud_proof(proof)
+
+
+def past_slash_window(request: PendingBondedRequest, context: dict) -> bool:
+    """Whether the runtime would refuse to slash ``request`` as expired. The
+    FRV2 pallet (settlement 0757de3) does; the FRAU pallet (settlement
+    c60b98f, spec 239) slashes a request of any age and removes one only by
+    attesting or slashing it, so there an expired fraud stays slashable."""
+    return context["protocol"] == "FRV2" and request_expired(request, context)
 
 
 # ---------------------------------------------------------------------------
@@ -882,7 +891,7 @@ class SlashWatcher:
             verdict.outcome = ClassifierOutcome.DEFERRED
             verdict.detail = "runtime_unavailable"
             return None
-        if request_expired(request, context):
+        if past_slash_window(request, context):
             verdict.outcome = ClassifierOutcome.DEFERRED
             verdict.detail = "request_expired"
             logger.info("slash_watcher: request_expired claim_id=%s", request.claim_id.hex())
@@ -1141,6 +1150,22 @@ class SlashWatcher:
                 verdict.detail = "runtime_changed"
                 logger.warning("slash_watcher: runtime_changed; discarding envelope and retrying next tick")
                 return verdict
+            # A FRAU digest does not name the request, so the bundle must go
+            # only against the row it was signed for.
+            try:
+                pending = await asyncio.to_thread(self.client.get_settlement_request, request.claim_id)
+            except Exception as error:  # noqa: BLE001
+                verdict.outcome = ClassifierOutcome.DEFERRED
+                verdict.detail = "request_unreadable"
+                logger.warning("slash_watcher: rereading claim %s... raised %s; not slashing",
+                               request.claim_id.hex()[:16], type(error).__name__)
+                return verdict
+            if pending is None or PendingBondedRequest(**pending) != request:
+                verdict.outcome = ClassifierOutcome.DEFERRED
+                verdict.detail = "request_changed"
+                logger.warning("slash_watcher: claim %s... no longer holds the request the bundle was signed for",
+                               request.claim_id.hex()[:16])
+                return verdict
             try:
                 ext_hash = await asyncio.to_thread(
                     self.client.submit_slash_bad_settlement_evidence,
@@ -1218,7 +1243,7 @@ class SlashWatcher:
                 # Filter early: unbonded rows are not slashable. The
                 # settle attestor handles them via the STCA path.
                 continue
-            if request_expired(req, context):
+            if past_slash_window(req, context):
                 continue
             bonded.append(req)
 
@@ -1249,40 +1274,10 @@ class SlashWatcher:
                 )
 
     async def _run_forever(self) -> None:
-        while self._running:
+        async def poll(chain_id: bytes) -> None:
             await self._report_status()
-            live_chain_id_hex = await asyncio.to_thread(
-                self.client.get_genesis_hash
-            )
-            if not live_chain_id_hex:
-                logger.info(
-                    "slash_watcher: substrate genesis not yet available "
-                    "— skipping tick"
-                )
-            else:
-                try:
-                    chain_id = bytes.fromhex(
-                        live_chain_id_hex.removeprefix("0x")
-                    )
-                except ValueError:
-                    logger.warning(
-                        f"slash_watcher: malformed live genesis "
-                        f"{live_chain_id_hex!r} — skipping tick"
-                    )
-                    chain_id = b""
-                if len(chain_id) == 32:
-                    try:
-                        await self._tick(chain_id)
-                    except Exception as e:  # noqa: BLE001
-                        logger.error(
-                            f"slash_watcher: tick raised "
-                            f"{type(e).__name__}: {e}",
-                            exc_info=True,
-                        )
-            try:
-                await asyncio.sleep(self._poll_interval)
-            except asyncio.CancelledError:
-                break
+            await self._tick(chain_id)
+        await poll_forever("slash_watcher", self.client, self._poll_interval, lambda: self._running, poll)
 
     def start(self) -> None:
         """Schedule the background loop on the running event loop.

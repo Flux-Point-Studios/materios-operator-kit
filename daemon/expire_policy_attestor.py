@@ -117,9 +117,9 @@ from daemon.settle_claim_attestor import (
     CARDANO_MAINNET_GENESIS_HASH,
     CARDANO_PREPROD_GENESIS_HASH,
     CARDANO_PREVIEW_GENESIS_HASH,
-    CardanoTxObservation,
     CardanoTxObserver,
     NETWORK_MAGIC_TO_GENESIS_HASH,
+    poll_forever,
 )
 
 logger = logging.getLogger(__name__)
@@ -726,39 +726,7 @@ class ExpirePolicyAttestor:
         await asyncio.gather(*coros, return_exceptions=True)
 
     async def _run_forever(self) -> None:
-        while self._running:
-            live_chain_id_hex = await asyncio.to_thread(
-                self.client.get_genesis_hash
-            )
-            if not live_chain_id_hex:
-                logger.info(
-                    "expire_attestor: substrate genesis not yet available "
-                    "— skipping tick"
-                )
-            else:
-                try:
-                    chain_id = bytes.fromhex(
-                        live_chain_id_hex.removeprefix("0x")
-                    )
-                except ValueError:
-                    logger.warning(
-                        f"expire_attestor: malformed live genesis "
-                        f"{live_chain_id_hex!r} — skipping tick"
-                    )
-                    chain_id = b""
-                if len(chain_id) == 32:
-                    try:
-                        await self._tick(chain_id)
-                    except Exception as e:  # noqa: BLE001
-                        logger.error(
-                            f"expire_attestor: tick raised "
-                            f"{type(e).__name__}: {e}",
-                            exc_info=True,
-                        )
-            try:
-                await asyncio.sleep(self._poll_interval)
-            except asyncio.CancelledError:
-                break
+        await poll_forever("expire_attestor", self.client, self._poll_interval, lambda: self._running, self._tick)
 
     def start(self) -> None:
         """Schedule the background loop on the running event loop.

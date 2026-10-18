@@ -118,9 +118,24 @@ lagging watchers can temporarily select different protocols.
 
 `SettlementRequestTtl` is decoded as u32 from that same metadata. A request
 is expired exactly when `submitted_block + ttl < current_block`; equality
-remains eligible. Expired rows are filtered before dispatch and checked
-again before signing and after acquiring the shared write lock. They cannot
-repeatedly send failed extrinsics while occupying that lock.
+remains eligible. On an FRV2 runtime the pallet (settlement `0757de3`)
+refuses to slash an expired request, so expired rows are filtered before
+dispatch and checked again before signing and after acquiring the shared
+write lock; they cannot repeatedly send failed extrinsics while occupying
+that lock. On spec 239 (FRAU, settlement `c60b98f`) the pallet slashes a
+request of any age and removes one only by attesting or slashing it, so
+there an expired fraudulent request stays slashable and is not filtered.
+
+Under the write lock the watcher also rereads the pending request and
+submits only if it is the row the bundle was signed for. A FRAU digest does
+not name the request, so without this a bundle signed for one request could
+slash its replacement.
+
+The settle, expire and slash loops share one poll loop. A failed read of the
+genesis hash is logged and retried after a delay that doubles from the poll
+interval up to 300 s, and a failed tick is logged; neither ends the loop. A
+failed read of the pending requests raises instead of reading as "no
+requests", so per-request state such as the supersede backoff survives it.
 
 ## Quorum and upgrade races
 

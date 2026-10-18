@@ -517,3 +517,25 @@ def test_each_reason_not_to_supersede_is_logged_once_per_claim(caplog):
     assert len(notes) == 2
     assert "supersede_unsupported" in notes[0] and "unverified:voucher" in notes[1]
 
+
+
+@pytest.mark.parametrize("error", [TimeoutError("rpc"), ConnectionError("ws"), ValueError("decode")])
+def test_a_failed_listing_raises_instead_of_reading_as_no_requests(error):
+    def failing(*args, **kwargs):
+        raise error
+    client = rpc({"query_map": failing})
+    with pytest.raises(type(error)):
+        client.list_pending_settlement_requests()
+
+
+def test_a_failed_listing_keeps_every_backoff():
+    request = junk_request()
+    chain = Chain(request, committee=(ALICE,), threshold=1)
+    chain.fail_submissions = True
+    att = attestor(chain.client(ALICE))
+    asyncio.run(att._tick(CHAIN_ID))
+    before = dict(att._supersede_backoff)
+    assert CLAIM_ID in before
+    att.client.list_pending_settlement_requests.side_effect = TimeoutError("rpc")
+    asyncio.run(att._tick(CHAIN_ID))
+    assert att._supersede_backoff == before

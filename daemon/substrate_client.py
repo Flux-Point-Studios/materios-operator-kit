@@ -1019,26 +1019,13 @@ class SubstrateClient:
         unbonded rows are skipped before the L1 observation pass.
         """
         out: list[dict] = []
-        try:
-            rows = self._call(
-                "query_map",
-                module="IntentSettlement",
-                storage_function="ClaimSettlementRequests",
-            )
-        except SubstrateRequestException as e:
-            logger.warning(
-                f"list_pending_settlement_requests: query_map raised "
-                f"{type(e).__name__}: {e}"
-            )
-            return out
-        except Exception as e:  # noqa: BLE001
-            # Older runtime versions without the pallet wired return a
-            # "module not found" — that's a soft-disable, not an error.
-            logger.info(
-                f"list_pending_settlement_requests: no IntentSettlement "
-                f"module on chain ({type(e).__name__}: {e}); skipping tick"
-            )
-            return out
+        # A failed read raises: callers must not take it for "no requests"
+        # and forget what they track per request.
+        rows = self._call(
+            "query_map",
+            module="IntentSettlement",
+            storage_function="ClaimSettlementRequests",
+        )
         for key, value in rows:
             try:
                 claim_id_b = _to_bytes32(key.value)

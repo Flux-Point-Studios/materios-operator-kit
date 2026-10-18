@@ -11,7 +11,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ['tests/test_slash_runtime.py', 'tests/test_frv2_vectors.py', 'tests/test_settle_supersede.py',
          'tests/test_slash_proof.py', 'tests/test_slash_watcher.py', 'tests/test_multisig_aggregator.py',
-         'tests/test_settlement_submits.py']
+         'tests/test_settlement_submits.py', 'tests/test_poll_loop.py']
 MUTANTS = [
     ('wrong-chain-accepted', 'daemon/substrate_client.py', 'if version["specName"] != "materios":', 'if False:'),
     ('unknown-contract-uses-frau', 'daemon/substrate_client.py', 'if SLASH_PROTOCOLS.get(fingerprint) != expected:', 'if fingerprint in SLASH_PROTOCOLS and SLASH_PROTOCOLS[fingerprint] != expected:'),
@@ -41,7 +41,7 @@ MUTANTS = [
     ('runtime-error-fallback', 'daemon/slash_watcher.py', '                             type(error).__name__)\n            return None\n', '                             type(error).__name__)\n            return dict(protocol="FRAU", block_number=101, ttl=2400, spec_version=239)\n'),
     ('expiry-disabled', 'daemon/settle_claim_attestor.py', 'return request.submitted_block + context["ttl"] < context["block_number"]', 'return False'),
     ('expiry-equality-rejected', 'daemon/settle_claim_attestor.py', 'context["ttl"] < context["block_number"]', 'context["ttl"] <= context["block_number"]'),
-    ('expired-tick-filter-disabled', 'daemon/slash_watcher.py', 'if request_expired(req, context):', 'if False:'),
+    ('expired-tick-filter-disabled', 'daemon/slash_watcher.py', 'if past_slash_window(req, context):', 'if False:'),
     ('post-observe-check-disabled', 'daemon/slash_watcher.py', 'context = await self._request_context(request, verdict)\n        if context is None:', 'context = dict(protocol="FRAU", block_number=101, ttl=10)\n        if context is None:'),
     ('post-lock-check-disabled', 'daemon/slash_watcher.py', 'current = await self._request_context(request, verdict)', 'current = context'),
     ('upgrade-bundle-accepted', 'daemon/slash_watcher.py', 'if current["protocol"] != context["protocol"]:', 'if False:'),
@@ -96,6 +96,13 @@ MUTANTS = [
     ('coverage-metric-constant', 'daemon/slash_watcher.py', 'slash_kupo_coverage_ok=int(gap is None)', 'slash_kupo_coverage_ok=1'),
     ('status-not-polled', 'daemon/slash_watcher.py', '            await self._report_status()\n', '            pass\n'),
     ('supersede-skips-silent', 'daemon/settle_claim_attestor.py', '            logger.info("settle_attestor: not superseding claim_id=%s...: %s",', '            logger.debug("settle_attestor: not superseding claim_id=%s...: %s",'),
+    ('genesis-read-unguarded', 'daemon/settle_claim_attestor.py', '            failures += 1\n', '            raise\n'),
+    ('genesis-backoff-flat', 'daemon/settle_claim_attestor.py', 'delay = min(poll_interval * 2 ** failures, GENESIS_RETRY_MAX_SECONDS)', 'delay = poll_interval'),
+    ('genesis-backoff-uncapped', 'daemon/settle_claim_attestor.py', 'delay = min(poll_interval * 2 ** failures, GENESIS_RETRY_MAX_SECONDS)', 'delay = poll_interval * 2 ** failures'),
+    ('listing-swallows-errors', 'daemon/substrate_client.py', '        rows = self._call(\n            "query_map",\n            module="IntentSettlement",\n            storage_function="ClaimSettlementRequests",\n        )\n', '        try:\n            rows = self._call(\n                "query_map",\n                module="IntentSettlement",\n                storage_function="ClaimSettlementRequests",\n            )\n        except Exception:\n            return out\n'),
+    ('slash-sent-against-replacement', 'daemon/slash_watcher.py', 'if pending is None or PendingBondedRequest(**pending) != request:', 'if pending is None:'),
+    ('slash-reread-ignored', 'daemon/slash_watcher.py', 'if pending is None or PendingBondedRequest(**pending) != request:', 'if False:'),
+    ('frau-expiry-filtered', 'daemon/slash_watcher.py', 'return context["protocol"] == "FRV2" and request_expired(request, context)', 'return request_expired(request, context)'),
 ]
 
 

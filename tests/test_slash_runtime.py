@@ -1,6 +1,6 @@
 import asyncio
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -29,6 +29,7 @@ def context(protocol='FRAU', block=101, ttl=10):
 def setup_watcher(ctx=None, aggregator=None):
     client = _make_substrate_client_stub()
     client.get_settlement_runtime_context = MagicMock(return_value=ctx or context())
+    client.get_settlement_request = MagicMock(side_effect=lambda claim_id: asdict(request))
     client.keypair = MagicMock(wraps=Keypair.create_from_uri('//Alice'))
     client.keypair.public_key = Keypair.create_from_uri('//Alice').public_key
     observer = SimpleNamespace(observe=AsyncMock(return_value=_make_observation(matched_lovelace=4)),
@@ -511,8 +512,12 @@ def test_unavailable_context_does_not_sign_and_alerts(error, caplog):
     assert 'settlement runtime unavailable' in caplog.text
 
 
-@pytest.mark.parametrize('protocol', ['FRAU', 'FRV2'])
-@pytest.mark.parametrize('block,expected', [(109, True), (110, True), (111, False)])
+@pytest.mark.parametrize('protocol, block, expected', [
+    ('FRV2', 109, True), ('FRV2', 110, True), ('FRV2', 111, False),
+    # Spec 239's pallet (settlement c60b98f) never refuses to slash an
+    # expired request, and only attesting or slashing removes it.
+    ('FRAU', 110, True), ('FRAU', 111, True), ('FRAU', 10**6, True),
+])
 def test_expiry_boundary(protocol, block, expected):
     watcher, client, observer, req = setup_watcher(context(protocol, block))
     verdict = asyncio.run(watcher.process_one(req, CHAIN_ID))
@@ -524,7 +529,7 @@ def test_expiry_boundary(protocol, block, expected):
 
 
 def test_expired_rows_never_repeat_submits_or_take_write_lock():
-    watcher, client, observer, req = setup_watcher(context(block=111))
+    watcher, client, observer, req = setup_watcher(context('FRV2', block=111))
     client.list_pending_settlement_requests.return_value = [asdict(req)]
     watcher.process_one = AsyncMock()
     async def run():
@@ -540,12 +545,12 @@ def test_expired_rows_never_repeat_submits_or_take_write_lock():
 @pytest.mark.parametrize('change', ['expired', 'upgrade', 'unavailable'])
 def test_runtime_or_expiry_changes_defer(when, change, caplog):
     agg = SimpleNamespace(assemble_envelope=AsyncMock())
-    watcher, client, observer, req = setup_watcher(aggregator=agg)
+    watcher, client, observer, req = setup_watcher(context('FRV2' if change == 'expired' else 'FRAU'), aggregator=agg)
     def mutate():
         if change == 'unavailable':
             client.get_settlement_runtime_context.side_effect = ValueError('')
         else:
-            client.get_settlement_runtime_context.return_value = context('FRV2' if change == 'upgrade' else 'FRAU', 111 if change == 'expired' else 102)
+            client.get_settlement_runtime_context.return_value = context('FRV2', 111 if change == 'expired' else 102)
     async def observe(*args):
         if when == 'observe':
             mutate()
@@ -641,10 +646,10 @@ def test_unknown_runtime_stops_entire_tick(caplog):
 
 def test_zero_ttl_is_read_from_chain_and_only_same_block_is_valid():
     assert rpc_client(metadata(ttl=0)).get_settlement_runtime_context()['ttl'] == 0
-    watcher, client, _, req = setup_watcher(context(block=101, ttl=0))
+    watcher, client, _, req = setup_watcher(context('FRV2', block=101, ttl=0))
     assert asyncio.run(watcher.process_one(req, CHAIN_ID)).detail == 'request_expired'
     client.submit_slash_bad_settlement_evidence.assert_not_called()
-    client.get_settlement_runtime_context.return_value = context(block=100, ttl=0)
+    client.get_settlement_runtime_context.return_value = context('FRV2', block=100, ttl=0)
     assert asyncio.run(watcher.process_one(req, CHAIN_ID)).extrinsic_hash
 
 
@@ -731,3 +736,36 @@ def test_every_poll_reports_status_before_looking_at_requests(monkeypatch):
     watcher._running = True
     asyncio.run(watcher._run_forever())
     assert order == ["status", "tick"]
+
+
+@pytest.mark.parametrize('protocol', ['FRAU', 'FRV2'])
+@pytest.mark.parametrize('pending', ['replaced', 'gone', 'unreadable'])
+def test_a_slash_is_sent_only_against_the_request_it_was_signed_for(protocol, pending):
+    # Under FRAU the digest does not name the request, so a bundle signed for
+    # one request would slash its replacement.
+    watcher, client, _, req = setup_watcher(context(protocol))
+    if pending == 'replaced':
+        client.get_settlement_request.side_effect = lambda claim_id: asdict(replace(req, submitted_block=101))
+    elif pending == 'gone':
+        client.get_settlement_request.side_effect = lambda claim_id: None
+    else:
+        client.get_settlement_request.side_effect = TimeoutError('rpc')
+    verdict = asyncio.run(watcher.process_one(req, CHAIN_ID))
+    assert verdict.detail == ('request_unreadable' if pending == 'unreadable' else 'request_changed')
+    client.submit_slash_bad_settlement_evidence.assert_not_called()
+
+
+def test_the_pending_request_is_reread_under_the_write_lock():
+    watcher, client, _, req = setup_watcher(context('FRAU'))
+    locked = []
+
+    class Lock:
+        async def __aenter__(self):
+            locked.append(True)
+
+        async def __aexit__(self, *args):
+            locked.clear()
+            return False
+    watcher._chain_write_lock = Lock()
+    client.get_settlement_request.side_effect = lambda claim_id: locked and asdict(req)
+    assert asyncio.run(watcher.process_one(req, CHAIN_ID)).extrinsic_hash

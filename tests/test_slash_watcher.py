@@ -49,6 +49,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -187,6 +188,20 @@ def _make_observer_stub(observation: SlashObservation):
     )
 
 
+class _ChainHoldsEachRequest(SlashWatcher):
+    """The chain still holds each processed request when the watcher rereads
+    it under the write lock, unless the test scripts that read itself."""
+
+    async def process_one(self, request, live_chain_id):
+        if not hasattr(self.client, "get_settlement_request"):
+            self.client.get_settlement_request = MagicMock(return_value=asdict(request))
+            try:
+                return await super().process_one(request, live_chain_id)
+            finally:
+                del self.client.get_settlement_request
+        return await super().process_one(request, live_chain_id)
+
+
 def _make_watcher(
     *,
     substrate_client,
@@ -200,7 +215,7 @@ def _make_watcher(
         kupo_url="http://kupo.test",
     )
     chain_lock = asyncio.Lock()
-    return SlashWatcher(
+    return _ChainHoldsEachRequest(
         config=config,
         substrate_client=substrate_client,
         chain_write_lock=chain_lock,
