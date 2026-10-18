@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Run targeted slash-safety mutants in isolated copies of the test suite."""
+from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import shutil
@@ -37,7 +38,7 @@ MUTANTS = [
     ('unknown-protocol-accepted', 'daemon/settle_claim_attestor.py', 'if context["protocol"] not in ("FRAU", "FRV2"):', 'if False:'),
     ('malformed-supersede-accepted', 'daemon/settle_claim_attestor.py', 'if type(context["supersede"]) is not bool:', 'if False:'),
     ('malformed-context-accepted', 'daemon/settle_claim_attestor.py', 'if type(context[name]) is not int or not 0 <= context[name] < limit:', 'if False:'),
-    ('runtime-error-fallback', 'daemon/slash_watcher.py', '            return None\n\n    async def _request_context', '            return dict(protocol="FRAU", block_number=101, ttl=2400, spec_version=239)\n\n    async def _request_context'),
+    ('runtime-error-fallback', 'daemon/slash_watcher.py', '                             type(error).__name__)\n            return None\n', '                             type(error).__name__)\n            return dict(protocol="FRAU", block_number=101, ttl=2400, spec_version=239)\n'),
     ('expiry-disabled', 'daemon/settle_claim_attestor.py', 'return request.submitted_block + context["ttl"] < context["block_number"]', 'return False'),
     ('expiry-equality-rejected', 'daemon/settle_claim_attestor.py', 'context["ttl"] < context["block_number"]', 'context["ttl"] <= context["block_number"]'),
     ('expired-tick-filter-disabled', 'daemon/slash_watcher.py', 'if request_expired(req, context):', 'if False:'),
@@ -81,7 +82,7 @@ MUTANTS = [
     ('patterns-unchecked', 'daemon/slash_watcher.py', 'if "*" not in patterns:', 'if False:'),
     ('spent-canary-unchecked', 'daemon/slash_watcher.py', 'if not any(isinstance(row, dict) and row.get("spent_at") for row in rows):', 'if False:'),
     ('network-without-canary-allowed', 'daemon/slash_watcher.py', 'return "no_spent_canary_for_network"', 'return None'),
-    ('coverage-skipped-for-present-tx', 'daemon/slash_watcher.py', 'gap = await self.observer.kupo_coverage_gap()', 'gap = None'),
+    ('coverage-skipped-for-present-tx', 'daemon/slash_watcher.py', '            gap = await self.observer.kupo_coverage_gap()\n            if gap is not None:\n                verdict.outcome', '            gap = None\n            if gap is not None:\n                verdict.outcome'),
     ('network-check-off', 'daemon/slash_watcher.py', 'and observation.mainchain_genesis_hash != request.mainchain_genesis_hash', 'and False'),
     ('tx-lookup-scans', 'daemon/settle_claim_attestor.py', 'session, f"/matches/*@{cardano_tx_hash_hex}", {},', 'session, "/matches/*", {"transaction_id": cardano_tx_hash_hex},'),
     ('envelope-admits-non-members', 'daemon/multisig_aggregator.py', 'if pub in committee and _verifies(pub, sig, digest):', 'if _verifies(pub, sig, digest):'),
@@ -89,31 +90,45 @@ MUTANTS = [
     ('envelope-wrapped-bytes-accepted', 'daemon/multisig_aggregator.py', 'return sr25519.verify(sig, digest, pubkey)', 'return sr25519.verify(sig, digest, pubkey) or sr25519.verify(sig, b"<Bytes>" + digest + b"</Bytes>", pubkey)'),
     ('unreadable-committee-admits-all', 'daemon/multisig_aggregator.py', '            committee = frozenset()\n', '            committee = frozenset(pub for pub, _ in await self.fetch_envelope(session, kind=kind, key=key, digest=digest))\n'),
     ('committee-from-stake-key', 'daemon/substrate_client.py', 'raw = bytes.fromhex(account[2:] if account.startswith("0x") else ss58_decode(account))', 'raw = bytes(32)'),
+    ('runtime-announced-every-read', 'daemon/substrate_client.py', '        if self._settlement_reported != runtime:\n            self._settlement_reported = runtime\n            logger.info(', '        if True:\n            logger.info('),
+    ('refusal-reported-every-read', 'daemon/substrate_client.py', '            if self._settlement_reported != runtime:\n                self._settlement_reported = runtime\n                logger.error(', '            if True:\n                logger.error('),
+    ('refusal-metric-stale', 'daemon/substrate_client.py', 'health_server.update_metrics(settlement_slash_protocol=0, settlement_supersede_offered=0)', 'pass'),
+    ('coverage-metric-constant', 'daemon/slash_watcher.py', 'slash_kupo_coverage_ok=int(gap is None)', 'slash_kupo_coverage_ok=1'),
+    ('status-not-polled', 'daemon/slash_watcher.py', '            await self._report_status()\n', '            pass\n'),
+    ('supersede-skips-silent', 'daemon/settle_claim_attestor.py', '            logger.info("settle_attestor: not superseding claim_id=%s...: %s",', '            logger.debug("settle_attestor: not superseding claim_id=%s...: %s",'),
 ]
 
 
 def run(directory):
-    return subprocess.run([sys.executable, '-B', '-m', 'pytest', '-q', '-p', 'no:cacheprovider', *TESTS],
+    return subprocess.run([sys.executable, '-B', '-m', 'pytest', '-x', '-q', '-p', 'no:cacheprovider', *TESTS],
                           cwd=directory, capture_output=True, text=True,
-                          env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, timeout=90)
+                          env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, timeout=180)
+
+
+def mutate(name, filename, before, after):
+    """None when the suite kills the mutant, else why not."""
+    with tempfile.TemporaryDirectory(prefix='operator-kit-frv2-mutant-') as scratch:
+        scratch = Path(scratch)
+        for directory in ('daemon', 'tests'):
+            shutil.copytree(ROOT / directory, scratch / directory, ignore=shutil.ignore_patterns('__pycache__'))
+        source = scratch / filename
+        source.write_text(source.read_text().replace(before, after))
+        result = run(scratch)
+        if result.returncode != 1 or ' failed' not in result.stdout or 'ERROR collecting' in result.stdout:
+            return f'{name}: SURVIVED or invalid mutant\n{result.stdout}\n{result.stderr}'
+        return None
 
 
 if __name__ == '__main__':
+    for name, filename, before, _ in MUTANTS:
+        if (ROOT / filename).read_text().count(before) != 1:
+            sys.exit(f'{name}: expected exactly one mutation site')
     baseline = run(ROOT)
     if baseline.returncode:
         sys.exit(baseline.stdout + baseline.stderr)
-    for name, filename, before, after in MUTANTS:
-        with tempfile.TemporaryDirectory(prefix='operator-kit-frv2-mutant-') as scratch:
-            scratch = Path(scratch)
-            for directory in ('daemon', 'tests'):
-                shutil.copytree(ROOT / directory, scratch / directory, ignore=shutil.ignore_patterns('__pycache__'))
-            source = scratch / filename
-            text = source.read_text()
-            if text.count(before) != 1:
-                sys.exit(f'{name}: expected exactly one mutation site')
-            source.write_text(text.replace(before, after))
-            result = run(scratch)
-            if result.returncode != 1 or ' failed' not in result.stdout or 'ERROR collecting' in result.stdout:
-                sys.exit(f'{name}: SURVIVED or invalid mutant\n{result.stdout}\n{result.stderr}')
+    with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as pool:
+        for (name, *_), failure in zip(MUTANTS, pool.map(lambda mutant: mutate(*mutant), MUTANTS)):
+            if failure:
+                sys.exit(failure)
             print(f'KILLED {name}', flush=True)
     print(f'{len(MUTANTS)}/{len(MUTANTS)} mutants killed')

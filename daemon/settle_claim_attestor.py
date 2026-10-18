@@ -1159,6 +1159,8 @@ class SettleClaimAttestor:
         self.min_signer_threshold = max(1, int(min_signer_threshold or 1))
         # claim_id -> (consecutive failed supersedes, first block to retry at)
         self._supersede_backoff: dict[bytes, tuple[int, int]] = {}
+        # (claim_id, reason) already logged as a reason not to supersede.
+        self._supersede_notes: set[tuple[bytes, str]] = set()
 
     async def process_one(
         self, request: PendingSettlementRequest, live_chain_id: bytes
@@ -1470,6 +1472,26 @@ class SettleClaimAttestor:
         live_chain_id: bytes,
         verdict: AttestationVerdict,
     ) -> AttestationVerdict:
+        """:meth:`_try_supersede`, logging each reason a refused request is
+        not superseded once per claim."""
+        await self._try_supersede(request, obs, voucher_digest, voucher, live_chain_id, verdict)
+        reason = verdict.supersede.split(":")[0]
+        if reason not in ("superseded", "submit_failed", "awaiting_peer_sigs") and \
+                (request.claim_id, reason) not in self._supersede_notes:
+            self._supersede_notes.add((request.claim_id, reason))
+            logger.info("settle_attestor: not superseding claim_id=%s...: %s",
+                        request.claim_id.hex()[:16], verdict.supersede)
+        return verdict
+
+    async def _try_supersede(
+        self,
+        request: PendingSettlementRequest,
+        obs: CardanoTxObservation,
+        voucher_digest: bytes,
+        voucher: Optional[dict],
+        live_chain_id: bytes,
+        verdict: AttestationVerdict,
+    ) -> AttestationVerdict:
         """Replace a request this attestor refused with the evidence it observed.
 
         Reached only after the genesis, transaction, amount and voucher digest
@@ -1587,6 +1609,7 @@ class SettleClaimAttestor:
         pending = {r.get("claim_id") for r in requests if isinstance(r, dict)}
         for claim in set(self._supersede_backoff) - pending:
             del self._supersede_backoff[claim]
+        self._supersede_notes = {note for note in self._supersede_notes if note[0] in pending}
         if not requests:
             return
         logger.info(

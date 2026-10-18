@@ -499,3 +499,21 @@ def test_the_supersede_call_encodes_against_the_spec_242_runtime():
     assert args["evidence"] == SUPERSEDE_PARAMS["evidence"]
     assert args["settled_direct"] is True
     assert [tuple(pair) for pair in args["signatures"]] == SUPERSEDE_PARAMS["signatures"]
+
+
+def test_each_reason_not_to_supersede_is_logged_once_per_claim(caplog):
+    caplog.set_level("INFO")
+    request = junk_request()
+    chain = Chain(request, committee=(ALICE,), threshold=1)
+    chain.context = context(supersede=False)
+    att = attestor(chain.client(ALICE))
+    for _ in range(3):
+        asyncio.run(att.process_one(request, CHAIN_ID))
+    chain.voucher = None
+    chain.context = context()
+    for _ in range(2):
+        asyncio.run(att.process_one(request, CHAIN_ID))
+    notes = [r.getMessage() for r in caplog.records if "not superseding" in r.getMessage()]
+    assert len(notes) == 2
+    assert "supersede_unsupported" in notes[0] and "unverified:voucher" in notes[1]
+

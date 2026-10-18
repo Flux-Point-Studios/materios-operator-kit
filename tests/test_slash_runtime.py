@@ -32,7 +32,7 @@ def setup_watcher(ctx=None, aggregator=None):
     client.keypair = MagicMock(wraps=Keypair.create_from_uri('//Alice'))
     client.keypair.public_key = Keypair.create_from_uri('//Alice').public_key
     observer = SimpleNamespace(observe=AsyncMock(return_value=_make_observation(matched_lovelace=4)),
-                               kupo_coverage_gap=AsyncMock(return_value=None))
+                               kupo_coverage_gap=AsyncMock(return_value=None), kupo_url="http://kupo.test")
     watcher = sw.SlashWatcher(config=SimpleNamespace(), substrate_client=client,
                               chain_write_lock=asyncio.Lock(), observer=observer,
                               aggregator=aggregator, min_signer_threshold=2 if aggregator else 1)
@@ -104,6 +104,7 @@ def rpc_client(meta=None, spec=239, spec_name='materios', code=CODE):
     client = object.__new__(SubstrateClient)
     client._read = object()
     client._settlement_contract = None
+    client._settlement_reported = None
     client.head = SimpleNamespace(meta=meta or metadata(), code=code)
     def call(method, *args, **kwargs):
         assert kwargs['conn'] is client._read
@@ -132,7 +133,7 @@ def methods(client):
 def test_runtime_detects_exact_metadata_at_head(protocol):
     client = rpc_client(metadata(protocol))
     result = client.get_settlement_runtime_context()
-    assert result == context(protocol.upper()) | {'block_hash': HEAD}
+    assert result == context(protocol.upper()) | {'block_hash': HEAD, 'fingerprint': FINGERPRINTS[protocol]}
     assert methods(client) == ['get_chain_head', 'get_block_runtime_version', 'get_block_number',
                                'rpc_request', 'get_block_metadata']
 
@@ -645,3 +646,88 @@ def test_zero_ttl_is_read_from_chain_and_only_same_block_is_valid():
     client.submit_slash_bad_settlement_evidence.assert_not_called()
     client.get_settlement_runtime_context.return_value = context(block=100, ttl=0)
     assert asyncio.run(watcher.process_one(req, CHAIN_ID)).extrinsic_hash
+
+
+# --- what an operator sees -----------------------------------------------------
+
+from daemon import health_server  # noqa: E402
+
+FINGERPRINTS = {"frau": "96dfe9b41a5471b578e065d9e3055a359e27e9a6576f94b1f932bd668219e85c",
+                "frv2": "693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7"}
+
+
+def detections(caplog):
+    return [r.getMessage() for r in caplog.records if "settlement runtime" in r.getMessage()]
+
+
+@pytest.mark.parametrize("protocol, supersede, gauge", [("frau", False, 1), ("frv2", True, 2)])
+def test_each_runtime_is_announced_once_with_what_it_selects(protocol, supersede, gauge, caplog):
+    caplog.set_level("INFO")
+    client = rpc_client(metadata(protocol), spec=242 if supersede else 239)
+    for _ in range(3):
+        client.get_settlement_runtime_context()
+    [line] = detections(caplog)
+    assert f"protocol={protocol.upper()}" in line and f"supersede={supersede}" in line
+    assert f"fingerprint={FINGERPRINTS[protocol]}" in line and f"spec={242 if supersede else 239}" in line
+    assert "ttl=10" in line and "min_finality_depth=15" in line
+    assert health_server._metrics["settlement_slash_protocol"] == gauge
+    assert health_server._metrics["settlement_supersede_offered"] == int(supersede)
+    assert health_server._metrics["settlement_runtime_spec_version"] == (242 if supersede else 239)
+
+
+def test_an_upgrade_is_announced_and_a_refusal_is_reported_once_per_runtime(caplog):
+    caplog.set_level("INFO")
+    client = rpc_client(metadata('frau'))
+    client.get_settlement_runtime_context()
+    v14 = fixture('frv2')
+    set_constant(v14, 'SlashSettlementTag', b'FRV3')
+    client.head = SimpleNamespace(meta=metadata(v14=v14), code='0x' + 'c1' * 32)
+    for _ in range(3):
+        with pytest.raises(ValueError, match='settlement runtime'):
+            client.get_settlement_runtime_context()
+    refusals = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(refusals) == 1 and "0x46525633" in refusals[0].getMessage()
+    assert health_server._metrics["settlement_slash_protocol"] == 0
+    assert health_server._metrics["settlement_supersede_offered"] == 0
+    client.head = SimpleNamespace(meta=metadata('frv2'), code='0x' + 'c2' * 32)
+    client.get_settlement_runtime_context()
+    assert "protocol=FRV2" in detections(caplog)[-1]
+    assert health_server._metrics["settlement_slash_protocol"] == 2
+
+
+def test_the_watcher_reports_runtime_and_kupo_coverage_on_change_even_when_idle(caplog):
+    caplog.set_level("INFO")
+    watcher, client, observer, _ = setup_watcher(context('FRV2'))
+    observer.kupo_coverage_gap = AsyncMock(side_effect=["patterns_without_*:4", "patterns_without_*:4", None])
+    for _ in range(3):
+        asyncio.run(watcher._report_status())
+    assert client.get_settlement_runtime_context.call_count == 3
+    coverage = [r for r in caplog.records if "Kupo" in r.getMessage()]
+    assert [r.levelname for r in coverage] == ["WARNING", "INFO"]
+    assert "patterns_without_*:4" in coverage[0].getMessage()
+    assert health_server._metrics["slash_kupo_coverage_ok"] == 1
+
+
+def test_a_failing_status_probe_is_logged_and_survived(caplog):
+    watcher, client, observer, _ = setup_watcher()
+    client.get_settlement_runtime_context.side_effect = ValueError('')
+    observer.kupo_coverage_gap = AsyncMock(side_effect=OSError('kupo down'))
+    for _ in range(2):
+        asyncio.run(watcher._report_status())
+    assert health_server._metrics["slash_kupo_coverage_ok"] == 0
+    assert sum("settlement runtime unavailable" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_every_poll_reports_status_before_looking_at_requests(monkeypatch):
+    watcher, client, _, _ = setup_watcher()
+    order = []
+    watcher._report_status = AsyncMock(side_effect=lambda: order.append("status"))
+    watcher._tick = AsyncMock(side_effect=lambda chain_id: order.append("tick"))
+    client.get_genesis_hash = MagicMock(return_value="0x" + "11" * 32)
+
+    async def stop_after_one_poll(seconds):
+        watcher._running = False
+    monkeypatch.setattr(sw.asyncio, "sleep", stop_after_one_poll)
+    watcher._running = True
+    asyncio.run(watcher._run_forever())
+    assert order == ["status", "tick"]

@@ -31,6 +31,8 @@ SLASH_PROTOCOLS = {
     "693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7": "FRV2",
 }
 SUPERSEDE_ARGS = ["claim_id", "settled_direct", "evidence", "signatures"]
+# settlement_slash_protocol metric: 0 means the runtime is refused.
+SLASH_PROTOCOL_GAUGE = {"FRAU": 1, "FRV2": 2}
 RUNTIME_CODE_KEY = "0x" + b":code".hex()
 
 
@@ -372,6 +374,8 @@ class SubstrateClient:
         self._read = _WsConn("read")
         # (runtime code hash, its settlement contract) from the last metadata read.
         self._settlement_contract: Optional[tuple[str, dict]] = None
+        # The runtime whose settlement contract, or refusal, was last logged.
+        self._settlement_reported: Optional[str] = None
         # Bounded-timeout + reconnect knobs (tasks #288 + #156). Each is
         # overridable via env so operators can tune in prod without a
         # re-deploy; the defaults are conservative.
@@ -718,13 +722,17 @@ class SubstrateClient:
         the reviewed contracts.
 
         Metadata is a function of the runtime code alone, so its parse is kept
-        for the ``:code`` hash at the head and redone once that hash changes."""
+        for the ``:code`` hash at the head and redone once that hash changes.
+        Each runtime's selection, or refusal, is logged once and exported as
+        the ``settlement_*`` metrics."""
         head = self._call("get_chain_head", conn=self._read)
         version = self._call("get_block_runtime_version", head, conn=self._read)
         block = self._call("get_block_number", head, conn=self._read)
         code_hash = self._call(
             "rpc_request", "state_getStorageHash", [RUNTIME_CODE_KEY, head], conn=self._read
         ).get("result")
+        spec = version.get("specVersion") if isinstance(version, dict) else None
+        runtime = code_hash or f"spec {spec}"
         try:
             if version["specName"] != "materios":
                 raise ValueError("unexpected spec name")
@@ -736,9 +744,25 @@ class SubstrateClient:
                 if code_hash:
                     self._settlement_contract = (code_hash, contract)
         except (KeyError, TypeError, ValueError, StopIteration, AttributeError) as error:
-            logger.error("settlement runtime at %s refused: %s: %s", head, type(error).__name__, error)
+            health_server.update_metrics(settlement_slash_protocol=0, settlement_supersede_offered=0)
+            if self._settlement_reported != runtime:
+                self._settlement_reported = runtime
+                logger.error("settlement runtime spec %s (code %s) refused: %s: %s; nothing will be signed",
+                             spec, code_hash, type(error).__name__, error)
             raise ValueError("unknown settlement runtime metadata or TTL") from error
-        return dict(block_hash=head, block_number=block, spec_version=version["specVersion"], **contract)
+        health_server.update_metrics(
+            settlement_slash_protocol=SLASH_PROTOCOL_GAUGE[contract["protocol"]],
+            settlement_supersede_offered=int(contract["supersede"]),
+            settlement_runtime_spec_version=spec,
+        )
+        if self._settlement_reported != runtime:
+            self._settlement_reported = runtime
+            logger.info(
+                "settlement runtime spec=%s (code %s): protocol=%s supersede=%s fingerprint=%s ttl=%d "
+                "min_finality_depth=%d", spec, code_hash, contract["protocol"], contract["supersede"],
+                contract["fingerprint"], contract["ttl"], contract["min_finality_depth"],
+            )
+        return dict(block_hash=head, block_number=block, spec_version=spec, **contract)
 
     def _read_settlement_contract(self, head: str) -> dict:
         # get_constant/get_metadata_call_function select the parent's runtime
@@ -747,8 +771,10 @@ class SubstrateClient:
         v14 = metadata.value[1]["V14"]
         constants = {c.name: bytes(c.constant_value)
                      for c in metadata.get_metadata_pallet("IntentSettlement").constants}
+        fingerprint = slash_contract_fingerprint(v14)
         return dict(
-            protocol=select_slash_protocol(slash_contract_fingerprint(v14), constants.get("SlashSettlementTag")),
+            protocol=select_slash_protocol(fingerprint, constants.get("SlashSettlementTag")),
+            fingerprint=fingerprint,
             supersede=supersede_offered(v14, constants.get("AttestSettleTag")),
             ttl=_u32_constant(constants, "SettlementRequestTtl"),
             min_finality_depth=_u32_constant(constants, "MinFinalityDepth"),

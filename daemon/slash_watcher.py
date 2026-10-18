@@ -26,6 +26,8 @@ from typing import Any, Optional, Union
 import aiohttp
 from scalecodec.utils.ss58 import ss58_decode
 
+from daemon import health_server
+
 # Reuse the Cardano follower built for the settle path. The slash
 # watcher has the SAME L1 observation needs (tip, genesis, tx slot,
 # tx depth, per-output amounts + beneficiary payment-hash) so we use
@@ -836,13 +838,43 @@ class SlashWatcher:
         # Pending request (as a tuple) -> Cardano tip height of its tx's
         # first proven absence.
         self._absences: dict[tuple, int] = {}
+        # Last logged runtime-context error and Kupo coverage gap, so each
+        # change is logged once.
+        self._context_error: Optional[str] = None
+        self._coverage_reported: Optional[str] = "unreported"
 
     async def _runtime_context(self) -> Optional[dict]:
         try:
-            return checked_runtime_context(await asyncio.to_thread(self.client.get_settlement_runtime_context))
+            context = checked_runtime_context(await asyncio.to_thread(self.client.get_settlement_runtime_context))
         except Exception as error:
-            logger.error("slash_watcher: settlement runtime unavailable (%s); refusing to sign or submit", type(error).__name__)
+            if self._context_error != type(error).__name__:
+                self._context_error = type(error).__name__
+                logger.error("slash_watcher: settlement runtime unavailable (%s); refusing to sign or submit",
+                             type(error).__name__)
             return None
+        self._context_error = None
+        return context
+
+    async def _report_status(self) -> None:
+        """Reads the runtime context, which the client announces once per
+        runtime, and whether Kupo can prove fraud, logged when it changes and
+        exported as ``slash_kupo_coverage_ok``. Runs every poll, pending
+        requests or not."""
+        await self._runtime_context()
+        try:
+            gap = await self.observer.kupo_coverage_gap()
+        except Exception as error:  # noqa: BLE001
+            gap = f"probe_failed:{type(error).__name__}"
+        health_server.update_metrics(slash_kupo_coverage_ok=int(gap is None))
+        if gap == self._coverage_reported:
+            return
+        self._coverage_reported = gap
+        if gap is None:
+            logger.info("slash_watcher: Kupo at %s indexes every address and keeps spent outputs; it can prove fraud",
+                        self.observer.kupo_url)
+        else:
+            logger.warning("slash_watcher: Kupo at %s cannot prove fraud (%s); no slash will be signed",
+                           self.observer.kupo_url, gap)
 
     async def _request_context(self, request: PendingBondedRequest, verdict: SlashVerdict) -> Optional[dict]:
         context = await self._runtime_context()
@@ -1218,6 +1250,7 @@ class SlashWatcher:
 
     async def _run_forever(self) -> None:
         while self._running:
+            await self._report_status()
             live_chain_id_hex = await asyncio.to_thread(
                 self.client.get_genesis_hash
             )
