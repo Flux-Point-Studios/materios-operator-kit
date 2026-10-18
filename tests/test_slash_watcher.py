@@ -62,7 +62,6 @@ from daemon.slash_watcher import (
     FRAUD_DISCRIMINANT_TX_NOT_FOUND,
     FRAUD_DISCRIMINANT_WRONG_AMOUNT,
     FRAUD_DISCRIMINANT_WRONG_BENEFICIARY,
-    KUPO_SYNC_SAFETY_MARGIN_SLOTS,
     PendingBondedRequest,
     SlashObservation,
     SlashVerdict,
@@ -179,8 +178,10 @@ def _make_observation(
 
 
 def _make_observer_stub(observation: SlashObservation):
+    """An observer whose Kupo indexes every address and keeps spent outputs."""
     return SimpleNamespace(
         observe=AsyncMock(return_value=observation),
+        kupo_coverage_gap=AsyncMock(return_value=None),
         ogmios_url="http://ogmios.test",
         kupo_url="http://kupo.test",
     )
@@ -459,14 +460,7 @@ class TestClassifyFraud:
             matched_lovelace=None,
             actual_beneficiary_hash=None,
         )
-        # Supply a checkpoint slot well above
-        # request.observed_slot + KUPO_SYNC_SAFETY_MARGIN_SLOTS so
-        # the sync gate clears and the classifier promotes to
-        # TxNotFound.
-        proof = classify_fraud(
-            req, obs,
-            kupo_checkpoint_slot=OBSERVED_SLOT + 10_000,
-        )
+        proof = classify_fraud(req, obs, absence_proven=True)
         assert isinstance(proof, TxNotFound)
 
     def test_classify_wrong_amount(self):
@@ -1715,153 +1709,29 @@ class TestFirstPaymentHashSkipsBeneficiary:
 
 
 class TestKupoSyncGate:
-    """Vuln 3 — gate empty-Kupo TxNotFound promotion on the local
-    follower being demonstrably caught up.
-    """
+    """An empty Kupo answer is a TxNotFound only once the dispatcher has
+    proven the absence (tests/test_slash_proof.py covers the proof)."""
 
-    def test_kupo_behind_request_depth_defers(self):
-        """Kupo returns empty matches AND the /health checkpoint is
-        below request.observed_slot. Classifier MUST defer (return
-        None), NOT promote to TxNotFound.
-        """
-        req = _default_pending_request()
+    def test_unproven_absence_is_not_a_proof(self):
         obs = _make_observation(
             mismatches=["kupo_no_matches_for_tx"],
             matched_lovelace=None,
             actual_beneficiary_hash=None,
         )
-        # Checkpoint well below request.observed_slot — follower mid-
-        # resync.
-        proof = classify_fraud(
-            req, obs,
-            kupo_checkpoint_slot=req.observed_slot - 100,
-        )
-        assert proof is None, (
-            f"classifier must defer when Kupo checkpoint is behind "
-            f"request.observed_slot; got {proof!r}"
-        )
-        assert "kupo_behind_request_depth" in obs.mismatches
+        assert classify_fraud(_default_pending_request(), obs) is None
 
-    def test_kupo_checkpoint_exactly_at_threshold_still_defers(self):
-        """Boundary check: checkpoint == request.observed_slot +
-        margin - 1 is STILL behind. The gate uses `<` not `<=` →
-        any value strictly below the threshold defers.
-        """
-        req = _default_pending_request()
+    def test_proven_absence_is_tx_not_found(self):
         obs = _make_observation(
             mismatches=["kupo_no_matches_for_tx"],
             matched_lovelace=None,
             actual_beneficiary_hash=None,
         )
-        proof = classify_fraud(
-            req, obs,
-            kupo_checkpoint_slot=(
-                req.observed_slot + KUPO_SYNC_SAFETY_MARGIN_SLOTS - 1
-            ),
-        )
-        assert proof is None
-        assert "kupo_behind_request_depth" in obs.mismatches
+        proof = classify_fraud(_default_pending_request(), obs, absence_proven=True)
+        assert isinstance(proof, TxNotFound)
 
-    def test_kupo_caught_up_classifies_tx_not_found(self):
-        """Kupo returns empty matches AND the /health checkpoint is
-        at or above request.observed_slot + margin. Classifier
-        promotes to TxNotFound (the truthful proof-of-absence).
-        """
-        req = _default_pending_request()
-        obs = _make_observation(
-            mismatches=["kupo_no_matches_for_tx"],
-            matched_lovelace=None,
-            actual_beneficiary_hash=None,
-        )
-        proof = classify_fraud(
-            req, obs,
-            kupo_checkpoint_slot=(
-                req.observed_slot + KUPO_SYNC_SAFETY_MARGIN_SLOTS
-            ),
-        )
-        assert isinstance(proof, TxNotFound), (
-            f"classifier must promote to TxNotFound when checkpoint "
-            f">= observed_slot + margin; got {proof!r}"
-        )
-        # No defer marker should have been appended.
-        assert "kupo_behind_request_depth" not in obs.mismatches
-
-    def test_classifier_defers_when_checkpoint_is_none(self):
-        """If the /health probe fails entirely (None), the
-        classifier defers — same fail-safe-on-tooling-error contract
-        as the rest of the slash path.
-        """
-        req = _default_pending_request()
-        obs = _make_observation(
-            mismatches=["kupo_no_matches_for_tx"],
-            matched_lovelace=None,
-            actual_beneficiary_hash=None,
-        )
-        proof = classify_fraud(req, obs, kupo_checkpoint_slot=None)
-        assert proof is None
-        assert "kupo_behind_request_depth" in obs.mismatches
-
-    def test_dispatcher_routes_kupo_behind_to_dedicated_outcome(self):
-        """End-to-end: the dispatcher emits the new
-        KUPO_BEHIND_REQUEST_DEPTH outcome (NOT generic
-        OBSERVER_UNAVAILABLE) when the sync gate fires. Operators
-        grep journalctl for this specific tag.
-        """
-        client = _make_substrate_client_stub()
-        obs = _make_observation(
-            mismatches=["kupo_no_matches_for_tx"],
-            matched_lovelace=None,
-            actual_beneficiary_hash=None,
-        )
-        # Build an observer stub that exposes the kupo_checkpoint_slot
-        # helper returning a behind-follower value.
-        observer = SimpleNamespace(
-            observe=AsyncMock(return_value=obs),
-            kupo_checkpoint_slot=AsyncMock(
-                return_value=OBSERVED_SLOT - 100,
-            ),
-            ogmios_url="http://ogmios.test",
-            kupo_url="http://kupo.test",
-        )
-        watcher = _make_watcher(
-            substrate_client=client, observer=observer,
-        )
-        req = _default_pending_request()
-        verdict = _run(watcher.process_one(req, CHAIN_ID))
-        assert verdict.outcome == ClassifierOutcome.KUPO_BEHIND_REQUEST_DEPTH
-        assert verdict.fraud_proof is None
-        assert verdict.extrinsic_hash is None
-        client.submit_slash_bad_settlement_evidence.assert_not_called()
-
-    def test_dispatcher_promotes_to_slash_when_observer_caught_up(self):
-        """Complement: when the observer's checkpoint is caught up,
-        the dispatcher promotes to SLASH_TX_NOT_FOUND and submits.
-        """
-        client = _make_substrate_client_stub(
-            submit_ext_hash="0x" + ("ff" * 32),
-        )
-        obs = _make_observation(
-            mismatches=["kupo_no_matches_for_tx"],
-            matched_lovelace=None,
-            actual_beneficiary_hash=None,
-        )
-        observer = SimpleNamespace(
-            observe=AsyncMock(return_value=obs),
-            kupo_checkpoint_slot=AsyncMock(
-                return_value=OBSERVED_SLOT + KUPO_SYNC_SAFETY_MARGIN_SLOTS + 50,
-            ),
-            ogmios_url="http://ogmios.test",
-            kupo_url="http://kupo.test",
-        )
-        watcher = _make_watcher(
-            substrate_client=client, observer=observer,
-            min_signer_threshold=1,
-        )
-        req = _default_pending_request()
-        verdict = _run(watcher.process_one(req, CHAIN_ID))
-        assert verdict.outcome == ClassifierOutcome.SLASH_TX_NOT_FOUND
-        assert isinstance(verdict.fraud_proof, TxNotFound)
-        client.submit_slash_bad_settlement_evidence.assert_called_once()
+    def test_a_proven_absence_does_not_excuse_other_mismatches(self):
+        obs = _make_observation(mismatches=["kupo_matches_unavailable"])
+        assert classify_fraud(_default_pending_request(), obs, absence_proven=True) is None
 
     def test_kupo_checkpoint_slot_parses_scalar_form(self):
         """Vuln 3 helper: /health may return

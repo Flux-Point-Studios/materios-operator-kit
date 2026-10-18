@@ -382,7 +382,7 @@ class CardanoTxObserver:
     Why two endpoints
     -----------------
     - **Kupo** is the tx-lookup-by-hash index. We use
-      ``GET /matches/*?transaction_id=<hash>`` to enumerate outputs of
+      ``GET /matches/*@<hash>`` to enumerate outputs of
       the tx and discover its ``created_at.{slot_no, block_no}``.
     - **Ogmios** carries the network-level facts: current tip
       (for depth = tip_block_no - tx_block_no) and the genesis-hash
@@ -859,16 +859,12 @@ class CardanoTxObserver:
                 return obs
             obs.mainchain_genesis_hash = genesis
 
-            # Kupo: enumerate all matches for this tx hash. We use the
-            # wildcard pattern ``*`` (all addresses) filtered by
-            # ``transaction_id`` query — equivalent to "all outputs of
-            # this tx, regardless of recipient." We need ALL of them
-            # because some are the beneficiary's payout and some are
-            # the keeper's change.
+            # Every output of the tx, whoever it pays: the beneficiary's
+            # payout and the keeper's change. ``*@<tx>`` reads Kupo's
+            # output-reference index; ``*?transaction_id=`` scans every
+            # match and times out on a Kupo that indexes all addresses.
             matches = await self._kupo_get(
-                session,
-                "/matches/*",
-                {"transaction_id": cardano_tx_hash_hex},
+                session, f"/matches/*@{cardano_tx_hash_hex}", {},
             )
             # A failed lookup proves nothing about the tx; only a
             # successful empty answer is a candidate for its absence.

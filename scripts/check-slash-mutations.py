@@ -68,6 +68,21 @@ MUTANTS = [
     ('cache-hit-skips-spec-name', 'daemon/substrate_client.py', 'if version["specName"] != "materios":', 'if version["specName"] != "materios" and not (self._settlement_contract and self._settlement_contract[0] == code_hash):'),
     ('failed-lookup-is-absence', 'daemon/settle_claim_attestor.py', '            if matches is None:\n                obs.mismatches.append("kupo_matches_unavailable")', '            if False:\n                obs.mismatches.append("kupo_matches_unavailable")'),
     ('shape-check-skipped', 'daemon/slash_watcher.py', 'if kupo_shape_error(base.outputs, expected_beneficiary_blake2_224):', 'if False:'),
+    ('unproven-absence-is-proof', 'daemon/slash_watcher.py', 'return TxNotFound() if absence_proven else None', 'return TxNotFound()'),
+    ('absence-single-proof', 'daemon/slash_watcher.py', 'if height - first < TX_ABSENCE_CONFIRM_BLOCKS:', 'if False:'),
+    ('absence-kept-after-tx-seen', 'daemon/slash_watcher.py', 'if reason == "tx_found":', 'if False:'),
+    ('absence-key-ignores-request', 'daemon/slash_watcher.py', 'key = astuple(request)', 'key = request.claim_id'),
+    ('absences-never-cleared', 'daemon/slash_watcher.py', 'self._absences.clear()', 'pass'),
+    ('freshness-gate-off', 'daemon/slash_watcher.py', 'if checkpoint < tip["slot"] - KUPO_TIP_LAG_MAX_SLOTS:', 'if False:'),
+    ('freshness-bound-exclusive', 'daemon/slash_watcher.py', 'if checkpoint < tip["slot"] - KUPO_TIP_LAG_MAX_SLOTS:', 'if checkpoint <= tip["slot"] - KUPO_TIP_LAG_MAX_SLOTS:'),
+    ('lookup-before-checkpoint', 'daemon/slash_watcher.py', '            checkpoint = await self.kupo_checkpoint_slot()\n', '            await self._kupo_get(session, f"/matches/*@{cardano_tx_hash_hex}", {})\n            checkpoint = await self.kupo_checkpoint_slot()\n'),
+    ('node-tip-as-checkpoint', 'daemon/slash_watcher.py', 'checkpoint = payload.get("most_recent_checkpoint")', 'checkpoint = payload.get("most_recent_checkpoint", payload.get("most_recent_node_tip"))'),
+    ('patterns-unchecked', 'daemon/slash_watcher.py', 'if "*" not in patterns:', 'if False:'),
+    ('spent-canary-unchecked', 'daemon/slash_watcher.py', 'if not any(isinstance(row, dict) and row.get("spent_at") for row in rows):', 'if False:'),
+    ('network-without-canary-allowed', 'daemon/slash_watcher.py', 'return "no_spent_canary_for_network"', 'return None'),
+    ('coverage-skipped-for-present-tx', 'daemon/slash_watcher.py', 'gap = await self.observer.kupo_coverage_gap()', 'gap = None'),
+    ('network-check-off', 'daemon/slash_watcher.py', 'and observation.mainchain_genesis_hash != request.mainchain_genesis_hash', 'and False'),
+    ('tx-lookup-scans', 'daemon/settle_claim_attestor.py', 'session, f"/matches/*@{cardano_tx_hash_hex}", {},', 'session, "/matches/*", {"transaction_id": cardano_tx_hash_hex},'),
 ]
 
 

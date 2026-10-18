@@ -204,6 +204,57 @@ the same beneficiary and amount can be settled by one payout. That holds for
 `attest_settle` today; supersede signs only what `attest_settle` would sign
 for a request carrying the same evidence and adds no new reach.
 
+## What a fraud proof needs
+
+The pallet checks only that a proof is internally consistent, and
+`TxNotFound` always is. What the committee signs is what slashes, so the
+watcher signs only what its Cardano view can prove.
+
+- **One lookup, read whole.** `/matches/*@<tx>` reads Kupo's output-reference
+  index; `*?transaction_id=` scans every match and times out on a Kupo that
+  indexes all addresses. A failed lookup (`kupo_matches_unavailable`) is never
+  an empty one: the watcher defers and the attestors refuse it as observer
+  unavailable. The amount sum, the shape check and the actual payee all read
+  the rows of that one lookup.
+- **The same network.** The observer's Cardano genesis must equal the
+  request's `mainchain_genesis_hash`.
+- **A Kupo that sees everything**, for every proof: `GET /patterns` holds `*`,
+  and Kupo returns the network's spent canary with `spent_at`. A Kupo with
+  narrow patterns misses beneficiaries and change outputs, and one started
+  with `--prune-utxo` forgets spent outputs; either turns an honest payout
+  into TxNotFound, WrongAmount or WrongBeneficiary. The canary (`SPENT_CANARIES`,
+  per Shelley genesis) is an output created and spent at preprod slot
+  10608917, so it also proves Kupo has indexed that far back. A network
+  without a canary, mainnet today, cannot prove fraud.
+- **TxNotFound needs two absence proofs.** Each proof reads the Ogmios tip,
+  then Kupo's checkpoint, which must be within `KUPO_TIP_LAG_MAX_SLOTS` (60)
+  of that tip, then the coverage checks, then the lookup, which must succeed
+  and be empty. The requester's slot plays no part. The two proofs must be
+  at least `TX_ABSENCE_CONFIRM_BLOCKS` (10) Cardano blocks apart; a tx seen in
+  between restarts the count, and a replacement request starts its own.
+  Ogmios has no historical tx lookup and no daemon has an Insight or Koios
+  endpoint configured, so the second proof is a second Kupo lookup.
+
+### The deployed Kupo cannot prove fraud yet
+
+Both cert-daemons read the validation Kupo on Node-3 (`:1442`; Gemtek as
+`192.168.0.133:1442`, Node-3's container as `172.17.0.1:1442`). Read on
+2026-10-18:
+
+| Kupo | `/patterns` holds `*` | keeps spent outputs | fraud proofs |
+| --- | --- | --- | --- |
+| validation `:1442` (v2.9) | no: 4 stored patterns | yes: no `--prune-utxo`, spent rows have `spent_at` | refused (`patterns_without_*:4`) |
+| all-address replica `:1444` (v2.12, read-only, writer `--match *`) | yes | yes: no `--prune-utxo`, canary returned spent | allowed |
+
+So on today's deployment the watcher signs no slash at all; every candidate
+is deferred with `kupo_coverage:patterns_without_*:4`. Slashing needs this
+infrastructure change: on Node-3, `ufw allow from 172.17.0.0/16 to any port
+1444 proto tcp` (Gemtek is already allowed), then `KUPO_URL` on both
+cert-daemons set to `http://192.168.0.133:1444`. The settle and expire
+attestors read the same `KUPO_URL` and work against either Kupo, since the
+tx lookup uses the index; on `:1444` they also see payouts to addresses the
+validation patterns miss.
+
 ## Rust provenance and validation
 
 `tests/fixtures/frv2/generate.rs` calls the pallet's own

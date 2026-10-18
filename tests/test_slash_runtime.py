@@ -31,7 +31,8 @@ def setup_watcher(ctx=None, aggregator=None):
     client.get_settlement_runtime_context = MagicMock(return_value=ctx or context())
     client.keypair = MagicMock(wraps=Keypair.create_from_uri('//Alice'))
     client.keypair.public_key = Keypair.create_from_uri('//Alice').public_key
-    observer = SimpleNamespace(observe=AsyncMock(return_value=_make_observation(matched_lovelace=4)))
+    observer = SimpleNamespace(observe=AsyncMock(return_value=_make_observation(matched_lovelace=4)),
+                               kupo_coverage_gap=AsyncMock(return_value=None))
     watcher = sw.SlashWatcher(config=SimpleNamespace(), substrate_client=client,
                               chain_write_lock=asyncio.Lock(), observer=observer,
                               aggregator=aggregator, min_signer_threshold=2 if aggregator else 1)
