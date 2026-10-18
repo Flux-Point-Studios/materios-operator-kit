@@ -514,8 +514,10 @@ _CALL_SEVERITY: dict[tuple[str, str], Severity] = {
     ("PalletSession", "purge_keys"): ALERT,
     ("RootTimelock", _ANY): CRITICAL,
 }
-# Calls of the spec-238 runtime that move no custody or authority. A call in neither
-# table pages as an ALERT, so one a runtime upgrade adds is reviewed, not ignored.
+# Calls of the spec-238 and spec-242 runtimes that move no custody or authority. A call
+# in neither table pages as an ALERT, so one a runtime upgrade adds is reviewed, not
+# ignored. Spec 242 adds supersede_settlement_request: committee-signed STCA, it settles
+# a claim and refunds the displaced request's bond to that request's own requester.
 _ROUTINE = frozenset({
     ("System", "remark"), ("System", "remark_with_event"),
     ("Timestamp", "set"),
@@ -536,7 +538,8 @@ _ROUTINE = frozenset({
         "expire_policy_mirror", "credit_deposit", "settle_batch_atomic", "attest_batch_intents",
         "request_batch_vouchers", "submit_batch_intents", "request_settle", "attest_settle",
         "request_batch_settle", "attest_batch_settle", "request_expire_policy", "attest_expire_policy",
-        "post_settlement_bond", "slash_bad_settlement_evidence", "release_settlement_bond")),
+        "post_settlement_bond", "slash_bad_settlement_evidence", "release_settlement_bond",
+        "supersede_settlement_request")),
     ("TeeAttestation", "submit_evidence"),
     *(("Billing", f) for f in (
         "topup_self", "topup_for", "pay_request", "request_withdrawal", "execute_withdrawal", "cancel_withdrawal",

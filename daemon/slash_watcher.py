@@ -1,103 +1,17 @@
-"""Cert-daemon module that prosecutes fraudulent ``SettlementEvidence``
-posts via the spec-225 ``slash_bad_settlement_evidence`` extrinsic
-(task #84-watcher).
+"""Prosecute fraudulent bonded settlement evidence using Cardano observations.
 
-Why this exists
----------------
-Spec-225 (live on Materios preprod 2026-05-15 block hash
-``0x14389692...``) shipped three permissionless bond-and-slash
-extrinsics on ``pallet-intent-settlement``:
+The live runtime metadata selects FRAU or request-bound FRV2 signatures.
+Unknown contracts and expired requests are refused before signing; runtime
+and expiry are checked again under the shared write lock before submission.
+Peer signatures are aggregated only for the locally computed digest.
 
-  * ``post_settlement_bond(claim_id, amount)`` — requester opt-in bond
-    against their ``request_settle`` evidence.
-  * ``release_settlement_bond(claim_id)`` — refund the bond after the
-    post-attest delay if no fraud was prosecuted.
-  * ``slash_bad_settlement_evidence(claim_id, fraud_proof, signatures)``
-    — permissionless slash: a watcher proves the requester's evidence
-    is fraudulent; M-of-N committee co-signs the canonical FRAU
-    digest; the bond gets repatriated (watcher share + treasury
-    share).
+FraudProof SCALE discriminants are WrongAmount=0 (u128 LE), TxNotFound=1,
+and WrongBeneficiary=2 ([u8; 28]). FRV2 adds a request identity over the
+requester, normalized u64 submission block, evidence, and settlement mode.
+Rust-generated parity fixtures pin these encodings.
 
-Without a daemon-side autonomous watcher, the slash path is on chain
-but no automated party calls ``slash_bad_settlement_evidence``. This
-module closes that gap. It polls Materios for bonded
-``ClaimSettlementRequests`` rows, independently observes each Cardano
-tx via the existing Ogmios+Kupo follower (same infrastructure the
-settle and expire attestors use), classifies the evidence as fraud
-when it disagrees with reality, signs the canonical FRAU digest with
-the cert-daemon sr25519 committee key, and submits the slash via the
-gateway-mediated multisig aggregator (M-sig envelope).
-
-Fraud classification (per task brief)
--------------------------------------
-For each ``ClaimSettlementRequests`` row with ``bond_amount > 0``:
-
-1. **Look up the Cardano tx** referenced by
-   ``evidence.cardano_tx_hash`` via Ogmios+Kupo (Kupo for tx
-   enumeration, Ogmios for genesis hash + tip + chain-sync block
-   height). If the tx does NOT exist at the claimed depth → fraud
-   variant ``TxNotFound``.
-
-2. **If the tx exists**, parse its outputs. For each output whose
-   payment-key hash matches ``evidence.beneficiary_addr_hash``, sum
-   the lovelace. Compare:
-     * Beneficiary mismatch — the tx pays a DIFFERENT 28-byte
-       payment-key hash. Surface the actual hash via
-       ``WrongBeneficiary { actual_payment_hash }``.
-     * Amount mismatch — the tx pays the expected beneficiary but at
-       a different amount. Surface the actual amount via
-       ``WrongAmount { actual_lovelace }``.
-
-3. **Honest evidence** (tx exists, beneficiary matches, amount matches)
-   — no slash. The settle attestor's normal STCA path handles the
-   close.
-
-Priority order: ``TxNotFound`` takes precedence over the
-field-mismatch variants. If the tx isn't on chain we can't
-meaningfully check fields against it.
-
-Transient-error safety
-----------------------
-A Cardano L1 query that times out or returns an unrecognised shape is
-NOT classified as ``TxNotFound`` — that would be a false positive
-that slashes an honest requester. The watcher logs the transient at
-WARNING and skips the row for the current tick; the next poll cycle
-retries. This is the same fail-safe-on-tooling-error contract the
-settle attestor's ``OBSERVER_UNAVAILABLE`` refusal expresses.
-
-FraudProof SCALE encoding (byte-pinned)
----------------------------------------
-The pallet's ``slash_bad_settlement_evidence_payload`` hashes:
-
-::
-
-    blake2_256(b"FRAU" || materios_chain_id (32B)
-                       || claim_id (32B)
-                       || scale(fraud_proof))
-
-``scale(fraud_proof)`` is the SCALE encoding of the
-``FraudProof`` enum, source variant order
-(``types.rs`` lines 448-464):
-
-   * ``WrongAmount { actual_lovelace: u128 }`` — discriminant 0
-   * ``TxNotFound`` — discriminant 1
-   * ``WrongBeneficiary { actual_payment_hash: [u8; 28] }`` —
-     discriminant 2
-
-Encoding by variant:
-
-   * ``WrongAmount`` → ``[0x00] || u128_le_bytes(actual_lovelace)``
-     (17 bytes total: 1B discriminant + 16B u128 LE).
-   * ``TxNotFound`` → ``[0x01]`` (1 byte).
-   * ``WrongBeneficiary`` →
-     ``[0x02] || actual_payment_hash (28B)`` (29 bytes total).
-
-We hand-roll the encoder because each variant body is < 30 bytes
-and the byte layout is fully specified by SCALE's spec. The unit
-test ``test_fraud_proof_scale_encoding`` pins the discriminants +
-field layout byte-exact so a future variant reorder in the pallet
-will turn the test red before it could ever ship a wrong-discriminant
-slash.
+Cardano query failures remain deferrals. TxNotFound requires a synced Kupo
+follower; a missing response alone never proves fraud.
 """
 
 from __future__ import annotations
@@ -106,10 +20,14 @@ import asyncio
 import hashlib
 import logging
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import astuple, dataclass
 from typing import Any, Optional, Union
 
 import aiohttp
+from scalecodec.utils.ss58 import ss58_decode
+
+from daemon import health_server
 
 # Reuse the Cardano follower built for the settle path. The slash
 # watcher has the SAME L1 observation needs (tip, genesis, tx slot,
@@ -122,13 +40,17 @@ from daemon.settle_claim_attestor import (
     CardanoTxObservation,
     CardanoTxObserver,
     NETWORK_MAGIC_TO_GENESIS_HASH,
+    LOCKED_REREAD_SECONDS,
+    checked_runtime_context,
+    poll_forever,
+    request_expired,
 )
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# FRAU domain tag + FraudProof SCALE encoder.
+# Legacy FRAU domain tag + FraudProof SCALE encoder.
 #
 # PINNED to pallet-intent-settlement::slash_bad_settlement_evidence_payload
 # (lib.rs lines 599-633) and the FraudProof enum (types.rs lines 448-464).
@@ -149,6 +71,7 @@ logger = logging.getLogger(__name__)
 # turn the discriminant-pinning test red before it could ever ship.
 # ---------------------------------------------------------------------------
 TAG_FRAU: bytes = b"FRAU"
+TAG_FRV2: bytes = b"FRV2"
 
 # FraudProof variant discriminants — pinned to the Rust enum order in
 # `pallets/intent-settlement/src/types.rs` lines 448-464. SCALE assigns
@@ -159,14 +82,42 @@ FRAUD_DISCRIMINANT_WRONG_AMOUNT: int = 0
 FRAUD_DISCRIMINANT_TX_NOT_FOUND: int = 1
 FRAUD_DISCRIMINANT_WRONG_BENEFICIARY: int = 2
 
-# Cardano preprod runs at 1 slot/sec. The classifier MUST NOT promote
-# Kupo's empty-match response to FraudProof::TxNotFound until the local
-# Kupo follower is demonstrably caught up to the requested
-# observation depth + a safety margin. 20 slots ≈ 20 seconds covers
-# any per-RPC indexer lag on a healthy follower; the operator's
-# auto-recover watchdog catches longer outages on a different
-# timescale (sec-review round-1 Vuln 3).
-KUPO_SYNC_SAFETY_MARGIN_SLOTS: int = 20
+# Most slots Kupo's checkpoint may trail the Cardano tip read just before it
+# for an empty lookup to prove a tx absent. An honest payout sits at least
+# MinFinalityDepth (15) blocks, about 300 slots, behind the tip.
+KUPO_TIP_LAG_MAX_SLOTS: int = 60
+
+# Cardano blocks between the two absence proofs TxNotFound needs.
+TX_ABSENCE_CONFIRM_BLOCKS: int = 10
+
+# Most slots the node's tip may trail the network's current slot, by the wall
+# clock, at each absence proof: a node that is catching up, stalled or on a
+# minority fork has not seen the network's recent transactions.
+CARDANO_TIP_LAG_MAX_SLOTS: int = 300
+
+# Most slots per block, on average, the node's chain may take between the two
+# absence proofs. Preprod and mainnet average 20 (active slot coefficient
+# 0.05); a sparse chain is a minority fork.
+CHAIN_SLOTS_PER_BLOCK_MAX: int = 60
+
+# Per Cardano network (Shelley genesis hash): (slot, unix seconds) at which
+# 1-second slots began. Preprod: systemStart 2022-06-01T00:00:00Z, then 86400
+# Byron slots of 20 s (Ogmios queryNetwork/startTime and
+# queryLedgerState/eraSummaries, read 2026-10-18; Lucid's SLOT_CONFIG_NETWORK
+# agrees). A network without an entry cannot prove a tx absent.
+NETWORK_CLOCKS: dict[bytes, tuple[int, int]] = {
+    CARDANO_PREPROD_GENESIS_HASH: (86400, 1655769600),
+}
+
+# Per Cardano network (Shelley genesis hash), an output reference that was
+# spent long ago. A Kupo that returns it with ``spent_at`` keeps spent outputs
+# and has indexed that far back. Preprod: created and spent at slot 10608917
+# (db-sync, read 2026-10-18). A network without an entry cannot prove fraud.
+SPENT_CANARIES: dict[bytes, tuple[str, int]] = {
+    CARDANO_PREPROD_GENESIS_HASH: (
+        "842905900c2c33c4d1d0efd9ad73f7a2e8326c547bab73bf6b950e12fab275d5", 0,
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +219,7 @@ def build_frau_preimage(
     claim_id: bytes,
     fraud_proof: FraudProof,
 ) -> bytes:
-    """Build the FRAU preimage that the pallet's
+    """Build the legacy FRAU preimage that the pallet's
     ``slash_bad_settlement_evidence_payload`` will rebuild at verify
     time.
 
@@ -293,13 +244,7 @@ def build_frau_preimage(
 
 
 def compute_frau_digest(preimage: bytes) -> bytes:
-    """Hash the FRAU preimage with blake2_256 (same hasher as the
-    pallet's ``domain_hash``). Returns 32 bytes.
-
-    No length assertion: unlike STCA/EXPP the FRAU preimage is
-    variant-width (69/85/97 bytes); the right invariant lives in
-    :func:`build_frau_preimage` which validates the components.
-    """
+    """Hash a validated FRAU or FRV2 preimage with blake2_256."""
     return hashlib.blake2b(preimage, digest_size=32).digest()
 
 
@@ -308,8 +253,7 @@ def compute_frau_digest(preimage: bytes) -> bytes:
 #
 # Mirrors :class:`daemon.settle_claim_attestor.PendingSettlementRequest`
 # minus the chain-state ``voucher_digest`` (which the slash path
-# doesn't need — the slash digest binds only chain_id + claim_id +
-# fraud_proof). The dispatcher converts the dicts returned by
+# doesn't need). The dispatcher converts the dicts returned by
 # ``substrate_client.list_pending_settlement_requests`` into this
 # dataclass at the boundary, exactly the same pattern the settle and
 # expire dispatchers use.
@@ -328,9 +272,9 @@ class PendingBondedRequest:
 
     The ``voucher_digest`` field is consumed by the settle attestor but
     NOT by the slash watcher. The pallet's slash dispatch binds the
-    digest to (chain_id, claim_id, fraud_proof) only — the voucher is
-    irrelevant. We accept the field for shape uniformity with the
-    settle path's dict shape but ignore it.
+    digest to the request identity under FRV2; the voucher is
+    irrelevant to both slash protocols. We accept the field for shape
+    uniformity with the settle path's dict shape but ignore it.
 
     The ``bond_amount`` field is the slash trigger. Rows with
     ``bond_amount == 0`` are pre-#84 records or unbonded post-#84
@@ -357,6 +301,49 @@ class PendingBondedRequest:
     bond_amount: int = 0
 
 
+def encode_request_identity(request: PendingBondedRequest) -> bytes:
+    """SCALE(requester[32], submitted_block:u64, evidence, settled_direct)."""
+    requester = request.requester
+    requester_bytes = bytes.fromhex(
+        requester[2:] if requester.startswith("0x") else ss58_decode(requester)
+    )
+    if len(requester_bytes) != 32:
+        raise ValueError("requester must encode to 32 bytes")
+    fields = [requester_bytes]
+    for value, width in (
+        (request.submitted_block, 8), (request.cardano_tx_hash, 32),
+        (request.observed_at_depth, 4), (request.observed_slot, 8),
+        (request.beneficiary_addr_hash, 28), (request.amount_lovelace, 8),
+        (request.mainchain_genesis_hash, 32),
+    ):
+        if width in (28, 32):
+            if not isinstance(value, bytes) or len(value) != width:
+                raise ValueError(f"request field must be {width} bytes")
+            fields.append(value)
+        else:
+            if type(value) is not int or not 0 <= value < 1 << (8 * width):
+                raise ValueError(f"request field must be u{8 * width}")
+            fields.append(value.to_bytes(width, "little"))
+    if type(request.settled_direct) is not bool:
+        raise ValueError("settled_direct must be bool")
+    return b"".join(fields) + bytes([request.settled_direct])
+
+
+def build_frv2_preimage(chain_id: bytes, request: PendingBondedRequest, proof: FraudProof) -> bytes:
+    if len(chain_id) != 32 or len(request.claim_id) != 32:
+        raise ValueError("chain_id and claim_id must be 32 bytes")
+    request_id = hashlib.blake2b(encode_request_identity(request), digest_size=32).digest()
+    return TAG_FRV2 + chain_id + request.claim_id + request_id + encode_fraud_proof(proof)
+
+
+def past_slash_window(request: PendingBondedRequest, context: dict) -> bool:
+    """Whether the runtime would refuse to slash ``request`` as expired. The
+    FRV2 pallet (settlement 0757de3) does; the FRAU pallet (settlement
+    c60b98f, spec 239) slashes a request of any age and removes one only by
+    attesting or slashing it, so there an expired fraud stays slashable."""
+    return context["protocol"] == "FRV2" and request_expired(request, context)
+
+
 # ---------------------------------------------------------------------------
 # Classification taxonomy.
 #
@@ -370,22 +357,19 @@ class PendingBondedRequest:
 class ClassifierOutcome:
     """Stable string tags emitted as ``verdict.outcome`` in logs.
 
-    NOT_FRAUD / TRANSIENT_L1_ERROR / OBSERVER_UNAVAILABLE /
-    KUPO_BEHIND_REQUEST_DEPTH are non-slash outcomes — the watcher
-    moves on without dispatching. The remaining three are the SLASH
-    outcomes and correspond directly to the pallet's FraudProof
-    variants.
+    The SLASH_* outcomes correspond to the pallet's FraudProof variants;
+    every other outcome moves on without dispatching.
     """
     NOT_FRAUD = "not_fraud"
+    DEFERRED = "deferred"
     TRANSIENT_L1_ERROR = "transient_l1_error"
     OBSERVER_UNAVAILABLE = "observer_unavailable"
-    # Kupo follower hasn't caught up to request.observed_slot +
-    # KUPO_SYNC_SAFETY_MARGIN_SLOTS yet. An empty Kupo match list in
-    # this case is NOT proof the tx is absent from chain — it could
-    # also be that the local Kupo follower is mid-resync (after an
-    # operator restart, ~10-20 min on preprod). We defer rather than
-    # promote to TxNotFound (sec-review round-1 Vuln 3).
-    KUPO_BEHIND_REQUEST_DEPTH = "kupo_behind_request_depth"
+    # Kupo returned no output of the tx, but its absence is not proven yet
+    # (see CardanoSlashObserver.prove_absence and TX_ABSENCE_CONFIRM_BLOCKS).
+    TX_ABSENCE_UNPROVEN = "tx_absence_unproven"
+    # The Kupo this watcher reads cannot prove fraud: it does not index every
+    # address, or does not keep spent outputs.
+    KUPO_COVERAGE_GAP = "kupo_coverage_gap"
     SLASH_TX_NOT_FOUND = "slash_tx_not_found"
     SLASH_WRONG_AMOUNT = "slash_wrong_amount"
     SLASH_WRONG_BENEFICIARY = "slash_wrong_beneficiary"
@@ -416,73 +400,34 @@ def classify_fraud(
     request: PendingBondedRequest,
     observation: CardanoTxObservation,
     *,
-    kupo_checkpoint_slot: Optional[int] = None,
+    absence_proven: bool = False,
 ) -> Optional[FraudProof]:
     """Decide whether a bonded settlement request's evidence is
     fraudulent given the cert-daemon's independent Cardano
     observation.
 
-    Returns:
-        * A :class:`FraudProof` instance when the observation
-          contradicts the evidence — the watcher will sign the
-          corresponding FRAU digest and submit a slash.
-        * ``None`` when (a) the evidence agrees with reality (honest
-          evidence), or (b) the observation is incomplete / transient
-          (cannot conclude — defer to next tick), or (c) the local
-          Kupo follower hasn't caught up to the requested observation
-          depth + safety margin (sec-review round-1 Vuln 3).
-          The caller distinguishes (a/b/c) via the observation's
-          ``mismatches`` list and the
-          ``kupo_behind_request_depth`` marker tag.
+    Returns a :class:`FraudProof` when the observation contradicts the
+    evidence, and None for honest evidence or an incomplete observation.
+    The caller must already have checked that the observer's Kupo indexes
+    every address and keeps spent outputs.
 
     Priority order:
-        1. Kupo-sync gate: if ``kupo_checkpoint_slot`` is supplied and
-           is below ``request.observed_slot +
-           KUPO_SYNC_SAFETY_MARGIN_SLOTS``, AND the observation
-           carries ``kupo_no_matches_for_tx``, append
-           ``kupo_behind_request_depth`` to the observation
-           mismatches and return None. The follower being behind
-           means "empty matches" doesn't prove the tx is absent —
-           it could still appear once the follower catches up.
-        2. ``TxNotFound`` (Kupo found nothing for cardano_tx_hash AND
-           the follower is caught up) — takes precedence over the
-           field-mismatch variants because if the tx doesn't exist
-           there's no concrete output to field-check.
-        3. ``WrongBeneficiary`` (tx exists but no output pays the
-           claimed beneficiary; we use a different
-           candidate-payment-hash from the observer).
-        4. ``WrongAmount`` (tx exists, pays the claimed beneficiary,
-           but a different lovelace total).
-        5. ``None`` (honest evidence).
+        1. ``TxNotFound``: Kupo returned no output of the tx
+           (``kupo_no_matches_for_tx``) AND ``absence_proven`` — the
+           caller's two proofs from a caught-up Kupo, see
+           :meth:`CardanoSlashObserver.prove_absence`. Without them,
+           None.
+        2. ``WrongBeneficiary``: the tx exists but no output pays the
+           claimed beneficiary; the observer surfaces another payee.
+        3. ``WrongAmount``: the tx pays the claimed beneficiary a
+           different lovelace total.
+        4. None: honest evidence.
 
-    Safety contract: transient errors (Ogmios down, Kupo 500,
-    chain-sync timeout, Kupo follower mid-resync) MUST NOT be
-    classified as ``TxNotFound``. The observer emits
-    ``kupo_no_matches_for_tx`` ONLY on a successful lookup that
-    returned an empty match list — but that empty list is only
-    proof-of-absence when the follower is demonstrably caught up.
-    Any other mismatch tag (including the new
-    ``kupo_behind_request_depth``) means incomplete observation;
-    the classifier returns ``None`` and the dispatcher defers.
+    Any other mismatch tag (Ogmios down, a failed Kupo lookup, a shape
+    error) is an incomplete observation and never a proof.
     """
-    # Slot 1: TxNotFound has highest priority IFF the follower is
-    # demonstrably caught up. The settle attestor uses the EXACT same
-    # `kupo_no_matches_for_tx` tag as its tx-existence proof; we
-    # mirror that contract — but the slash path is one-sided
-    # (false-positive slashes burn an honest requester) so we gate
-    # the promotion on a local Kupo sync check first.
     if "kupo_no_matches_for_tx" in observation.mismatches:
-        if kupo_checkpoint_slot is None or kupo_checkpoint_slot < (
-            request.observed_slot + KUPO_SYNC_SAFETY_MARGIN_SLOTS
-        ):
-            # Follower below the safety threshold (or health probe
-            # failed entirely → kupo_checkpoint_slot is None). Surface
-            # the new mismatch tag so the dispatcher's logging path
-            # makes the defer reason visible to operators.
-            if "kupo_behind_request_depth" not in observation.mismatches:
-                observation.mismatches.append("kupo_behind_request_depth")
-            return None
-        return TxNotFound()
+        return TxNotFound() if absence_proven else None
 
     # Any OTHER mismatch tag = transient / incomplete observation.
     # Fall through to None so the dispatcher logs + defers.
@@ -566,7 +511,8 @@ def _extract_kupo_checkpoint_slot(payload: Any) -> Optional[int]:
     number or a sub-dict carrying ``slot_no``. Older builds emit
     ``most_recent_checkpoint.slot_no``; some forks emit
     ``most_recent_checkpoint`` directly as an integer. We parse both
-    defensively (sec-review round-1 Vuln 3).
+    defensively (sec-review round-1 Vuln 3). ``most_recent_node_tip`` is
+    the node's tip, not what Kupo has indexed, and never stands in for it.
 
     Returns the slot number on success, None on any unexpected shape
     (the caller treats None as "can't prove caught-up" → defer).
@@ -580,16 +526,6 @@ def _extract_kupo_checkpoint_slot(payload: Any) -> Optional[int]:
     # Form 2: sub-dict carrying slot_no.
     if isinstance(checkpoint, dict):
         slot = checkpoint.get("slot_no")
-        if isinstance(slot, int):
-            return slot
-    # Some forks expose a top-level `most_recent_node_tip` sub-dict
-    # with the same shape — fall back to that if the canonical key is
-    # missing or wrong-shape.
-    tip = payload.get("most_recent_node_tip")
-    if isinstance(tip, int):
-        return tip
-    if isinstance(tip, dict):
-        slot = tip.get("slot_no")
         if isinstance(slot, int):
             return slot
     return None
@@ -608,37 +544,19 @@ class CardanoSlashObserver(CardanoTxObserver):
     logic.
     """
 
+    wall_clock = staticmethod(time.time)
+
     async def kupo_checkpoint_slot(self) -> Optional[int]:
-        """Return the Kupo follower's most-recent-checkpoint slot number.
+        """Kupo's most recent checkpoint slot from ``/health``, or None on any
+        error or unexpected shape.
 
-        Used by the slash watcher's classifier (sec-review round-1
-        Vuln 3) to gate the ``TxNotFound`` promotion: an empty Kupo
-        ``/matches`` response is only proof-of-absence if the
-        follower is demonstrably caught up to the requested observation
-        depth + a safety margin (see
-        :data:`KUPO_SYNC_SAFETY_MARGIN_SLOTS`). Otherwise the follower
-        might be mid-resync after an operator restart and we'd burn an
-        honest requester for a false-positive ``TxNotFound``.
+        :meth:`prove_absence` requires it within KUPO_TIP_LAG_MAX_SLOTS of
+        the node's tip before an empty lookup counts as an absence; None
+        defers.
 
-        Returns ``None`` on any error (Kupo unreachable, non-200
-        response, unexpected JSON shape). The dispatcher treats None
-        as "can't prove caught-up" → defer (NOT slash). Same fail-safe
-        contract as :meth:`_first_payment_hash` returning None.
-
-        Kupo 2.x exposes ``/health`` with a JSON body containing
-        ``most_recent_checkpoint`` as either a scalar slot number or a
-        sub-dict carrying ``slot_no``. We parse both shapes
-        defensively to stay forward-compatible.
-
-        Live-prod note (2026-05-15): Kupo 2.9 content-negotiates the
-        ``/health`` response body — without an explicit
-        ``Accept: application/json`` request header it falls back to
-        Prometheus text format (either as 200 with text body or 406
-        depending on version). The slash watcher then can't parse
-        the structured shape, returns None, and the dispatcher defers
-        TxNotFound prosecution per the Vuln 3 fail-safe contract. The
-        ``Accept`` header below is load-bearing — do NOT remove without
-        confirming current Kupo continues to serve JSON by default.
+        Kupo 2.9 content-negotiates ``/health``: without
+        ``Accept: application/json`` it answers in Prometheus text (200 or
+        406), which does not parse. The header is load-bearing.
         """
         url = f"{self.kupo_url}/health"
         try:
@@ -663,6 +581,89 @@ class CardanoSlashObserver(CardanoTxObserver):
             )
             return None
         return _extract_kupo_checkpoint_slot(payload)
+
+    async def _coverage_gap(self, session: aiohttp.ClientSession, genesis: bytes) -> Optional[str]:
+        """None when this Kupo indexes every address (``/patterns`` holds
+        ``*``) and keeps spent outputs (it returns the network's spent
+        canary with ``spent_at``); otherwise why it cannot prove fraud."""
+        patterns = await self._kupo_get(session, "/patterns", {})
+        if patterns is None:
+            return "patterns_unavailable"
+        if "*" not in patterns:
+            return f"patterns_without_*:{len(patterns)}"
+        canary = SPENT_CANARIES.get(genesis)
+        if canary is None:
+            return "no_spent_canary_for_network"
+        tx, index = canary
+        rows = await self._kupo_get(session, f"/matches/{index}@{tx}", {})
+        if rows is None:
+            return "spent_canary_unavailable"
+        if not any(isinstance(row, dict) and row.get("spent_at") for row in rows):
+            return "spent_outputs_not_kept"
+        return None
+
+    async def kupo_coverage_gap(self) -> Optional[str]:
+        """:meth:`_coverage_gap` for the network Ogmios follows."""
+        async with aiohttp.ClientSession() as session:
+            genesis = await self.get_genesis_hash(session)
+            if genesis is None:
+                return "ogmios_genesis_hash_unavailable"
+            return await self._coverage_gap(session, genesis)
+
+    async def _network_tip(self, session: aiohttp.ClientSession) -> tuple[Optional[dict], str]:
+        """The node's tip slot and height, the network it follows, and how
+        many slots the tip trails the network's current slot by the wall
+        clock; or None with the reason."""
+        tip = await self._ogmios_rpc(session, "queryNetwork/tip")
+        height = await self._ogmios_rpc(session, "queryNetwork/blockHeight")
+        if not (isinstance(tip, dict) and type(tip.get("slot")) is int and type(height) is int):
+            return None, "ogmios_tip_unavailable"
+        genesis = await self.get_genesis_hash(session)
+        if genesis is None:
+            return None, "ogmios_genesis_hash_unavailable"
+        clock = NETWORK_CLOCKS.get(genesis)
+        if clock is None:
+            return None, "no_network_clock"
+        shelley_slot, shelley_unix = clock
+        lag = shelley_slot + int(self.wall_clock() - shelley_unix) - tip["slot"]
+        return dict(slot=tip["slot"], height=height, genesis=genesis, lag=lag), "ok"
+
+    async def network_tip_lag(self) -> Optional[int]:
+        """Slots the node's tip trails the network's current slot, or None."""
+        async with aiohttp.ClientSession() as session:
+            tip, _ = await self._network_tip(session)
+        return None if tip is None else tip["lag"]
+
+    async def prove_absence(self, cardano_tx_hash_hex: str) -> tuple[Optional[tuple[int, int]], str]:
+        """The node's tip (height, slot) at which a caught-up, fully indexing
+        Kupo returned no output of the tx, or None with the reason.
+
+        Order matters: the tip is read first and must be within
+        CARDANO_TIP_LAG_MAX_SLOTS of the network's current slot by the wall
+        clock; then Kupo's checkpoint, which must be within
+        KUPO_TIP_LAG_MAX_SLOTS of that tip; then the lookup, so the lookup
+        covers at least everything up to that checkpoint.
+        """
+        async with aiohttp.ClientSession() as session:
+            tip, reason = await self._network_tip(session)
+            if tip is None:
+                return None, reason
+            if tip["lag"] > CARDANO_TIP_LAG_MAX_SLOTS:
+                return None, f"cardano_tip_behind_wallclock:{tip['lag']}>{CARDANO_TIP_LAG_MAX_SLOTS}"
+            checkpoint = await self.kupo_checkpoint_slot()
+            if checkpoint is None:
+                return None, "kupo_checkpoint_unavailable"
+            if checkpoint < tip["slot"] - KUPO_TIP_LAG_MAX_SLOTS:
+                return None, f"kupo_behind_tip:{checkpoint}<{tip['slot']}-{KUPO_TIP_LAG_MAX_SLOTS}"
+            gap = await self._coverage_gap(session, tip["genesis"])
+            if gap is not None:
+                return None, f"kupo_coverage:{gap}"
+            matches = await self._kupo_get(session, f"/matches/*@{cardano_tx_hash_hex}", {})
+            if matches is None:
+                return None, "kupo_matches_unavailable"
+            if matches:
+                return None, "tx_found"
+            return (tip["height"], tip["slot"]), "absent"
 
     async def observe(  # type: ignore[override]
         self,
@@ -701,241 +702,95 @@ class CardanoSlashObserver(CardanoTxObserver):
         slash_obs.beneficiary_addr_blake2_224 = base.beneficiary_addr_blake2_224
         slash_obs.mainchain_genesis_hash = base.mainchain_genesis_hash
         slash_obs.mismatches = list(base.mismatches)
+        slash_obs.outputs = base.outputs
+        if base.outputs is None:
+            return slash_obs
 
-        # Defensive pre-validation of Kupo output shapes (sec-review
-        # round-1 Vuln 2). The parent observer's amount-sum treats
-        # `value.coins` as 0 when it's not an int (e.g. stringly-typed
-        # `"5000000"` from some Kupo forks). That silently understates
-        # `matched_address_lovelace` and would mis-trigger the
-        # WrongBeneficiary slash path here. Surface the shape error as
-        # a NEW mismatch tag so the dispatcher defers rather than
-        # slashes.
-        #
-        # We do a SEPARATE Kupo fetch (cheap, no chain-write side
-        # effects) so we can inspect the raw output shape without
-        # touching the settle attestor's amount-sum code path. If any
-        # output for the expected beneficiary has a non-int
-        # `value.coins`, append the new mismatch tag and short-circuit
-        # the actual-hash lookup.
-        #
-        # Round-2 sec-review fix: the gate runs whenever the tx
-        # exists (no `kupo_no_matches_for_tx`), NOT only when
-        # `matched_address_lovelace == 0`. Previously the `== 0`
-        # conjunct meant a tx with MULTIPLE beneficiary outputs —
-        # some int-typed and some stringly-typed — bypassed this
-        # check (matched != 0 from the int-typed half), letting the
-        # downstream classifier emit a false-positive
-        # `WrongAmount(actual=undercounted_sum)` slash against an
-        # honest requester. Running the shape check on every
-        # classify-bound observation closes that hole; the wrapper
-        # iterates only the beneficiary-matching outputs so the cost
-        # stays bounded.
-        if "kupo_no_matches_for_tx" not in slash_obs.mismatches:
-            shape_error = await self._kupo_response_has_shape_error(
-                cardano_tx_hash_hex,
-                expected_beneficiary_blake2_224,
+        # Sec-review round-1 Vuln 2 and round 2: the parent's amount sum
+        # counts a non-int ``value.coins`` as 0, which would understate the
+        # payment and mis-trigger WrongAmount or WrongBeneficiary. Every
+        # check reads the same rows the sum did.
+        if kupo_shape_error(base.outputs, expected_beneficiary_blake2_224):
+            slash_obs.mismatches.append("kupo_response_shape_error")
+            return slash_obs
+        if slash_obs.matched_address_lovelace == 0:
+            slash_obs.actual_beneficiary_hash = first_payment_hash(
+                base.outputs, expected_beneficiary_blake2_224,
             )
-            if shape_error:
-                slash_obs.mismatches.append("kupo_response_shape_error")
-                return slash_obs
-
-        # If the tx exists (no kupo_no_matches_for_tx) AND no
-        # lovelace went to the expected beneficiary, walk the outputs
-        # ONE more time to surface the actual payment-hash. We do a
-        # second Kupo fetch rather than thread the matches list back
-        # from the parent class — the parent's logic isn't designed
-        # to expose them, and a second tx lookup is cheap relative
-        # to the slash flow's other I/O.
-        needs_actual_hash = (
-            "kupo_no_matches_for_tx" not in slash_obs.mismatches
-            and slash_obs.matched_address_lovelace == 0
-        )
-        if needs_actual_hash:
-            slash_obs.actual_beneficiary_hash = await self._first_payment_hash(
-                cardano_tx_hash_hex,
-                expected_beneficiary_blake2_224,
-            )
-
         return slash_obs
 
-    async def _kupo_response_has_shape_error(
-        self,
-        cardano_tx_hash_hex: str,
-        expected_beneficiary_blake2_224: bytes,
-    ) -> bool:
-        """Pre-validate Kupo output shapes before downstream code makes
-        a slash decision (sec-review round-1 Vuln 2).
 
-        Returns True if ANY output that pays the expected beneficiary
-        has a non-int ``value.coins`` (e.g. stringly-typed from older
-        Kupo versions / forks). In that case the parent observer would
-        silently treat the output as 0 lovelace and the slash path
-        would mis-trigger WrongBeneficiary on an honest requester.
-
-        Network / decode failures return False (the parent observer
-        will surface its own mismatch tags on the same path) — we only
-        care about the specific stringly-typed-coins shape here.
-        """
+def kupo_shape_error(matches: list, expected_beneficiary_blake2_224: bytes) -> bool:
+    """Whether an output paying the expected beneficiary carries a
+    ``value`` the parent's amount sum cannot read as an int lovelace
+    total (sec-review round-1 Vuln 2): a stringly-typed or boolean
+    ``coins``, no coin field, or a ``value`` that is not a dict."""
+    from daemon.cardano_address import (
+        extract_payment_hash_from_cardano_address,
+    )
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        address = m.get("address")
+        if not isinstance(address, str):
+            continue
         try:
-            async with aiohttp.ClientSession() as session:
-                matches = await self._kupo_get(
-                    session,
-                    "/matches/*",
-                    {"transaction_id": cardano_tx_hash_hex},
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"slash_watcher: _kupo_response_has_shape_error lookup "
-                f"raised {type(e).__name__}: {e}"
-            )
-            return False
-        if not matches:
-            return False
-        from daemon.cardano_address import (
-            extract_payment_hash_from_cardano_address,
-        )
-        for m in matches:
-            if not isinstance(m, dict):
-                continue
-            address = m.get("address")
-            if not isinstance(address, str):
-                continue
-            try:
-                addr_hash = extract_payment_hash_from_cardano_address(
-                    address,
-                )
-            except ValueError:
-                continue
-            if addr_hash != expected_beneficiary_blake2_224:
-                continue
-            value = m.get("value") or {}
-            if not isinstance(value, dict):
-                # Whole `value` field isn't a dict — the parent
-                # observer's `value.coins` access would have silently
-                # short-circuited. Surface as shape error.
-                return True
-            coins = value.get("coins")
-            if coins is None:
-                # Some Kupo builds use `lovelace` instead of `coins`.
-                # Mirror the parent observer's fallback.
-                coins = value.get("lovelace")
-            if coins is None:
-                # No coin field at all — also a shape mismatch the
-                # parent silently treats as 0.
-                return True
-            if not isinstance(coins, int) or isinstance(coins, bool):
-                # Stringly-typed `coins` (the headline bug) or
-                # boolean (accidental Truthy coercion). Either way,
-                # the parent observer silently treats it as 0 and the
-                # slash path mis-triggers.
-                return True
-        return False
+            addr_hash = extract_payment_hash_from_cardano_address(address)
+        except ValueError:
+            continue
+        if addr_hash != expected_beneficiary_blake2_224:
+            continue
+        value = m.get("value") or {}
+        if not isinstance(value, dict):
+            return True
+        coins = value.get("coins")
+        if coins is None:
+            # Some Kupo builds use `lovelace`; mirror the parent's fallback.
+            coins = value.get("lovelace")
+        if coins is None or not isinstance(coins, int) or isinstance(coins, bool):
+            return True
+    return False
 
-    async def _first_payment_hash(
-        self,
-        cardano_tx_hash_hex: str,
-        expected_beneficiary_blake2_224: bytes,
-    ) -> Optional[bytes]:
-        """Return a NON-BENEFICIARY 28-byte payment-key hash via Kupo.
 
-        We deliberately FILTER OUT any output whose computed payment
-        hash equals ``expected_beneficiary_blake2_224`` before picking
-        the first remaining hash (sec-review round-1 Vuln 2). Without
-        this filter, a Kupo response shape error or a stringly-typed
-        ``value.coins`` could let the parent observer report
-        ``matched_address_lovelace == 0`` against a tx that actually
-        paid the beneficiary correctly — and we'd then surface the
-        keeper's CHANGE-output hash as the "actual" payee, slashing
-        an honest requester for ``WrongBeneficiary(change_hash)``.
+def first_payment_hash(matches: list, expected_beneficiary_blake2_224: bytes) -> Optional[bytes]:
+    """The payment-key hash of the first output that does NOT pay the
+    expected beneficiary, or None when no such output decodes.
 
-        Determinism: Kupo doesn't guarantee stable match ordering, so
-        we sort by ``output_index`` ascending (CIP-0019 outputs are
-        contiguously indexed by tx-construction order) with a stable
-        secondary sort by ``address`` to break ties when
-        ``output_index`` is missing or duplicated. This pins
-        cross-watcher determinism on the (rare but valid)
-        legitimate-slash path so the M-of-N envelope can converge.
+    The beneficiary is filtered out first (sec-review round-1 Vuln 2):
+    otherwise a shape error could surface the keeper's change output as
+    the "actual" payee and slash an honest requester for
+    ``WrongBeneficiary(change_hash)``. Outputs are taken in
+    ``output_index`` order, then by address, so every watcher derives the
+    same hash and the M-of-N envelope converges.
+    """
+    from daemon.cardano_address import (
+        extract_payment_hash_from_cardano_address,
+    )
 
-        Returns ``None`` on any error (no non-beneficiary output,
-        decode failure, Kupo unreachable). The dispatcher treats None
-        as "can't construct WrongBeneficiary proof" and defers the
-        slash to the next tick rather than fabricating a hash —
-        :class:`SlashWatcher._process_one_locked` will tag the row
-        with :attr:`ClassifierOutcome.OBSERVER_UNAVAILABLE` so an
-        operator can grep journalctl for the deferred decision.
-        """
-        # Reuse the parent's address-extraction helper.
-        from daemon.cardano_address import (
-            extract_payment_hash_from_cardano_address,
-        )
+    def _sort_key(entry: Any) -> tuple:
+        if not isinstance(entry, dict):
+            return (2**31, "")
+        oi = entry.get("output_index")
+        if not isinstance(oi, int):
+            oi = 2**31 - 1
+        addr = entry.get("address") if isinstance(entry.get("address"), str) else ""
+        return (oi, addr)
+
+    for m in sorted(matches, key=_sort_key):
+        if not isinstance(m, dict):
+            continue
+        address = m.get("address")
+        if not isinstance(address, str):
+            continue
         try:
-            async with aiohttp.ClientSession() as session:
-                matches = await self._kupo_get(
-                    session,
-                    "/matches/*",
-                    {"transaction_id": cardano_tx_hash_hex},
-                )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"slash_watcher: _first_payment_hash Kupo lookup raised "
-                f"{type(e).__name__}: {e}"
-            )
-            return None
-        if not matches:
-            return None
-        # Deterministic ordering: sort by output_index ascending, then
-        # address (stable secondary sort so a missing/duplicate
-        # output_index doesn't break cross-watcher convergence).
-        # Non-dict entries sort last via a high sentinel — they're
-        # filtered out in the loop below anyway.
-
-        def _sort_key(entry: Any) -> tuple:
-            if not isinstance(entry, dict):
-                return (2**31, "")
-            oi = entry.get("output_index")
-            if not isinstance(oi, int):
-                oi = 2**31 - 1
-            addr = entry.get("address") if isinstance(
-                entry.get("address"), str
-            ) else ""
-            return (oi, addr)
-
-        try:
-            sorted_matches = sorted(matches, key=_sort_key)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                f"slash_watcher: _first_payment_hash sort raised "
-                f"{type(e).__name__}: {e} — falling back to unsorted "
-                f"iteration"
-            )
-            sorted_matches = list(matches)
-        for m in sorted_matches:
-            if not isinstance(m, dict):
-                continue
-            address = m.get("address")
-            if not isinstance(address, str):
-                continue
-            try:
-                candidate_hash = extract_payment_hash_from_cardano_address(
-                    address,
-                )
-            except ValueError:
-                # Skip non-CIP-0019 type-0/6 addresses (script /
-                # enterprise / type-7 etc). Move on to the next
-                # output. None at the end if NONE decode.
-                continue
-            # CRITICAL: filter out the expected beneficiary. Without
-            # this, a Kupo shape error could surface the beneficiary's
-            # own payment hash as "actual" and the dispatcher would
-            # then defer via the FraudProofInvalid-style internal-
-            # consistency check in classify_fraud (actual == stored
-            # short-circuits to no-slash). But if there's ALSO a
-            # change output, we'd return that hash here and slash an
-            # honest requester for WrongBeneficiary(change_hash).
-            if candidate_hash == expected_beneficiary_blake2_224:
-                continue
-            return candidate_hash
-        return None
+            candidate_hash = extract_payment_hash_from_cardano_address(address)
+        except ValueError:
+            # Script, enterprise and other non type-0/6 addresses.
+            continue
+        if candidate_hash == expected_beneficiary_blake2_224:
+            continue
+        return candidate_hash
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -957,7 +812,7 @@ class SlashWatcher:
          independently observes the requested Cardano tx via
          Ogmios+Kupo.
       3. Runs the classifier. None → no slash. Otherwise builds the
-         FRAU preimage, signs blake2_256(preimage) with the
+         runtime-selected preimage, signs blake2_256(preimage) with the
          cert-daemon sr25519 key, assembles an M-sig envelope via
          the gateway aggregator (channel namespace ``slash``), and
          submits ``IntentSettlement::slash_bad_settlement_evidence``.
@@ -1016,6 +871,119 @@ class SlashWatcher:
                 )
                 min_signer_threshold = 2
         self.min_signer_threshold = max(1, int(min_signer_threshold or 1))
+        # Pending request (as a tuple) -> Cardano tip (height, slot) of its
+        # tx's first proven absence.
+        self._absences: dict[tuple, tuple[int, int]] = {}
+        # Last logged runtime-context error and Kupo coverage gap, so each
+        # change is logged once.
+        self._context_error: Optional[str] = None
+        self._coverage_reported: Optional[str] = "unreported"
+
+    async def _runtime_context(self) -> Optional[dict]:
+        try:
+            context = checked_runtime_context(await asyncio.to_thread(self.client.get_settlement_runtime_context))
+        except Exception as error:
+            if self._context_error != type(error).__name__:
+                self._context_error = type(error).__name__
+                logger.error("slash_watcher: settlement runtime unavailable (%s); refusing to sign or submit",
+                             type(error).__name__)
+            return None
+        self._context_error = None
+        return context
+
+    async def _report_status(self) -> None:
+        """Reads the runtime context, which the client announces once per
+        runtime; how far the node's tip trails the network, exported as
+        ``slash_cardano_tip_lag_slots``; and whether Kupo can prove fraud,
+        logged when it changes and exported as ``slash_kupo_coverage_ok``.
+        Runs every poll, pending requests or not."""
+        await self._runtime_context()
+        try:
+            lag = await self.observer.network_tip_lag()
+        except Exception as error:  # noqa: BLE001
+            logger.warning("slash_watcher: reading the Cardano tip raised %s", type(error).__name__)
+            lag = None
+        if lag is not None:
+            health_server.update_metrics(slash_cardano_tip_lag_slots=lag)
+        try:
+            gap = await self.observer.kupo_coverage_gap()
+        except Exception as error:  # noqa: BLE001
+            gap = f"probe_failed:{type(error).__name__}"
+        health_server.update_metrics(slash_kupo_coverage_ok=int(gap is None))
+        if gap == self._coverage_reported:
+            return
+        self._coverage_reported = gap
+        if gap is None:
+            logger.info("slash_watcher: Kupo at %s indexes every address and keeps spent outputs; it can prove fraud",
+                        self.observer.kupo_url)
+        else:
+            logger.warning("slash_watcher: Kupo at %s cannot prove fraud (%s); no slash will be signed",
+                           self.observer.kupo_url, gap)
+
+    async def _request_context(self, request: PendingBondedRequest, verdict: SlashVerdict) -> Optional[dict]:
+        context = await self._runtime_context()
+        if context is None:
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "runtime_unavailable"
+            return None
+        if past_slash_window(request, context):
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "request_expired"
+            logger.info("slash_watcher: request_expired claim_id=%s", request.claim_id.hex())
+            return None
+        return context
+
+    async def _confirm_absence(self, request: PendingBondedRequest) -> tuple[bool, str]:
+        """Whether the tx of ``request`` was proven absent twice, at Cardano
+        tip heights at least TX_ABSENCE_CONFIRM_BLOCKS apart, over a chain no
+        sparser than CHAIN_SLOTS_PER_BLOCK_MAX slots per block. A tx seen in
+        between, here or by an observation, restarts the count, as does a
+        sparse chain; a replacement request starts its own."""
+        key = astuple(request)
+        proof, reason = await self.observer.prove_absence(request.cardano_tx_hash.hex())
+        if proof is None:
+            if reason == "tx_found":
+                self._absences.pop(key, None)
+            return False, reason
+        height, slot = proof
+        first_height, first_slot = self._absences.setdefault(key, proof)
+        blocks = height - first_height
+        if blocks < TX_ABSENCE_CONFIRM_BLOCKS:
+            return False, f"absence_unconfirmed:first_height={first_height},height={height}"
+        if slot - first_slot > CHAIN_SLOTS_PER_BLOCK_MAX * blocks:
+            self._absences[key] = proof
+            return False, f"cardano_chain_sparse:{slot - first_slot}_slots_over_{blocks}_blocks"
+        return True, f"absent_from_height={first_height}_to_{height}"
+
+    async def _still_current(self, request: PendingBondedRequest, verdict: SlashVerdict, context: dict) -> bool:
+        """Whether the bundle signed under ``context`` may still be submitted:
+        the runtime and protocol are unchanged, the request is in its slash
+        window, and the claim still holds that request. A FRAU digest does not
+        name the request, so a bundle must go only against the row it was
+        signed for."""
+        current = await self._request_context(request, verdict)
+        if current is None:
+            return False
+        if current["protocol"] != context["protocol"]:
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "runtime_changed"
+            logger.warning("slash_watcher: runtime_changed; discarding envelope and retrying next tick")
+            return False
+        try:
+            pending = await asyncio.to_thread(self.client.get_settlement_request, request.claim_id)
+        except Exception as error:  # noqa: BLE001
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "request_unreadable"
+            logger.warning("slash_watcher: rereading claim %s... raised %s; not slashing",
+                           request.claim_id.hex()[:16], type(error).__name__)
+            return False
+        if pending is None or PendingBondedRequest(**pending) != request:
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "request_changed"
+            logger.warning("slash_watcher: claim %s... no longer holds the request the bundle was signed for",
+                           request.claim_id.hex()[:16])
+            return False
+        return True
 
     async def process_one(
         self,
@@ -1049,6 +1017,9 @@ class SlashWatcher:
             verdict.detail = "unbonded_skip"
             return verdict
 
+        if await self._request_context(request, verdict) is None:
+            return verdict
+
         # Observe the Cardano tx. The observer returns either a
         # populated SlashObservation or an observation with mismatch
         # tags. We pass the EXPECTED beneficiary hash so the
@@ -1073,30 +1044,15 @@ class SlashWatcher:
             verdict.detail = f"observer_raised: {type(e).__name__}"
             return verdict
 
-        # The observation must distinguish between three states:
-        #
-        #   (a) "tx not on chain" — Kupo successfully looked up and
-        #       returned an empty match list. The observer signals
-        #       this with the `kupo_no_matches_for_tx` mismatch tag.
-        #       This is the TxNotFound proof's CANDIDATE trigger —
-        #       but only after the sync gate below confirms the
-        #       follower is caught up.
-        #   (b) "tx exists, here's the data" — no mismatch tags,
-        #       fields populated. The classifier compares fields and
-        #       returns Wrong* or None.
-        #   (c) "tooling failed" — anything else (kupo timeout,
-        #       ogmios unreachable, malformed response,
-        #       kupo_response_shape_error). The observer surfaces
-        #       non-`kupo_no_matches_for_tx` mismatch tags
-        #       (`ogmios_tip_unavailable`, `kupo_match_missing_slot`,
-        #       `kupo_response_shape_error`, etc.) — we MUST NOT
-        #       classify those as TxNotFound.
+        if observation.outputs:
+            self._absences.pop(astuple(request), None)
+
+        # Only `kupo_no_matches_for_tx` (a successful, empty lookup) can lead
+        # to a proof; any other tag is an incomplete observation.
         if (
             observation.mismatches
             and "kupo_no_matches_for_tx" not in observation.mismatches
         ):
-            # State (c) — defer. Log so an operator can see why the
-            # slash didn't progress.
             logger.info(
                 f"slash_watcher: observation incomplete for claim "
                 f"{request.claim_id.hex()[:16]}... — "
@@ -1106,55 +1062,33 @@ class SlashWatcher:
             verdict.detail = ", ".join(observation.mismatches)
             return verdict
 
-        # Vuln 3: gate `TxNotFound` promotion on the local Kupo
-        # follower being demonstrably caught up. Probe the
-        # `/health` endpoint (if the observer exposes the helper)
-        # and feed the slot to the classifier; an unreachable or
-        # behind follower causes the classifier to defer rather than
-        # promote an empty match list to a slash.
-        kupo_checkpoint_slot: Optional[int] = None
-        if "kupo_no_matches_for_tx" in observation.mismatches:
-            checkpoint_getter = getattr(
-                self.observer, "kupo_checkpoint_slot", None,
-            )
-            if checkpoint_getter is not None:
-                try:
-                    kupo_checkpoint_slot = await checkpoint_getter()
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"slash_watcher: kupo_checkpoint_slot probe "
-                        f"raised for claim_id="
-                        f"{request.claim_id.hex()[:16]}...: "
-                        f"{type(e).__name__}: {e} — deferring slash"
-                    )
-                    kupo_checkpoint_slot = None
-
-        proof = classify_fraud(
-            request, observation,
-            kupo_checkpoint_slot=kupo_checkpoint_slot,
-        )
-        # The classifier appends `kupo_behind_request_depth` to the
-        # observation mismatches when it defers due to the sync gate.
-        # Surface that explicitly so the operator sees the right
-        # reason in journalctl (NOT a generic OBSERVER_UNAVAILABLE).
+        # Everything below compares the request with the network Ogmios
+        # follows; an observer on another network proves nothing.
         if (
-            proof is None
-            and "kupo_behind_request_depth" in observation.mismatches
+            observation.mainchain_genesis_hash is not None
+            and observation.mainchain_genesis_hash != request.mainchain_genesis_hash
         ):
-            logger.info(
-                f"slash_watcher: deferring TxNotFound slash for claim "
-                f"{request.claim_id.hex()[:16]}... — Kupo follower "
-                f"checkpoint_slot={kupo_checkpoint_slot} below "
-                f"request.observed_slot={request.observed_slot} + margin "
-                f"({KUPO_SYNC_SAFETY_MARGIN_SLOTS}). Will retry next "
-                f"tick."
-            )
-            verdict.outcome = ClassifierOutcome.KUPO_BEHIND_REQUEST_DEPTH
-            verdict.detail = (
-                f"kupo_checkpoint_slot={kupo_checkpoint_slot} "
-                f"vs request.observed_slot={request.observed_slot}"
+            verdict.outcome = ClassifierOutcome.DEFERRED
+            verdict.detail = "cardano_network_mismatch"
+            logger.warning(
+                "slash_watcher: observer follows another Cardano network than claim %s... requests; not slashing",
+                request.claim_id.hex()[:16],
             )
             return verdict
+
+        absence_proven = False
+        if "kupo_no_matches_for_tx" in observation.mismatches:
+            absence_proven, reason = await self._confirm_absence(request)
+            if not absence_proven:
+                verdict.outcome = ClassifierOutcome.TX_ABSENCE_UNPROVEN
+                verdict.detail = reason
+                logger.info(
+                    "slash_watcher: tx of claim %s... not proven absent (%s); not slashing yet",
+                    request.claim_id.hex()[:16], reason,
+                )
+                return verdict
+
+        proof = classify_fraud(request, observation, absence_proven=absence_proven)
         if proof is None:
             # State (b) with honest evidence — no slash. The settle
             # attestor's STCA path handles the close.
@@ -1165,10 +1099,24 @@ class SlashWatcher:
             )
             return verdict
 
+        # A negative claim about the tx's outputs needs a Kupo that sees
+        # every address and every spent output (prove_absence checked this
+        # for TxNotFound).
+        if not absence_proven:
+            gap = await self.observer.kupo_coverage_gap()
+            if gap is not None:
+                verdict.outcome = ClassifierOutcome.KUPO_COVERAGE_GAP
+                verdict.detail = f"kupo_coverage:{gap}"
+                logger.warning(
+                    "slash_watcher: %s for claim %s... is unprovable on this Kupo (%s); not slashing",
+                    type(proof).__name__, request.claim_id.hex()[:16], gap,
+                )
+                return verdict
+
         # Tag the outcome by variant for journalctl grep.
         if isinstance(proof, TxNotFound):
             verdict.outcome = ClassifierOutcome.SLASH_TX_NOT_FOUND
-            verdict.detail = "kupo_returned_no_matches"
+            verdict.detail = reason
         elif isinstance(proof, WrongAmount):
             verdict.outcome = ClassifierOutcome.SLASH_WRONG_AMOUNT
             verdict.detail = (
@@ -1183,11 +1131,13 @@ class SlashWatcher:
             )
         verdict.fraud_proof = proof
 
-        # Build + sign the FRAU digest.
-        preimage = build_frau_preimage(
-            chain_id=live_chain_id,
-            claim_id=request.claim_id,
-            fraud_proof=proof,
+        context = await self._request_context(request, verdict)
+        if context is None:
+            return verdict
+        preimage = (
+            build_frau_preimage(live_chain_id, request.claim_id, proof)
+            if context["protocol"] == "FRAU"
+            else build_frv2_preimage(live_chain_id, request, proof)
         )
         digest = compute_frau_digest(preimage)
         sig_bytes = self.client.keypair.sign(digest)
@@ -1263,39 +1213,28 @@ class SlashWatcher:
                 f"{self.min_signer_threshold} sigs for "
                 f"{request.claim_id.hex()[:16]}... — submitting slash"
             )
-            async with self._chain_write_lock:
-                try:
-                    ext_hash = await asyncio.to_thread(
-                        self.client.submit_slash_bad_settlement_evidence,
-                        request.claim_id,
-                        proof,
-                        envelope,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"slash_watcher: submit_slash_envelope raised "
-                        f"for {request.claim_id.hex()[:16]}...: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    verdict.detail = f"submit_raised: {type(e).__name__}"
-                    return verdict
         else:
-            async with self._chain_write_lock:
-                try:
-                    ext_hash = await asyncio.to_thread(
-                        self.client.submit_slash_bad_settlement_evidence,
-                        request.claim_id,
-                        proof,
-                        [(pubkey_bytes, sig_bytes)],
-                    )
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(
-                        f"slash_watcher: submit_slash_1sig raised for "
-                        f"{request.claim_id.hex()[:16]}...: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    verdict.detail = f"submit_raised: {type(e).__name__}"
-                    return verdict
+            envelope = [(pubkey_bytes, sig_bytes)]
+
+        async with self._chain_write_lock:
+            try:
+                current = await asyncio.wait_for(self._still_current(request, verdict, context),
+                                                 LOCKED_REREAD_SECONDS)
+            except asyncio.TimeoutError:
+                verdict.outcome = ClassifierOutcome.DEFERRED
+                verdict.detail = "reread_timed_out"
+                return verdict
+            if not current:
+                return verdict
+            try:
+                ext_hash = await asyncio.to_thread(
+                    self.client.submit_slash_bad_settlement_evidence,
+                    request.claim_id, proof, envelope,
+                )
+            except Exception as error:
+                logger.warning("slash_watcher: submit_slash raised: %s", type(error).__name__)
+                verdict.detail = f"submit_raised: {type(error).__name__}"
+                return verdict
 
         if not ext_hash:
             logger.warning(
@@ -1329,6 +1268,11 @@ class SlashWatcher:
             )
             return
         if not requests:
+            self._absences.clear()
+            return
+
+        context = await self._runtime_context()
+        if context is None:
             return
 
         # Convert dicts → PendingBondedRequest at the boundary
@@ -1359,8 +1303,12 @@ class SlashWatcher:
                 # Filter early: unbonded rows are not slashable. The
                 # settle attestor handles them via the STCA path.
                 continue
+            if past_slash_window(req, context):
+                continue
             bonded.append(req)
 
+        live = {astuple(req) for req in bonded}
+        self._absences = {key: height for key, height in self._absences.items() if key in live}
         if not bonded:
             return
         logger.info(
@@ -1386,39 +1334,10 @@ class SlashWatcher:
                 )
 
     async def _run_forever(self) -> None:
-        while self._running:
-            live_chain_id_hex = await asyncio.to_thread(
-                self.client.get_genesis_hash
-            )
-            if not live_chain_id_hex:
-                logger.info(
-                    "slash_watcher: substrate genesis not yet available "
-                    "— skipping tick"
-                )
-            else:
-                try:
-                    chain_id = bytes.fromhex(
-                        live_chain_id_hex.removeprefix("0x")
-                    )
-                except ValueError:
-                    logger.warning(
-                        f"slash_watcher: malformed live genesis "
-                        f"{live_chain_id_hex!r} — skipping tick"
-                    )
-                    chain_id = b""
-                if len(chain_id) == 32:
-                    try:
-                        await self._tick(chain_id)
-                    except Exception as e:  # noqa: BLE001
-                        logger.error(
-                            f"slash_watcher: tick raised "
-                            f"{type(e).__name__}: {e}",
-                            exc_info=True,
-                        )
-            try:
-                await asyncio.sleep(self._poll_interval)
-            except asyncio.CancelledError:
-                break
+        async def poll(chain_id: bytes) -> None:
+            await self._report_status()
+            await self._tick(chain_id)
+        await poll_forever("slash_watcher", self.client, self._poll_interval, lambda: self._running, poll)
 
     def start(self) -> None:
         """Schedule the background loop on the running event loop.
@@ -1504,7 +1423,9 @@ def maybe_create_slash_watcher(
     gateway_url = (getattr(config, "blob_gateway_url", "") or "").strip()
     if gateway_url:
         from daemon.multisig_aggregator import MultisigAggregator
-        aggregator = MultisigAggregator(gateway_url=gateway_url)
+        aggregator = MultisigAggregator(
+            gateway_url=gateway_url, committee=substrate_client.get_committee_pubkeys,
+        )
         logger.info(
             f"slash_watcher: multisig aggregator wired (gateway={gateway_url})"
         )
@@ -1530,7 +1451,12 @@ __all__ = [
     "FRAUD_DISCRIMINANT_WRONG_AMOUNT",
     "FRAUD_DISCRIMINANT_TX_NOT_FOUND",
     "FRAUD_DISCRIMINANT_WRONG_BENEFICIARY",
-    "KUPO_SYNC_SAFETY_MARGIN_SLOTS",
+    "KUPO_TIP_LAG_MAX_SLOTS",
+    "TX_ABSENCE_CONFIRM_BLOCKS",
+    "CARDANO_TIP_LAG_MAX_SLOTS",
+    "CHAIN_SLOTS_PER_BLOCK_MAX",
+    "NETWORK_CLOCKS",
+    "SPENT_CANARIES",
     "WrongAmount",
     "TxNotFound",
     "WrongBeneficiary",

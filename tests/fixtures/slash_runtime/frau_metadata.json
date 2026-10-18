@@ -1,0 +1,632 @@
+{
+ "provenance": {
+  "source": "live Materios preprod state_getMetadata via ws://127.0.0.1:9945 (read-only)",
+  "block_hash": "0x2743fc10c7f463e5d2256cd90f3ab66226018475c01585fc4e57265bf3ed5311",
+  "block_number": 2330118,
+  "spec_name": "materios",
+  "spec_version": 239,
+  "genesis": "0x0e46e33f639a56cc8780fd871d9a15e16d99af248526f907cb560cb40849f7bf",
+  "metadata_sha256": "df165b811cc3c364a1829c6aaf92a0fbd2db09b42f59c2cce5fa6d93448e79fd",
+  "trimmed_to": {
+   "calls": [
+    "request_settle",
+    "slash_bad_settlement_evidence",
+    "supersede_settlement_request"
+   ],
+   "storage": [
+    "ClaimSettlementRequests",
+    "SlashedSettlementRequests",
+    "BondSlashedRequests"
+   ],
+   "constants": [
+    "SettlementRequestTtl",
+    "SlashWatcherShareBps",
+    "MinFinalityDepth",
+    "SlashSettlementTag",
+    "AttestSettleTag"
+   ]
+  }
+ },
+ "v14": {
+  "pallets": [
+   {
+    "name": "IntentSettlement",
+    "index": 19,
+    "calls": {
+     "ty": 176
+    },
+    "storage": {
+     "prefix": "IntentSettlement",
+     "entries": [
+      {
+       "name": "ClaimSettlementRequests",
+       "modifier": "Optional",
+       "type": {
+        "Map": {
+         "hashers": [
+          "Blake2_128Concat"
+         ],
+         "key": 13,
+         "value": 266
+        }
+       },
+       "default": "\u0000",
+       "documentation": [
+        " Task #266 (mis-sec P0): pending `request_settle` records, keyed by",
+        " claim_id. Populated by `request_settle`; consumed by `attest_settle`",
+        " (removed on successful attestation OR on `SettlementRequestExpired`).",
+        "",
+        " Bounded indirectly: each entry pins one storage slot until consumed",
+        " or expired. The TTL gate at `Config::SettlementRequestTtl` blocks",
+        " keeps the worst-case live set size bounded by `expected claim rate ×",
+        " TTL_blocks`, which is single-digit on preprod and ~hundreds on",
+        " mainnet."
+       ]
+      },
+      {
+       "name": "BondSlashedRequests",
+       "modifier": "Optional",
+       "type": {
+        "Map": {
+         "hashers": [
+          "Blake2_128Concat"
+         ],
+         "key": 13,
+         "value": 39
+        }
+       },
+       "default": "\u0000",
+       "documentation": [
+        " Task #84 (mis-sec P1): tombstone set for claims whose bond was",
+        " slashed via `slash_bad_settlement_evidence`. The presence of an",
+        " entry blocks a re-attest, re-bond, or release attempt on the same",
+        " claim — once a watcher has prosecuted a fraudulent settlement",
+        " request, the requester cannot re-post the same claim_id under a",
+        " fresh evidence record nor recover the bond. Acts as the",
+        " \"slashed-no-release\" gate referenced by `BondSlashedNoRelease`.",
+        "",
+        " Bounded indirectly: only `slash_bad_settlement_evidence` inserts,",
+        " and the call requires a successful M-of-N round + an internally-",
+        " consistent fraud proof, so the live set tracks actual prosecuted",
+        " fraud events — single-digit on preprod, ~tens worst case on",
+        " mainnet."
+       ]
+      }
+     ]
+    },
+    "event": null,
+    "error": null,
+    "constants": [
+     {
+      "name": "MinFinalityDepth",
+      "type": 4,
+      "value": "0x0f000000",
+      "documentation": [
+       " Task #266 (mis-sec P0): minimum Cardano confirmation depth before",
+       " a `request_settle` is eligible to be attested. Default 15 Materios",
+       " blocks (~5 min preprod, ~36 min mainnet — matches the legacy",
+       " keeper rule at `docs/spec-v1.md` L731). Governance-tunable via the",
+       " same path used for `MinSignerThreshold`. The attestor's own",
+       " Cardano-side k=2160-slot rule is enforced off-chain in",
+       " cert-daemon; this constant is the **pallet's** freshness gate",
+       " (attest_settle rejects bundles whose evidence reports",
+       " `observed_at_depth < MinFinalityDepth`)."
+      ]
+     },
+     {
+      "name": "SettlementRequestTtl",
+      "type": 4,
+      "value": "0x60090000",
+      "documentation": [
+       " Task #266 (mis-sec P0): maximum age (in Materios blocks) of a",
+       " pending settlement request before `attest_settle` rejects it",
+       " with `SettlementRequestExpired`. Default 2400 blocks (~4h) — long",
+       " enough for any attestor-pool downtime, short enough that stale",
+       " requests don't pin storage."
+      ]
+     },
+     {
+      "name": "SlashWatcherShareBps",
+      "type": 4,
+      "value": "0x88130000",
+      "documentation": [
+       " Task #84 (mis-sec P1): basis-point share of a slashed bond paid",
+       " out to the watcher who proved the fraud. `5000` (= 50%) is the",
+       " test default and the design-memo §6 #9 starting point;",
+       " governance-tunable post-launch. Values outside `[0, 10_000]`",
+       " are clamped at the call site so a misconfigured runtime can",
+       " never pay out more than the bond."
+      ]
+     }
+    ]
+   }
+  ],
+  "types": {
+   "types": [
+    {
+     "id": 0,
+     "type": {
+      "path": [
+       "sp_core",
+       "crypto",
+       "AccountId32"
+      ],
+      "params": [],
+      "def": {
+       "composite": {
+        "fields": [
+         {
+          "name": null,
+          "type": 1,
+          "typeName": "[u8; 32]",
+          "docs": []
+         }
+        ]
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 1,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "array": {
+        "len": 32,
+        "type": 2
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 2,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "primitive": "u8"
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 4,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "primitive": "u32"
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 6,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "primitive": "u128"
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 8,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "primitive": "bool"
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 12,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "primitive": "u64"
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 13,
+     "type": {
+      "path": [
+       "primitive_types",
+       "H256"
+      ],
+      "params": [],
+      "def": {
+       "composite": {
+        "fields": [
+         {
+          "name": null,
+          "type": 1,
+          "typeName": "[u8; 32]",
+          "docs": []
+         }
+        ]
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 39,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "tuple": []
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 59,
+     "type": {
+      "path": [
+       "pallet_intent_settlement",
+       "types",
+       "FraudProof"
+      ],
+      "params": [],
+      "def": {
+       "variant": {
+        "variants": [
+         {
+          "name": "WrongAmount",
+          "fields": [
+           {
+            "name": "actual_lovelace",
+            "type": 6,
+            "typeName": "u128",
+            "docs": []
+           }
+          ],
+          "index": 0,
+          "docs": []
+         },
+         {
+          "name": "TxNotFound",
+          "fields": [],
+          "index": 1,
+          "docs": []
+         },
+         {
+          "name": "WrongBeneficiary",
+          "fields": [
+           {
+            "name": "actual_payment_hash",
+            "type": 60,
+            "typeName": "[u8; 28]",
+            "docs": []
+           }
+          ],
+          "index": 2,
+          "docs": []
+         }
+        ]
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 60,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "array": {
+        "len": 28,
+        "type": 2
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 114,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "array": {
+        "len": 64,
+        "type": 2
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 176,
+     "type": {
+      "path": [
+       "pallet_intent_settlement",
+       "pallet",
+       "Call"
+      ],
+      "params": [
+       {
+        "name": "T",
+        "type": null
+       }
+      ],
+      "def": {
+       "variant": {
+        "variants": [
+         {
+          "name": "request_settle",
+          "fields": [
+           {
+            "name": "claim_id",
+            "type": 13,
+            "typeName": "ClaimId",
+            "docs": []
+           },
+           {
+            "name": "cardano_tx_hash",
+            "type": 1,
+            "typeName": "[u8; 32]",
+            "docs": []
+           },
+           {
+            "name": "settled_direct",
+            "type": 8,
+            "typeName": "bool",
+            "docs": []
+           },
+           {
+            "name": "attestation_evidence",
+            "type": 200,
+            "typeName": "SettlementEvidence",
+            "docs": []
+           }
+          ],
+          "index": 13,
+          "docs": [
+           "Task #266 (mis-sec P0): Phase 1 of the new attested settlement",
+           "pipeline. Anyone can submit `request_settle` once they observe",
+           "the matching Cardano transaction; the signer pays the (negligible)",
+           "extrinsic fee. The pallet stores the `SettlementEvidence` keyed",
+           "by `claim_id` and waits for a follow-up `attest_settle` call",
+           "carrying M-of-N committee signatures over the canonical STCA",
+           "payload (which mixes the stored evidence with chain-state-derived",
+           "fields like `voucher_digest`).",
+           "",
+           "The requester is NOT required to be a committee member — this is",
+           "the permissionless-keeper hand-off contemplated by task #84.",
+           "Bond + slash on bad evidence is added in #84 (`requester` is",
+           "stored here precisely as the slash target).",
+           "",
+           "Per-call invariants:",
+           "- `evidence.observed_at_depth >= Config::MinFinalityDepth`",
+           "  (`FinalityDepthBelowMinimum`).",
+           "- `evidence.mainchain_genesis_hash == Config::MainchainGenesisHash`",
+           "  (`WrongMainchainGenesis`).",
+           "- Claim must exist (`ClaimNotFound`) and not already be settled",
+           "  (`AlreadySettled`).",
+           "- Voucher must exist (`VoucherMissing`) — we cross-check the",
+           "  amount + beneficiary now, not just at attest time, so a",
+           "  provably-bad request never even pins storage.",
+           "- No pending request for this claim_id can exist",
+           "  (`SettlementRequestAlreadyExists`). The requester waits out",
+           "  `SettlementRequestTtl` before re-posting; this preempts a",
+           "  request-flapper attack."
+          ]
+         },
+         {
+          "name": "slash_bad_settlement_evidence",
+          "fields": [
+           {
+            "name": "claim_id",
+            "type": 13,
+            "typeName": "ClaimId",
+            "docs": []
+           },
+           {
+            "name": "fraud_proof",
+            "type": 59,
+            "typeName": "FraudProof",
+            "docs": []
+           },
+           {
+            "name": "signatures",
+            "type": 184,
+            "typeName": "Vec<(CommitteePubkey, CommitteeSig)>",
+            "docs": []
+           }
+          ],
+          "index": 20,
+          "docs": [
+           "Task #84 (mis-sec P1): the watcher posts a `FraudProof`",
+           "against an outstanding `request_settle` entry. M-of-N",
+           "committee signatures over the canonical FRAU digest attest",
+           "the watcher's claim is truthful; the reserved bond is split",
+           "`SlashWatcherShareBps / 10_000` to the watcher and the rest",
+           "to the treasury PalletId-derived account.",
+           "",
+           "Per-call invariants:",
+           "- Pending request must exist (`SettlementRequestMissing`).",
+           "- Pending request must be bonded (`BondNotReserved`).",
+           "- `fraud_proof` must be internally consistent with the",
+           "  stored evidence (`FraudProofInvalid`) — e.g., a",
+           "  `WrongAmount { actual_lovelace = X }` proof requires",
+           "  `X != stored.amount_lovelace`.",
+           "- `signatures` must clear the same M-of-N threshold",
+           "  `attest_settle` uses (`FraudThresholdNotMet`).",
+           "- `signatures` must verify against the canonical FRAU",
+           "  pre-image (`InvalidSignature` — surfaced by",
+           "  `ensure_threshold_signatures`).",
+           "- Caller binding: the watcher's own pubkey MUST appear in",
+           "  the sig bundle (`ensure_threshold_signatures` enforces).",
+           "",
+           "On success: the bond is repatriated via",
+           "`Currency::repatriate_reserved` (watcher gets",
+           "`bond * watcher_bps / 10_000`, treasury gets the rest),",
+           "`BondSlashedRequests[claim_id]` is set, the",
+           "`ClaimSettlementRequests` row is removed (so",
+           "`attest_settle` errors with `SettlementRequestMissing`),",
+           "and `SettlementBondSlashed` is emitted."
+          ]
+         }
+        ]
+       }
+      },
+      "docs": [
+       "Contains a variant per dispatchable extrinsic that this pallet has."
+      ]
+     }
+    },
+    {
+     "id": 183,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "tuple": [
+        1,
+        114
+       ]
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 184,
+     "type": {
+      "path": [],
+      "params": [],
+      "def": {
+       "sequence": {
+        "type": 183
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 200,
+     "type": {
+      "path": [
+       "pallet_intent_settlement",
+       "types",
+       "SettlementEvidence"
+      ],
+      "params": [],
+      "def": {
+       "composite": {
+        "fields": [
+         {
+          "name": "cardano_tx_hash",
+          "type": 1,
+          "typeName": "[u8; 32]",
+          "docs": []
+         },
+         {
+          "name": "observed_at_depth",
+          "type": 4,
+          "typeName": "u32",
+          "docs": []
+         },
+         {
+          "name": "observed_slot",
+          "type": 12,
+          "typeName": "u64",
+          "docs": []
+         },
+         {
+          "name": "beneficiary_addr_hash",
+          "type": 60,
+          "typeName": "[u8; 28]",
+          "docs": []
+         },
+         {
+          "name": "amount_lovelace",
+          "type": 12,
+          "typeName": "u64",
+          "docs": []
+         },
+         {
+          "name": "mainchain_genesis_hash",
+          "type": 1,
+          "typeName": "[u8; 32]",
+          "docs": []
+         }
+        ]
+       }
+      },
+      "docs": []
+     }
+    },
+    {
+     "id": 266,
+     "type": {
+      "path": [
+       "pallet_intent_settlement",
+       "types",
+       "SettlementRequestRecord"
+      ],
+      "params": [
+       {
+        "name": "AccountId",
+        "type": 0
+       },
+       {
+        "name": "BlockNumber",
+        "type": 4
+       }
+      ],
+      "def": {
+       "composite": {
+        "fields": [
+         {
+          "name": "requester",
+          "type": 0,
+          "typeName": "AccountId",
+          "docs": []
+         },
+         {
+          "name": "evidence",
+          "type": 200,
+          "typeName": "SettlementEvidence",
+          "docs": []
+         },
+         {
+          "name": "settled_direct",
+          "type": 8,
+          "typeName": "bool",
+          "docs": []
+         },
+         {
+          "name": "submitted_block",
+          "type": 4,
+          "typeName": "BlockNumber",
+          "docs": []
+         },
+         {
+          "name": "bond_amount",
+          "type": 6,
+          "typeName": "u128",
+          "docs": []
+         }
+        ]
+       }
+      },
+      "docs": []
+     }
+    }
+   ]
+  }
+ }
+}
