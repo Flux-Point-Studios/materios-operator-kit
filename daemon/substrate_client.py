@@ -67,6 +67,24 @@ def supersede_offered(v14: dict, attest_tag: Optional[bytes]) -> bool:
     return True
 
 
+def settlement_contract(metadata: Any) -> dict:
+    """What a runtime's decoded metadata makes the daemons sign: the slash
+    protocol and the contract fingerprint behind it, whether supersede is
+    offered, the TTL and MinFinalityDepth. Raises on any runtime outside the
+    reviewed contracts."""
+    v14 = metadata.value[1]["V14"]
+    constants = {c.name: bytes(c.constant_value)
+                 for c in metadata.get_metadata_pallet("IntentSettlement").constants}
+    fingerprint = slash_contract_fingerprint(v14)
+    return dict(
+        protocol=select_slash_protocol(fingerprint, constants.get("SlashSettlementTag")),
+        fingerprint=fingerprint,
+        supersede=supersede_offered(v14, constants.get("AttestSettleTag")),
+        ttl=_u32_constant(constants, "SettlementRequestTtl"),
+        min_finality_depth=_u32_constant(constants, "MinFinalityDepth"),
+    )
+
+
 def _u32_constant(constants: dict, name: str) -> int:
     raw = constants[name]
     if len(raw) != 4:
@@ -767,18 +785,7 @@ class SubstrateClient:
     def _read_settlement_contract(self, head: str) -> dict:
         # get_constant/get_metadata_call_function select the parent's runtime
         # in substrate-interface 1.x, which is stale at an upgrade block.
-        metadata = self._call("get_block_metadata", head, conn=self._read)
-        v14 = metadata.value[1]["V14"]
-        constants = {c.name: bytes(c.constant_value)
-                     for c in metadata.get_metadata_pallet("IntentSettlement").constants}
-        fingerprint = slash_contract_fingerprint(v14)
-        return dict(
-            protocol=select_slash_protocol(fingerprint, constants.get("SlashSettlementTag")),
-            fingerprint=fingerprint,
-            supersede=supersede_offered(v14, constants.get("AttestSettleTag")),
-            ttl=_u32_constant(constants, "SettlementRequestTtl"),
-            min_finality_depth=_u32_constant(constants, "MinFinalityDepth"),
-        )
+        return settlement_contract(self._call("get_block_metadata", head, conn=self._read))
 
     # --- Bond helpers (OrinqReceipts pallet) --------------------------------
     # These are used by CertDaemon._ensure_bond() to keep the attestor's

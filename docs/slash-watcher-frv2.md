@@ -313,23 +313,193 @@ mutants.
 `test_merged_settlement_vector` checks the Python FRV2 digest against the
 vector settlement `0757de3` asserts in `integration.rs`.
 
-## Rollout order
+## Rollout runbook
 
-1. Review and release this operator-kit change.
-2. Deploy it to the cert-daemons that reach Cardano (slash watcher and
-   settle attestor run in the same process): Gemtek and Node-3, the M=2
-   committee for these paths. Deploy it to the custody watcher on node2.
-   Verify each cert-daemon detects FRAU, `supersede=False`, TTL 2400 and
-   `MinFinalityDepth` 15 on live spec 239. Rollback before enactment is the
-   previous image or release. After enactment the previous builds' slashes
-   fail (they sign FRAU), their attestors cannot supersede and the previous
-   custody watcher pages on every supersede, so roll forward instead.
-3. Enact the reviewed runtime (Materios `67ec3d9`, spec 242, transaction
-   version 6, settlement `0757de3`). Before enactment, check that its
-   metadata carries `SlashSettlementTag` = `FRV2` and fingerprints to the FRV2
-   pin; the tag cannot reveal a layout change under an unchanged tag (see
-   Limit), so also check the settlement revision. After enactment, verify
-   every daemon detects FRV2 and `supersede=True`.
+Everything below happens before spec 242 is enacted. `$SHA` is the merge
+commit of this change on `main`; the main pipeline publishes
+`ghcr.io/flux-point-studios/materios-operator-kit:$SHA` (amd64 and arm64).
+Old and new daemons can run side by side on spec 239: both sign FRAU and
+neither supersedes, so the hosts can be done one at a time. Never print a
+compose file, an env file or `docker inspect` env output: they hold signer
+keys.
+
+### 0. Enable slashing (infrastructure, optional)
+
+Without this the new daemons sign no slash (see above); attest, expire and
+supersede work either way. On Node-3:
+
+```sh
+sudo ufw allow from 172.17.0.0/16 to any port 1444 proto tcp comment 'Docker -> kupo-preprod-all-ro for slash proofs'
+```
+
+Then use `http://192.168.0.133:1444` as `KUPO_URL` in steps 1 and 2.
+
+### 1. Node-3 cert-daemon (standalone container)
+
+```sh
+ssh deci@192.168.0.133
+SHA=<merge sha>
+sudo docker pull ghcr.io/flux-point-studios/materios-operator-kit:$SHA
+sudo install -d -m 700 /root/cert-daemon-$SHA
+# The env file holds the signer key: root-only, never printed.
+sudo sh -c "docker inspect cert-daemon-preprod --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep -v -E '^(PATH|LANG|GPG_KEY|PYTHON_VERSION|PYTHON_SHA256)=' > /root/cert-daemon-$SHA/env"
+sudo chmod 600 /root/cert-daemon-$SHA/env
+# Step 0 only:
+sudo sed -i 's#^KUPO_URL=.*#KUPO_URL=http://192.168.0.133:1444#' /root/cert-daemon-$SHA/env
+sudo docker stop cert-daemon-preprod
+sudo docker rename cert-daemon-preprod cert-daemon-preprod-pre-$SHA
+sudo docker run -d --name cert-daemon-preprod --restart unless-stopped --network bridge \
+  -v cert-daemon-preprod-data:/data -p 8080:8080 \
+  --env-file /root/cert-daemon-$SHA/env \
+  ghcr.io/flux-point-studios/materios-operator-kit:$SHA
+sudo shred -u /root/cert-daemon-$SHA/env
+```
+
+Verify:
+
+```sh
+sudo docker logs --since 10m cert-daemon-preprod 2>&1 \
+  | grep -E 'settlement runtime|slash_watcher: (started|Kupo)|settle_attestor: started|expire_attestor: started'
+curl -s 127.0.0.1:8080/metrics | grep -E 'settlement_|slash_kupo_coverage_ok'
+```
+
+Expect `settlement runtime spec=239 (code 0xef23631b…): protocol=FRAU
+supersede=False fingerprint=96dfe9b4…e85c ttl=2400 min_finality_depth=15`,
+the metrics `settlement_slash_protocol 1`, `settlement_supersede_offered 0`,
+`settlement_runtime_spec_version 239`, and `slash_kupo_coverage_ok 0` on
+`:1442` (with the `cannot prove fraud (patterns_without_*:4)` WARNING) or
+`1` on `:1444`.
+
+Rollback before enactment:
+
+```sh
+sudo docker stop cert-daemon-preprod && sudo docker rm cert-daemon-preprod
+sudo docker rename cert-daemon-preprod-pre-$SHA cert-daemon-preprod
+sudo docker start cert-daemon-preprod
+```
+
+### 2. Gemtek cert-daemon (compose)
+
+The service `cert-daemon-preprod` in `/home/deci/materios-node` runs the
+local build `ghcr.io/flux-point-studios/materios-cert-daemon:local-7bbdeb9`.
+`--no-deps` keeps compose from recreating the blob gateway and the other
+services it depends on.
+
+```sh
+cd /home/deci/materios-node
+SHA=<merge sha>
+docker pull ghcr.io/flux-point-studios/materios-operator-kit:$SHA
+install -m 600 docker-compose.yml ~/docker-compose.yml.pre-$SHA
+sed -i "s#^    image: ghcr.io/flux-point-studios/materios-cert-daemon:local-7bbdeb9\$#    image: ghcr.io/flux-point-studios/materios-operator-kit:$SHA#" docker-compose.yml
+# Step 0 only:
+sed -i 's#^      KUPO_URL: "http://192.168.0.133:1442"$#      KUPO_URL: "http://192.168.0.133:1444"#' docker-compose.yml
+grep -c "materios-operator-kit:$SHA" docker-compose.yml    # 1
+docker compose up -d --no-deps cert-daemon-preprod
+```
+
+Verify as in step 1, with `docker logs --since 10m
+materios-node-cert-daemon-preprod-1` and `curl -s 127.0.0.1:8081/metrics`.
+
+Rollback before enactment:
+
+```sh
+cd /home/deci/materios-node
+install -m 600 ~/docker-compose.yml.pre-$SHA docker-compose.yml
+docker compose up -d --no-deps cert-daemon-preprod
+```
+
+### 3. node2 custody watcher
+
+As in the `0d1d592` cutover: a root-owned release directory and one new
+drop-in that points `WorkingDirectory` at it. The `90-insight-0d1d592.conf`
+credentials stay as they are.
+
+```sh
+# From a verified checkout at $SHA (Gemtek):
+git -C <checkout> archive "$SHA" | ssh deci@192.168.0.132 \
+  "sudo install -d -o root -g root -m 755 /opt/custody-watch/releases/$SHA && sudo tar -x -C /opt/custody-watch/releases/$SHA"
+git -C <checkout> show "$SHA:daemon/custody_rules.py" | sha256sum
+ssh deci@192.168.0.132 "sha256sum /opt/custody-watch/releases/$SHA/daemon/custody_rules.py"    # same hash
+
+ssh deci@192.168.0.132
+SHA=<merge sha>
+sudo install -d -m 700 /root/custody-release-$SHA
+sudo systemctl stop custody-watch.service
+sudo /opt/custody-watch/venv/bin/python -c "import sqlite3, sys; sqlite3.connect('file:/var/lib/custody-watch/state.db?mode=ro', uri=True).backup(sqlite3.connect(sys.argv[1]))" \
+  /root/custody-release-$SHA/state-before.db
+printf '[Service]\nWorkingDirectory=/opt/custody-watch/releases/%s\n' "$SHA" \
+  | sudo tee /etc/systemd/system/custody-watch.service.d/95-release-$SHA.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl start custody-watch.service
+sudo systemctl show custody-watch.service -p ActiveState -p NRestarts -p WorkingDirectory
+sudo journalctl -u custody-watch.service --since -15min | grep -i -E 'error|traceback|could not be classified'
+```
+
+Expect `ActiveState=active`, `NRestarts=0`, the new `WorkingDirectory`, and
+no matches. Rollback: remove `95-release-$SHA.conf`, `daemon-reload`,
+restart `custody-watch.service`; the database stays as it is.
+
+### 4. Soak
+
+At least 30 minutes on all three hosts:
+
+- each container shows `RestartCount` 0 (`docker inspect -f '{{.RestartCount}} {{.State.Status}}'`);
+- custody-watch shows `NRestarts=0`;
+- the only new WARNINGs are `cannot prove fraud` (Kupo `:1442`) and
+  ordinary deferrals;
+- there is no `settlement runtime … refused` and no `tick raised`.
+
+Then remove the Node-3 backup container (`sudo docker rm cert-daemon-preprod-pre-$SHA`).
+
+### 5. Enactment preflight
+
+1. Gemtek and Node-3 run `materios-operator-kit:$SHA` and report FRAU /
+   supersede 0 / spec 239 on `/metrics`. node2's custody-watch runs from
+   `/opt/custody-watch/releases/$SHA`.
+2. The runtime to enact pins the reviewed settlement:
+   `grep -n '^pallet-intent-settlement' partnerchain/Cargo.toml` shows
+   `rev = "0757de35efa52d983c9203a683307827d76ae338"`. The tag cannot reveal a
+   preimage layout change under an unchanged tag (see Limit).
+3. Its metadata selects FRV2. In that materios checkout, add
+   `partnerchain/runtime/examples/dump_metadata.rs`:
+
+   ```rust
+   fn main() {
+       // MateriosChainId reads the genesis hash from storage.
+       let metadata = sp_io::TestExternalities::default()
+           .execute_with(|| materios_runtime::Runtime::metadata_at_version(14).expect("metadata v14"));
+       let hex: String = metadata.iter().map(|b| format!("{b:02x}")).collect();
+       println!("0x{hex}");
+   }
+   ```
+
+   then:
+
+   ```sh
+   cd partnerchain
+   flock /tmp/materios-cargo-build.lock nice -n 10 env SKIP_WASM_BUILD=1 CARGO_TARGET_DIR=<private target> \
+     cargo run --locked -p materios-runtime --example dump_metadata > /tmp/metadata-candidate.hex
+   python3 <operator-kit>/scripts/settlement-runtime.py /tmp/metadata-candidate.hex
+   ```
+
+   It must print `protocol=FRV2 supersede=True
+   fingerprint=693ba3e8bc9106fb036f96bc73b3c7797d314c36ef95c0564c715ce58113eeb7
+   ttl=2400 min_finality_depth=15`. Materios `67ec3d9` does.
+
+Only then enact, by the materios ceremony runbook. Within a poll of the
+upgrade block, both cert-daemons log `settlement runtime spec=242 …:
+protocol=FRV2 supersede=True fingerprint=693ba3e8…` and export
+`settlement_slash_protocol 2`, `settlement_supersede_offered 1`,
+`settlement_runtime_spec_version 242`. The custody watcher pages one
+CRITICAL for the runtime change; supersedes page nothing.
+
+### After enactment: roll forward only
+
+The previous builds sign FRAU, so their slashes fail. Their attestors cannot
+supersede, and the previous custody watcher pages an ALERT on every
+supersede. If a daemon logs `settlement runtime … refused` for spec 242, it
+signs nothing, which is safe. Fix it with a new release, not a rollback.
 
 This PR does not deploy or restart services. The draft PR with green CI is
 the implementation handoff; materios performs the cross-model review.
