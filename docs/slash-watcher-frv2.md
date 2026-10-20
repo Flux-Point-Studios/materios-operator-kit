@@ -328,7 +328,7 @@ To reproduce in a separate settlement checkout at that commit, copy
 flock /tmp/materios-cargo-build.lock nice -n 10 env CARGO_TARGET_DIR=/path/to/unique-target \
   cargo run --locked -p pallet-intent-settlement --example frv2_vectors
 nice -n 10 python3 -B -m pytest -q -p no:cacheprovider
-nice -n 10 python3 scripts/check-slash-mutations.py
+nice -n 10 python3 scripts/check-mutations.py
 ```
 
 The mutation harness checks the tag table (an unknown tag, a tagless FRV2

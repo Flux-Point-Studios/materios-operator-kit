@@ -3,13 +3,15 @@ import hashlib
 import json
 import logging
 import os
+import ssl
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.exceptions import SubstrateRequestException
 from substrateinterface.utils.ss58 import ss58_decode
+from websocket import WebSocketConnectionClosedException
 
 from daemon import health_server
 from daemon.config import DaemonConfig
@@ -175,10 +177,14 @@ def slash_contract_fingerprint(v14: dict) -> str:
 #      and constructs a new SI. A successful call resets the streak.
 #   3. Reconnect failures retry with exponential backoff: 1s, 2s, 4s, 8s,
 #      16s, then capped at 30s. The streak gauge surfaces to /metrics.
+#   4. A call that fails on a dead socket (``TRANSPORT_DEAD_ERRORS``) replaces
+#      that conn's SI at once and is retried once on the fresh one. A conn left
+#      without an SI reconnects on its next call.
 #
 # Metrics surfaced on success/failure:
 #   - cert_daemon_ws_rpc_timeouts_total (counter)
 #   - cert_daemon_ws_force_reconnects_total (counter)
+#   - cert_daemon_ws_transport_replacements_total (counter)
 #   - cert_daemon_ws_consecutive_reconnect_failures (gauge)
 #   - last_poll_timestamp bumped on every success
 # ---------------------------------------------------------------------------
@@ -191,6 +197,43 @@ class RPCTimeoutError(Exception):
     react (retry, log, drop pending row, etc.) without coupling to the
     threading impl detail.
     """
+
+
+# What a websocket raises once its peer, or a proxy in between (Cloudflare
+# drops idle websockets after ~100 s), has dropped the connection: every later
+# call on it fails the same way. substrate-interface reconnects by itself only
+# when websocket-client has already cleared the socket, which a failed send
+# (EPIPE) never does. CPython builds an OSError carrying EPIPE, ECONNRESET or
+# ECONNABORTED as the matching subclass below. Node verdicts
+# (SubstrateRequestException, a 1010) and validation errors (ValueError) are
+# not transport failures.
+TRANSPORT_DEAD_ERRORS = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    WebSocketConnectionClosedException,
+    ssl.SSLEOFError,
+)
+
+
+def _error_chain(error: Optional[BaseException]) -> Iterator[BaseException]:
+    """``error`` and what caused it, in the order a traceback prints them."""
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        yield error
+        error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+
+
+def is_transport_dead(error: BaseException) -> bool:
+    """Whether ``error``, or an error that caused it, says the socket is dead."""
+    return any(isinstance(e, TRANSPORT_DEAD_ERRORS) for e in _error_chain(error))
+
+
+def is_rpc_unavailable(error: BaseException) -> bool:
+    """Whether ``error`` means the RPC did not serve the call at all: a dead
+    socket, or no answer within the timeout budget."""
+    return is_transport_dead(error) or any(isinstance(e, RPCTimeoutError) for e in _error_chain(error))
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -236,8 +279,13 @@ class SubmitCertOutcome:
     `AutoSlashedForBadAttest` (committee ejection + bond slashed); we
     surface that as a separate flag so the caller can fire a more urgent
     operator alert.
+
+    `already_on_chain` marks a success this submit did not make: the runtime
+    refused it because the receipt is certified or already carries this
+    signer's attest.
     """
     success: bool
+    already_on_chain: bool = False
     bad_attest_strike: bool = False
     auto_slashed: bool = False
     strikes: int = 0
@@ -382,6 +430,7 @@ class _WsConn:
         "si",
         "consecutive_timeouts",
         "consecutive_reconnect_failures",
+        "replace_lock",
     )
 
     def __init__(self, name: str) -> None:
@@ -389,6 +438,9 @@ class _WsConn:
         self.si: Optional[SubstrateInterface] = None
         self.consecutive_timeouts = 0
         self.consecutive_reconnect_failures = 0
+        # Held while a dead or missing SI is replaced, so calls that fail
+        # together on one socket replace it once.
+        self.replace_lock = threading.Lock()
 
 
 class SubstrateClient:
@@ -425,6 +477,11 @@ class SubstrateClient:
         # off a fresh cycle.
         self._reconnect_max_attempts: int = _read_int_env(
             "MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS", 8
+        )
+        # Seconds between keepalive RPCs on the write conn, which idles between
+        # receipts while proxies drop idle websockets (Cloudflare after ~100 s).
+        self.keepalive_secs: float = _read_float_env(
+            "MATERIOS_RPC_KEEPALIVE_SECS", 30.0
         )
         # Each ``_call`` dispatches its work on a fresh daemon thread.
         # We can't reuse a single-worker pool — a wedged thread would
@@ -554,9 +611,14 @@ class SubstrateClient:
 
         If the call exceeds the budget we raise :class:`RPCTimeoutError`;
         consecutive timeouts on that conn trigger a force-replace of *its*
-        ``SubstrateInterface`` (the other conn is untouched). On success we
-        bump ``health_server.update_metrics(last_poll_timestamp=...)`` so the
-        outer watchdog's ``/ready last_poll_age`` reflects the freshest chain
+        ``SubstrateInterface`` (the other conn is untouched). A call that
+        fails on a dead socket replaces that conn's SI at once and runs once
+        more on the fresh one; failing there too, it replaces the SI again and
+        propagates. A resent submit carries the same signed extrinsic, whose
+        nonce the runtime accepts at most once. Every other exception is the
+        node's verdict and propagates untouched. On success we bump
+        ``health_server.update_metrics(last_poll_timestamp=...)`` so the outer
+        watchdog's ``/ready last_poll_age`` reflects the freshest chain
         interaction.
 
         Threading model: each call runs on a fresh daemonised thread. When
@@ -565,8 +627,24 @@ class SubstrateClient:
         (``close()`` in force-replace) or at process exit.
         """
         self._ensure_wrapper_state()
-        if conn is None:
-            conn = self._write
+        requested = conn or self._write
+        for attempt in (1, 2):
+            conn, si = self._live_conn(requested, method_name)
+            try:
+                return self._call_once(conn, si, method_name, args, kwargs)
+            except Exception as error:
+                if not is_transport_dead(error):
+                    raise
+                self._replace_dead_conn(conn, si, method_name, error)
+                if attempt == 2 or conn.si is None:
+                    raise
+
+    def _live_conn(
+        self, conn: "_WsConn", method_name: str
+    ) -> "tuple[_WsConn, SubstrateInterface]":
+        """The conn a call on ``conn`` runs on, and its SI. A conn whose last
+        replace gave up is reconnected here: nothing else reopens it while
+        the read path stays healthy."""
         with self._reconnect_lock:
             # A read-conn request degrades to the write conn when the read
             # conn was never opened (pre-split fixtures) or is mid-recovery.
@@ -574,14 +652,20 @@ class SubstrateClient:
                 conn = self._write
             si = conn.si
         if si is None:
-            # Defensive: the daemon's `_running` loop calls `connect()`
-            # before any RPC; if we land here the wrapper still must
-            # not block — bail loudly.
+            with conn.replace_lock:
+                if conn.si is None:
+                    self._force_replace(conn)
+                si = conn.si
+        if si is None:
             raise RPCTimeoutError(
-                f"_call({method_name!r}) invoked with no live "
-                f"SubstrateInterface on the {conn.name} conn"
+                f"_call({method_name!r}) found no live SubstrateInterface on "
+                f"the {conn.name} conn and could not reconnect it"
             )
+        return conn, si
 
+    def _call_once(
+        self, conn: "_WsConn", si: SubstrateInterface, method_name: str, args: tuple, kwargs: dict
+    ) -> Any:
         result_holder: dict[str, Any] = {}
 
         def _invoke():
@@ -608,13 +692,37 @@ class SubstrateClient:
                 f"budget on the {conn.name} conn"
             )
         if "err" in result_holder:
+            error = result_holder["err"]
+            if (isinstance(error, json.JSONDecodeError)
+                    and getattr(getattr(si, "websocket", None), "connected", True) is False):
+                # websocket-client answers the peer's close frame by marking
+                # itself closed and returning "", which substrate-interface
+                # then fails to parse.
+                raise WebSocketConnectionClosedException(
+                    f"the {conn.name} conn's peer closed the websocket"
+                ) from error
             # Any other exception (SubstrateRequestException, ValueError,
             # etc.) is the underlying call's verdict — surface as-is so
             # existing `except` clauses still match. Real exceptions do
             # NOT count toward the consecutive-timeout streak.
-            raise result_holder["err"]
+            raise error
         self._on_rpc_success(conn)
         return result_holder.get("ok")
+
+    def _replace_dead_conn(
+        self, conn: "_WsConn", dead_si: SubstrateInterface, method_name: str, error: BaseException
+    ) -> None:
+        """Replace ``conn``'s SI after ``dead_si`` failed on a dead socket,
+        unless a call that failed alongside already replaced it."""
+        with conn.replace_lock:
+            if conn.si is not dead_si:
+                return
+            logger.warning(
+                f"force-replace[{conn.name}]: transport error {type(error).__name__} "
+                f"in {method_name!r}: {error}"
+            )
+            health_server.increment_metric("ws_transport_replacements_total")
+            self._force_replace(conn)
 
     def _on_rpc_success(self, conn: "_WsConn") -> None:
         """Reset the conn's consecutive-timeout streak and bump health_last_poll."""
@@ -639,7 +747,8 @@ class SubstrateClient:
             f"(consecutive={conn.consecutive_timeouts})"
         )
         if conn.consecutive_timeouts >= self._reconnect_after_timeouts:
-            self._force_replace(conn)
+            with conn.replace_lock:
+                self._force_replace(conn)
 
     def _force_replace(self, conn: "_WsConn") -> None:
         """Close a conn's websocket and construct a new one, in isolation.
@@ -708,8 +817,7 @@ class SubstrateClient:
             return
         # Bailed without a working SI. The next user-call enters _call,
         # finds this conn's si is None, and (for reads) degrades to the
-        # write conn or (for writes) raises RPCTimeoutError — the caller
-        # retries on its own schedule (poll loop, evidence_submitter tick).
+        # write conn or (for writes) runs a fresh reconnect cycle first.
         try:
             health_server.update_metrics(
                 ws_consecutive_reconnect_failures=conn.consecutive_reconnect_failures,
@@ -727,6 +835,10 @@ class SubstrateClient:
     def rpc(self, method: str, params: list) -> Any:
         """A raw JSON-RPC read on the read conn, under the bounded timeout."""
         return self._call("rpc_request", method, params, conn=self._read)["result"]
+
+    def keepalive(self) -> None:
+        """One cheap RPC on the write conn, through the bounded call."""
+        self._call("rpc_request", "system_health", [])
 
     def get_finalized_head_number(self) -> int:
         head_hash = self._call("get_chain_finalised_head", conn=self._read)
@@ -2005,6 +2117,11 @@ class SubstrateClient:
         `BadAttestStrike` / `AutoSlashedForBadAttest` markers — `is_success`
         alone would falsely report acceptance and silently rack up strikes
         until auto-ejection.
+
+        A refused attest is done when :meth:`attestation_on_chain` holds: the
+        attest landed through a reply the socket lost, or other members
+        certified the receipt first. A dead socket that ``_call``'s retry did
+        not get past propagates, and the caller retries the receipt later.
         """
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
@@ -2038,16 +2155,42 @@ class SubstrateClient:
                 logger.info(f"Cert attested for {receipt_id}, block {receipt.block_hash}")
                 return SubmitCertOutcome(success=True)
             except SubstrateRequestException as e:
+                if self.attestation_on_chain(receipt_id):
+                    logger.info(
+                        f"Cert tx for {receipt_id} refused ({e}); the receipt is "
+                        f"certified or already carries this signer's attest"
+                    )
+                    return SubmitCertOutcome(success=True, already_on_chain=True)
                 last_error = f"{type(e).__name__}: {e}"
                 logger.error(f"Cert tx attempt {attempt + 1} failed for {receipt_id}: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
             except Exception as e:
+                if is_transport_dead(e):
+                    raise
                 last_error = f"{type(e).__name__}: {e}"
                 logger.error(f"Unexpected error submitting cert for {receipt_id}: {e}")
                 if attempt < self.config.tx_max_retries - 1:
                     time.sleep(2 ** attempt)
         return SubmitCertOutcome(success=False, error_message=last_error)
+
+    def attestation_on_chain(self, receipt_id: str) -> bool:
+        """Whether the chain already holds what this signer's attest would add:
+        the receipt is certified, or its ``Attestations`` entry records this
+        signer. Spec 242's pool refuses an attest in either state as 1010
+        "Transaction call is not expected"; its other 1010 refusals (not a
+        member, unknown receipt, non-canonical hash) leave this False."""
+        receipt = self.get_receipt(receipt_id)
+        if receipt is None:
+            return False
+        if receipt.availability_cert_hash != bytes(32):
+            return True
+        entry = self._call(
+            "query", "OrinqReceipts", "Attestations", [receipt_id], conn=self._read
+        ).value
+        return entry is not None and self.keypair.public_key in {
+            _account_id_bytes(str(signer)) for signer in entry[1]
+        }
 
     def _scan_for_bad_attest(
         self, receipt, receipt_id: str

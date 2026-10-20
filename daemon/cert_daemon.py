@@ -9,7 +9,7 @@ import aiohttp
 
 from daemon.config import DaemonConfig
 from daemon.models import AttestationLevel, PendingReceipt
-from daemon.substrate_client import SubstrateClient
+from daemon.substrate_client import SubstrateClient, is_rpc_unavailable
 from daemon.locator_registry import LocatorRegistry
 from daemon.blob_verifier import BlobVerifier
 from daemon.cert_builder import scale_cert_encode
@@ -88,6 +88,12 @@ FALLBACK_WINDOW: int = _default_fallback_window()
 # pruning, chain tip jumping faster than we can poll, etc.) — at the cap we
 # break out of the tick and let the next tick recompute head from scratch.
 MAX_CLAMPS_PER_TICK: int = 5
+
+# Retries a receipt gets after the RPC failed its processing (a dead socket
+# that `_call`'s own retry did not get past, or a timeout), one per poll tick,
+# before it is dropped as RPC_RETRIES_EXHAUSTED. While the endpoint is down,
+# each retry waits out a reconnect cycle first.
+MAX_RECEIPT_RPC_RETRIES: int = 5
 
 
 def _is_pruned_state_error(exc) -> bool:
@@ -351,6 +357,11 @@ class CertDaemon:
             error). This keeps the cursor-advance contract: once
             `last_processed_block = N`, every receipt in (prior, N] has been
             seen exactly once.
+          - A receipt whose processing the RPC failed (a dead socket or a
+            timeout) does not leave with its block: it moves to
+            `self.pending`, and `retry_pending` runs it again on later ticks,
+            at most `MAX_RECEIPT_RPC_RETRIES` times. The cursor never waits
+            on it.
           - After a clamp, we re-enter the outer loop with the new cursor.
             If the clamped cursor is ALSO past pruning, we clamp again, up
             to `MAX_CLAMPS_PER_TICK` — then bail and let the next tick
@@ -381,7 +392,9 @@ class CertDaemon:
                             return_exceptions=True,
                         )
                         for ev, res in zip(events, results):
-                            if isinstance(res, BaseException):
+                            if isinstance(res, BaseException) and is_rpc_unavailable(res):
+                                await self._defer_receipt(ev["receipt_id"], res)
+                            elif isinstance(res, BaseException):
                                 logger.warning(
                                     f"process_receipt failed for "
                                     f"{ev['receipt_id'][:16]}... in block {block_num}: "
@@ -422,6 +435,30 @@ class CertDaemon:
         assert self._concurrency_sem is not None  # set by _ensure_concurrency_primitives
         async with self._concurrency_sem:
             return await self.process_receipt(receipt_id)
+
+    async def _defer_receipt(
+        self, receipt_id: str, error: BaseException, entry: Optional[PendingReceipt] = None
+    ) -> None:
+        """Keep a receipt whose processing the RPC failed in `pending`, so
+        `retry_pending` runs it again on a later tick; `entry` carries the
+        retries it has already had. Drops it, by name, once those reach
+        MAX_RECEIPT_RPC_RETRIES."""
+        entry = entry or PendingReceipt(receipt_id=receipt_id, receipt=None, first_seen=time.time())
+        entry.retries += 1
+        entry.last_error = f"{type(error).__name__}: {error}"
+        if entry.retries > MAX_RECEIPT_RPC_RETRIES:
+            logger.error(
+                f"dropping receipt {receipt_id[:16]}...: RPC_RETRIES_EXHAUSTED after "
+                f"{MAX_RECEIPT_RPC_RETRIES} retries; last error {entry.last_error}"
+            )
+            return
+        async with self._pending_lock:
+            self.pending[receipt_id] = entry
+        logger.warning(
+            f"process_receipt for {receipt_id[:16]}... failed on the RPC "
+            f"({entry.last_error}); retry {entry.retries}/{MAX_RECEIPT_RPC_RETRIES} "
+            f"on a later tick"
+        )
 
     def _clamp_cursor_past_pruned(self, stuck_block: int, head: int) -> int:
         """Advance `last_processed_block` past the node's state-pruning window
@@ -607,9 +644,6 @@ class CertDaemon:
         )
         cert_hash = hashlib.sha256(cert_bytes).digest()
 
-        # Store cert to filesystem
-        self.cert_store.save(receipt_id, cert_bytes)
-
         # Submit on-chain. Two concerns:
         #
         #   (1) Nonce ordering — substrate-interface fetches `accountNextIndex`
@@ -631,14 +665,18 @@ class CertDaemon:
             outcome = await asyncio.to_thread(
                 self.client.submit_availability_cert, receipt_id, cert_hash
             )
+        # Stored once the chain has answered: a submit that died on the RPC
+        # raised above, leaving no cert to make its retry skip the receipt.
+        self.cert_store.save(receipt_id, cert_bytes)
         if outcome.success:
-            health_server.increment_metric("certs_submitted_total")
             async with self._pending_lock:
                 self.pending.pop(receipt_id, None)
-            await self.send_discord(
-                f"Cert submitted for `{receipt_id[:16]}...` (L{verification.attestation_level})",
-                "info",
-            )
+            if not outcome.already_on_chain:
+                health_server.increment_metric("certs_submitted_total")
+                await self.send_discord(
+                    f"Cert submitted for `{receipt_id[:16]}...` (L{verification.attestation_level})",
+                    "info",
+                )
         elif outcome.bad_attest_strike:
             # spec-219: runtime rejected our cert_hash as non-canonical.
             # Strike is permanent for this receipt — retry would re-strike
@@ -676,6 +714,24 @@ class CertDaemon:
                 "critical",
             )
 
+    async def _keep_write_conn_alive(self):
+        """Exercise the write conn every ``client.keepalive_secs``: it idles
+        between receipts, and a proxy that drops idle websockets (Cloudflare
+        after ~100 s) would kill it there. The RPC goes through the bounded
+        call, so a timeout or a dead socket replaces the conn as any call's
+        would. A beat that finds a submit holding the chain-write lock is
+        skipped rather than queued behind it: the submit is traffic enough."""
+        self._ensure_concurrency_primitives()
+        while self._running:
+            await asyncio.sleep(self.client.keepalive_secs)
+            if self._chain_write_lock.locked():
+                continue
+            async with self._chain_write_lock:
+                try:
+                    await asyncio.to_thread(self.client.keepalive)
+                except Exception as e:
+                    logger.warning(f"write-conn keepalive failed: {type(e).__name__}: {e}")
+
     async def retry_pending(self):
         self._ensure_concurrency_primitives()
         now = time.time()
@@ -687,6 +743,30 @@ class CertDaemon:
         async with self._pending_lock:
             snapshot = list(self.pending.items())
         for receipt_id, pending in snapshot:
+            if pending.last_error:
+                # Popped first, so a run that misses the locator can park the
+                # receipt back in `pending` as an ordinary locator wait.
+                async with self._pending_lock:
+                    self.pending.pop(receipt_id, None)
+                try:
+                    # The failed run may have landed its attest before the
+                    # socket died; then there is nothing left to sign.
+                    if await asyncio.to_thread(self.client.attestation_on_chain, receipt_id):
+                        logger.info(
+                            f"retry of {receipt_id[:16]}... skipped: certified or "
+                            f"already attested by this signer"
+                        )
+                        continue
+                    await self.process_receipt(receipt_id)
+                except Exception as error:
+                    if is_rpc_unavailable(error):
+                        await self._defer_receipt(receipt_id, error, pending)
+                    else:
+                        logger.warning(
+                            f"retry of {receipt_id[:16]}... failed: "
+                            f"{type(error).__name__}: {error}"
+                        )
+                continue
             content_hash_hex = pending.receipt.content_hash.hex() if isinstance(pending.receipt.content_hash, bytes) else str(pending.receipt.content_hash)
             manifest = await self.locator.resolve(receipt_id, content_hash=content_hash_hex)
             if manifest is None:
@@ -949,6 +1029,8 @@ class CertDaemon:
         if self.slash_watcher is not None:
             self.slash_watcher.start()
 
+        keepalive = asyncio.create_task(self._keep_write_conn_alive())
+
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
 
         while self._running:
@@ -1057,6 +1139,7 @@ class CertDaemon:
             interval = self.config.poll_interval_fast if has_pending else self.config.poll_interval_idle
             await asyncio.sleep(interval)
 
+        keepalive.cancel()
         await self.send_discord("Daemon shutting down", "info")
 
 

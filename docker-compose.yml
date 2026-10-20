@@ -65,6 +65,10 @@ services:
       MATERIOS_RPC_TIMEOUT_SECS: "30"
       MATERIOS_RPC_RECONNECT_AFTER_TIMEOUTS: "2"
       MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS: "8"
+      ## Seconds between keepalive RPCs on the extrinsic-submit connection,
+      ## which idles between receipts. A proxy in front of the RPC drops
+      ## idle websockets (Cloudflare after ~100 s), so keep this well below.
+      MATERIOS_RPC_KEEPALIVE_SECS: "30"
 
     volumes:
       - cert-daemon-data:/data
