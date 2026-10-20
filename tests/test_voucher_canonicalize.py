@@ -29,6 +29,7 @@ from daemon.voucher_canonicalize import (
     compute_voucher_digest_with_address,
     split_type0_address_bytes,
 )
+from daemon.substrate_client import ChainIdRefused
 
 
 # ---------------------------------------------------------------------------
@@ -401,9 +402,12 @@ def _make_substrate_mock(
     voucher_row: dict | None,
     voucher_digests_present: bool = False,
     voucher_digest_field: bytes | None = None,
+    genesis_hash: str | None = "0x" + PARITY_MATERIOS_CHAIN_ID.hex(),
+    metadata_chain_id: bytes | None = PARITY_MATERIOS_CHAIN_ID,
 ) -> MagicMock:
-    """Construct a `SubstrateInterface` mock whose `query` and
-    `get_constant` calls return chain-state for the parity vector.
+    """Construct a `SubstrateInterface` mock whose `query`,
+    `get_constant` and `get_block_hash` calls return chain-state for the
+    parity vector.
 
     Args:
         voucher_row: dict the `Vouchers[claim_id]` query returns
@@ -412,8 +416,15 @@ def _make_substrate_mock(
             map is present (typically False — it doesn't exist today).
         voucher_digest_field: override the `voucher_digest` field on
             the voucher row (typically None — the field doesn't exist).
+        genesis_hash: what `chain_getBlockHash(0)` returns.
+        metadata_chain_id: the `IntentSettlement.MateriosChainId` constant
+            in the cached metadata (None means the constant is absent).
     """
     substrate = MagicMock()
+
+    def get_block_hash(block_id: int):
+        assert block_id == 0, f"unexpected chain_getBlockHash({block_id})"
+        return genesis_hash
 
     def query(module: str, storage_function: str, params: list | None = None):
         result = MagicMock()
@@ -437,8 +448,10 @@ def _make_substrate_mock(
     def get_constant(module: str, name: str):
         c = MagicMock()
         if name == "MateriosChainId":
+            if metadata_chain_id is None:
+                return None
             # In real metadata this comes back as a 0x-hex string for H256.
-            c.value = "0x" + PARITY_MATERIOS_CHAIN_ID.hex()
+            c.value = "0x" + metadata_chain_id.hex()
         elif name == "NetworkMagic":
             c.value = PARITY_NETWORK_MAGIC
         elif name == "AegisPolicyV1ScriptHash":
@@ -451,6 +464,7 @@ def _make_substrate_mock(
 
     substrate.query = MagicMock(side_effect=query)
     substrate.get_constant = MagicMock(side_effect=get_constant)
+    substrate.get_block_hash = MagicMock(side_effect=get_block_hash)
     return substrate
 
 
@@ -581,3 +595,90 @@ def test_get_voucher_digest_returns_none_on_missing_chain_identity() -> None:
     substrate.get_constant = MagicMock(return_value=None)
     client = _make_client_with_substrate(substrate)
     assert client.get_voucher_digest(PARITY_CLAIM_ID) is None
+
+
+# ---------------------------------------------------------------------------
+# Chain id source: chain_getBlockHash(0), whatever MateriosChainId the cached
+# metadata carries.
+# ---------------------------------------------------------------------------
+
+# frame_system's genesis stores this as BlockHash(0) until block 1 records the
+# real hash, so metadata read at block 0 carries it as MateriosChainId.
+BLOCK_ZERO_PLACEHOLDER = bytes.fromhex("45" * 32)
+OTHER_CHAIN_GENESIS = bytes.fromhex(
+    "b10f0a46" + "00" * 26 + "96c6"
+)
+
+
+def test_block_zero_placeholder_metadata_still_yields_the_genesis_chain_id() -> None:
+    """A daemon that first loads metadata at block 0 keeps the placeholder
+    MateriosChainId until the next runtime upgrade. The chain id comes from
+    chain_getBlockHash(0), so the digest is the pinned parity value."""
+    substrate = _make_substrate_mock(
+        voucher_row=_build_voucher_row(),
+        metadata_chain_id=BLOCK_ZERO_PLACEHOLDER,
+    )
+    client = _make_client_with_substrate(substrate)
+    identity = client.get_chain_identity()
+    assert identity.materios_chain_id == PARITY_MATERIOS_CHAIN_ID
+    assert client.get_voucher_digest(PARITY_CLAIM_ID) == PARITY_EXPECTED_DIGEST
+    substrate.get_block_hash.assert_called_with(0)
+
+
+def test_absent_metadata_chain_id_yields_the_genesis_chain_id() -> None:
+    substrate = _make_substrate_mock(
+        voucher_row=_build_voucher_row(), metadata_chain_id=None,
+    )
+    client = _make_client_with_substrate(substrate)
+    assert client.get_chain_identity().materios_chain_id == PARITY_MATERIOS_CHAIN_ID
+    assert client.get_voucher_digest(PARITY_CLAIM_ID) == PARITY_EXPECTED_DIGEST
+
+
+@pytest.mark.parametrize(
+    ("genesis", "metadata_chain_id"),
+    [
+        (OTHER_CHAIN_GENESIS, PARITY_MATERIOS_CHAIN_ID),
+        (PARITY_MATERIOS_CHAIN_ID, bytes(32)),
+    ],
+    ids=["runtime-pinned-to-another-chain", "zero-metadata"],
+)
+def test_metadata_chain_id_that_differs_from_the_genesis_is_refused(
+    genesis: bytes, metadata_chain_id: bytes,
+) -> None:
+    substrate = _make_substrate_mock(
+        voucher_row=_build_voucher_row(),
+        genesis_hash="0x" + genesis.hex(),
+        metadata_chain_id=metadata_chain_id,
+    )
+    client = _make_client_with_substrate(substrate)
+    with pytest.raises(ChainIdRefused, match="differs from chain_getBlockHash"):
+        client.get_chain_identity()
+    with pytest.raises(ChainIdRefused, match="differs from chain_getBlockHash"):
+        client.get_voucher_digest(PARITY_CLAIM_ID)
+
+
+@pytest.mark.parametrize(
+    ("genesis_hash", "metadata_chain_id"),
+    [
+        ("0x" + BLOCK_ZERO_PLACEHOLDER.hex(), BLOCK_ZERO_PLACEHOLDER),
+        ("0x" + bytes(32).hex(), bytes(32)),
+        (None, PARITY_MATERIOS_CHAIN_ID),
+        ("0x" + PARITY_MATERIOS_CHAIN_ID.hex()[:-2], PARITY_MATERIOS_CHAIN_ID),
+    ],
+    ids=["placeholder", "zero", "missing", "31-bytes"],
+)
+def test_unusable_genesis_chain_id_is_refused(
+    genesis_hash: str | None, metadata_chain_id: bytes,
+) -> None:
+    """The metadata agrees in the placeholder and zero cases, so only the
+    outright refusal of the genesis value can stop them."""
+    substrate = _make_substrate_mock(
+        voucher_row=_build_voucher_row(),
+        genesis_hash=genesis_hash,
+        metadata_chain_id=metadata_chain_id,
+    )
+    client = _make_client_with_substrate(substrate)
+    with pytest.raises(ChainIdRefused, match=r"chain_getBlockHash\(0\) returned"):
+        client.get_chain_identity()
+    with pytest.raises(ChainIdRefused, match=r"chain_getBlockHash\(0\) returned"):
+        client.get_voucher_digest(PARITY_CLAIM_ID)

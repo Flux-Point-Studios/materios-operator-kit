@@ -36,6 +36,15 @@ SLASH_PROTOCOL_GAUGE = {"FRAU": 1, "FRV2": 2}
 RUNTIME_CODE_KEY = "0x" + b":code".hex()
 
 
+# frame_system's genesis stores this as BlockHash(0); block 1 overwrites it
+# with the real genesis hash.
+BLOCK_ZERO_PLACEHOLDER = b"\x45" * 32
+
+
+class ChainIdRefused(Exception):
+    """The Materios chain id a voucher digest would bind is unusable."""
+
+
 def select_slash_protocol(fingerprint: str, tag: Optional[bytes]) -> str:
     """The runtime's ``SlashSettlementTag`` names the protocol and the contract
     must be that protocol's pin; a runtime without the tag gets FRAU only on
@@ -1110,24 +1119,27 @@ class SubstrateClient:
             return None
 
     def get_chain_identity(self) -> Optional[ChainIdentity]:
-        """Read the four IntentSettlement chain-identity constants via
-        runtime metadata and assemble a :class:`ChainIdentity`.
+        """Assemble the :class:`ChainIdentity` a voucher digest binds.
 
-        Returns ``None`` if any of the four constants is unreadable
-        (typically because the runtime doesn't expose
-        ``IntentSettlement::*`` — e.g. an older spec without
-        ``pallet-intent-settlement`` wired in). Callers MUST treat
-        ``None`` as "cannot derive voucher digest" rather than
-        fabricate a default — a stale or zeroed chain-identity would
-        produce wrong-domain digests and silently break attest_settle.
+        ``materios_chain_id`` is ``chain_getBlockHash(0)``, the id the outer
+        STCA payload and the slash watcher already sign over. The runtime's
+        ``IntentSettlement.MateriosChainId`` reads ``System.BlockHash(0)``,
+        which holds :data:`BLOCK_ZERO_PLACEHOLDER` until block 1, and
+        substrate-interface caches metadata per runtime version: a daemon
+        that first reads it at block 0 keeps the placeholder until the next
+        runtime upgrade. The constant is therefore only a cross-check,
+        skipped when it is absent or the placeholder.
 
-        We fetch these on every call rather than cache them in
-        ``self`` because the cache invalidation rules
-        (``feedback_cert_daemon_chain_id_must_be_set.md``) require
-        re-fetch on every genesis-hash change anyway, and the four
-        ``get_constant`` calls are decoded from already-cached
-        metadata so the cost is negligible relative to a single
-        ``query``.
+        Returns ``None`` if NetworkMagic, AegisPolicyV1ScriptHash or
+        SettlementVersion is unreadable (a runtime without
+        ``pallet-intent-settlement``). Raises :class:`ChainIdRefused` when
+        the genesis hash is malformed, the placeholder or zero, or differs
+        from the runtime's ``MateriosChainId``. Callers MUST NOT fabricate a
+        default: a wrong chain id produces wrong-domain digests and every
+        attest_settle fails with ``InvalidSignature``.
+
+        Read on every call, so a chain reset is picked up at once; the
+        constants decode from already-cached metadata.
         """
         try:
             chain_id_const = self._call(
@@ -1149,7 +1161,6 @@ class SubstrateClient:
             )
             return None
         consts = (
-            chain_id_const,
             network_magic_const,
             script_hash_const,
             settlement_version_const,
@@ -1157,8 +1168,9 @@ class SubstrateClient:
         if any(c is None for c in consts):
             return None
         try:
-            chain_id_raw = _to_bytes_exact(
-                getattr(chain_id_const, "value", chain_id_const), 32
+            runtime_chain_id = (
+                None if chain_id_const is None
+                else _to_bytes_exact(getattr(chain_id_const, "value", chain_id_const), 32)
             )
             network_magic_raw = int(
                 getattr(network_magic_const, "value", network_magic_const)
@@ -1179,9 +1191,25 @@ class SubstrateClient:
                 f"{type(e).__name__}: {e}"
             )
             return None
+        genesis = self.get_genesis_hash()
+        try:
+            chain_id = _to_bytes_exact(genesis, 32)
+        except (ValueError, TypeError) as e:
+            raise ChainIdRefused(
+                f"chain_getBlockHash(0) returned {genesis!r}, not a 32-byte hash"
+            ) from e
+        if chain_id in (bytes(32), BLOCK_ZERO_PLACEHOLDER):
+            raise ChainIdRefused(
+                f"chain_getBlockHash(0) returned the unusable chain id 0x{chain_id.hex()}"
+            )
+        if runtime_chain_id not in (None, BLOCK_ZERO_PLACEHOLDER, chain_id):
+            raise ChainIdRefused(
+                f"runtime MateriosChainId 0x{runtime_chain_id.hex()} differs from "
+                f"chain_getBlockHash(0) 0x{chain_id.hex()}"
+            )
         try:
             return ChainIdentity(
-                materios_chain_id=chain_id_raw,
+                materios_chain_id=chain_id,
                 network_magic=network_magic_raw,
                 aegis_policy_script_hash=script_hash_raw,
                 settlement_version=settlement_version_raw,
@@ -1205,8 +1233,8 @@ class SubstrateClient:
            ``Vouchers[claim_id]`` row. Doesn't exist either today; same
            forward-compat reason.
         3. **Live fallback (task #278)** — read the full
-           ``Vouchers[claim_id]`` row + the four chain-identity
-           runtime constants via metadata, then recompute the digest
+           ``Vouchers[claim_id]`` row + the chain identity
+           (:meth:`get_chain_identity`), then recompute the digest
            via :func:`daemon.voucher_canonicalize.compute_voucher_digest_with_address`.
            This is the only path that actually returns a value on the
            current chain. Byte-for-byte mirrors the pallet's
@@ -1225,6 +1253,8 @@ class SubstrateClient:
         ``None`` causes the dispatcher to drop the settle request
         rather than sign a wrong-domain digest — falsifiability is the
         whole point of the STCA preimage (memo §2.4).
+
+        Raises :class:`ChainIdRefused` from :meth:`get_chain_identity`.
         """
         claim_param = "0x" + claim_id.hex()
         # Path 1: dedicated VoucherDigests map (forward-compat).

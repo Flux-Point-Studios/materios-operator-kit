@@ -15,6 +15,10 @@ DAEMON_VERSION = "1.1.0"
 # Deterministic signing string format — pipe-delimited, fixed field order
 SIGNING_PREFIX = "materios-heartbeat-v1"
 
+# The gateway refuses a finality_gap outside [0, u32::MAX]
+# (materios-gateway src/routes/heartbeats.ts).
+U32_MAX = 0xFFFF_FFFF
+
 
 class HeartbeatSender:
     """Background thread that sends periodic signed heartbeats."""
@@ -59,6 +63,10 @@ class HeartbeatSender:
         """Build deterministic pipe-delimited signing string."""
         # substrate_connected as 1/0 integer
         sc = 1 if substrate_connected else 0
+        # The gateway rebuilds an absent or null field here as 0.
+        finalized_block, finality_gap = (
+            0 if value is None else value for value in (finalized_block, finality_gap)
+        )
         return (
             f"{SIGNING_PREFIX}|{validator_id}|{seq}|{timestamp}|{best_block}|"
             f"{finalized_block}|{finality_gap}|{pending_receipts}|{certs_submitted}|"
@@ -76,6 +84,16 @@ class HeartbeatSender:
                 pending_receipts = self._metrics.get("pending_receipts", 0)
                 certs_submitted = self._metrics.get("certs_submitted_total", 0)
                 substrate_connected = self._metrics.get("substrate_connected", False)
+
+            # Best and finalized are read at different moments, possibly on
+            # different connections after a reconnect, so the raw gap can be
+            # negative, missing or not an integer. Unknown when either head is.
+            if best_block is None or finalized_block is None:
+                finality_gap = None
+            try:
+                finality_gap = min(max(0, int(finality_gap)), U32_MAX)
+            except (TypeError, ValueError, OverflowError):
+                finality_gap = None
 
             validator_id = self.keypair.ss58_address
             self._seq += 1
@@ -101,13 +119,14 @@ class HeartbeatSender:
                 "timestamp": timestamp,
                 "best_block": best_block,
                 "finalized_block": finalized_block,
-                "finality_gap": finality_gap,
                 "pending_receipts": pending_receipts,
                 "certs_submitted": certs_submitted,
                 "substrate_connected": substrate_connected,
                 "version": DAEMON_VERSION,
                 "uptime_seconds": uptime,
             }
+            if finality_gap is not None:
+                payload["finality_gap"] = finality_gap
 
             # POST to gateway
             url = f"{self.config.heartbeat_url}/heartbeats"

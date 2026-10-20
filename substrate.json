@@ -4,7 +4,7 @@
     {
       "id": "daemon-core",
       "name": "Daemon core",
-      "desc": "Shared runtime plumbing for every operator-kit daemon module: configuration, the Substrate chain client (bounded per-call timeout and reconnect, raw reads that never derive a signer, one submission path for committee-signed settlement calls, the committee key set, and the settlement runtime context read once per runtime code and announced in logs and metrics; scripts/settlement-runtime.py prints it for a candidate runtime), data models, Cardano address decoding, the health server, heartbeat reporting and Discord delivery.",
+      "desc": "Shared runtime plumbing for every operator-kit daemon module: configuration, the Substrate chain client (bounded per-call timeout and reconnect, raw reads that never derive a signer, one submission path for committee-signed settlement calls, the committee key set, voucher digests bound to the live chain_getBlockHash(0) with a placeholder, zero or disagreeing runtime MateriosChainId refused, and the settlement runtime context read once per runtime code and announced in logs and metrics; scripts/settlement-runtime.py prints it for a candidate runtime), data models, Cardano address decoding, the health server, heartbeat reporting and Discord delivery.",
       "kind": "toolkit",
       "paths": [
         "daemon/config.py",

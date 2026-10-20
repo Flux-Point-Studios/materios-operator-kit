@@ -70,6 +70,7 @@ from daemon.settle_claim_attestor import (
     compute_stca_digest,
     maybe_create_settle_claim_attestor,
 )
+from daemon.substrate_client import ChainIdRefused
 
 
 # ---------------------------------------------------------------------------
@@ -859,6 +860,23 @@ class TestDispatcherRefusals:
         assert verdict.signed is False
         assert verdict.refusal_reason == RefusalReason.VOUCHER_DIGEST_MISMATCH
         assert verdict.refusal_detail == "no_voucher_for_claim_id"
+        client.submit_attest_settle.assert_not_called()
+
+    def test_refuses_with_chain_id_unavailable_when_the_chain_id_is_refused(self):
+        observer = _make_observer_stub()
+        client = _make_substrate_client_stub()
+        client.get_voucher_digest.side_effect = ChainIdRefused(
+            "chain_getBlockHash(0) returned the unusable chain id 0x4545"
+        )
+        attestor = _make_attestor(
+            substrate_client=client, observer=observer,
+        )
+        verdict = _run(attestor.process_one(_default_pending_request(), CHAIN_ID))
+        assert verdict.signed is False
+        assert verdict.refusal_reason == RefusalReason.CHAIN_ID_UNAVAILABLE
+        assert verdict.refusal_detail == (
+            "chain_getBlockHash(0) returned the unusable chain id 0x4545"
+        )
         client.submit_attest_settle.assert_not_called()
 
     def test_refuses_when_chain_voucher_digest_differs_from_request(self):
