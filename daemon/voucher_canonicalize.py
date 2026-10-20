@@ -100,9 +100,10 @@ _TYPE0_CBOR_LEN: int = 80
 class ChainIdentity:
     """The four chain-identity constants pinned into every voucher digest.
 
-    Pulled from the pallet's runtime metadata at startup (see
-    ``SubstrateClient.get_chain_identity``). Do NOT hardcode preprod values
-    — the same daemon image must work on mainnet too.
+    Read live by ``SubstrateClient.get_chain_identity``: the chain id from
+    ``chain_getBlockHash(0)``, the rest from the pallet's runtime metadata.
+    Do NOT hardcode preprod values — the same daemon image must work on
+    mainnet too.
 
     Fields mirror ``voucher_canonicalize::ChainIdentity`` in the pallet:
 

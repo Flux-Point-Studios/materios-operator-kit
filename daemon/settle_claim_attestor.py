@@ -74,6 +74,7 @@ import aiohttp
 from daemon.cardano_address import (
     extract_payment_hash_from_cardano_address,
 )
+from daemon.substrate_client import ChainIdRefused
 
 logger = logging.getLogger(__name__)
 
@@ -1427,6 +1428,11 @@ class SettleClaimAttestor:
             on_chain_voucher_digest = await asyncio.to_thread(
                 self.client.get_voucher_digest, request.claim_id
             )
+        except ChainIdRefused as e:
+            verdict.refusal_reason = RefusalReason.CHAIN_ID_UNAVAILABLE
+            verdict.refusal_detail = str(e)
+            self._log_refusal(verdict)
+            return None
         except Exception as e:  # noqa: BLE001
             verdict.refusal_reason = RefusalReason.VOUCHER_DIGEST_MISMATCH
             verdict.refusal_detail = (
