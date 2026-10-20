@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Run targeted slash-safety mutants in isolated copies of the test suite."""
+"""Run targeted safety mutants in isolated copies of the test suite: slash
+signing, and the attest path's recovery from dead RPC sockets. Each suite runs
+only its own tests, and first proves they pass unmutated in that same layout."""
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -9,10 +11,10 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-TESTS = ['tests/test_slash_runtime.py', 'tests/test_frv2_vectors.py', 'tests/test_settle_supersede.py',
-         'tests/test_slash_proof.py', 'tests/test_slash_watcher.py', 'tests/test_multisig_aggregator.py',
-         'tests/test_settlement_submits.py', 'tests/test_poll_loop.py']
-MUTANTS = [
+SLASH_TESTS = ['tests/test_slash_runtime.py', 'tests/test_frv2_vectors.py', 'tests/test_settle_supersede.py',
+               'tests/test_slash_proof.py', 'tests/test_slash_watcher.py', 'tests/test_multisig_aggregator.py',
+               'tests/test_settlement_submits.py', 'tests/test_poll_loop.py']
+SLASH_MUTANTS = [
     ('wrong-chain-accepted', 'daemon/substrate_client.py', 'if version["specName"] != "materios":', 'if False:'),
     ('unknown-contract-uses-frau', 'daemon/substrate_client.py', 'if SLASH_PROTOCOLS.get(fingerprint) != expected:', 'if fingerprint in SLASH_PROTOCOLS and SLASH_PROTOCOLS[fingerprint] != expected:'),
     ('tag-skips-contract-pin', 'daemon/substrate_client.py', 'if SLASH_PROTOCOLS.get(fingerprint) != expected:', 'if False:'),
@@ -116,37 +118,78 @@ MUTANTS = [
     ('supersede-reread-unbounded', 'daemon/settle_claim_attestor.py', 'current = await asyncio.wait_for(self._still_supersedable(request, verdict), LOCKED_REREAD_SECONDS)', 'current = await self._still_supersedable(request, verdict)'),
 ]
 
+TRANSPORT_TESTS = ['tests/test_dead_write_conn.py', 'tests/test_receipt_rpc_retry.py',
+                   'tests/test_write_conn_keepalive.py', 'tests/test_substrate_client_ws_retry.py',
+                   'daemon/tests/test_read_write_ws_split.py']
+TRANSPORT_MUTANTS = [
+    ('transport-branch-deleted', 'daemon/substrate_client.py', '                if not is_transport_dead(error):\n                    raise\n                self._replace_dead_conn', '                raise\n                self._replace_dead_conn'),
+    ('transport-set-broken-pipe-only', 'daemon/substrate_client.py', 'TRANSPORT_DEAD_ERRORS = (\n    BrokenPipeError,\n    ConnectionResetError,\n    ConnectionAbortedError,\n    WebSocketConnectionClosedException,\n    ssl.SSLEOFError,\n)', 'TRANSPORT_DEAD_ERRORS = (BrokenPipeError,)'),
+    ('transport-set-websocket-only', 'daemon/substrate_client.py', 'TRANSPORT_DEAD_ERRORS = (\n    BrokenPipeError,\n    ConnectionResetError,\n    ConnectionAbortedError,\n    WebSocketConnectionClosedException,\n    ssl.SSLEOFError,\n)', 'TRANSPORT_DEAD_ERRORS = (WebSocketConnectionClosedException,)'),
+    ('wrapped-transport-missed', 'daemon/substrate_client.py', 'return any(isinstance(e, TRANSPORT_DEAD_ERRORS) for e in _error_chain(error))', 'return isinstance(error, TRANSPORT_DEAD_ERRORS)'),
+    ('transport-not-retried', 'daemon/substrate_client.py', '                if attempt == 2 or conn.si is None:\n                    raise\n', '                raise\n'),
+    ('second-failure-swallowed', 'daemon/substrate_client.py', '                if attempt == 2 or conn.si is None:\n', '                if conn.si is None:\n'),
+    ('retried-on-the-dead-socket', 'daemon/substrate_client.py', '            health_server.increment_metric("ws_transport_replacements_total")\n            self._force_replace(conn)\n', '            health_server.increment_metric("ws_transport_replacements_total")\n'),
+    ('replacement-not-counted', 'daemon/substrate_client.py', '            health_server.increment_metric("ws_transport_replacements_total")\n', ''),
+    ('one-dead-socket-replaced-per-call', 'daemon/substrate_client.py', '            if conn.si is not dead_si:\n                return\n', ''),
+    ('timeout-replace-unserialized', 'daemon/substrate_client.py', '            with conn.replace_lock:\n                self._force_replace(conn)\n', '            self._force_replace(conn)\n'),
+    ('no-reconnect-on-use', 'daemon/substrate_client.py', '                if conn.si is None:\n                    self._force_replace(conn)\n', '                pass\n'),
+    ('close-frame-not-transport', 'daemon/substrate_client.py', 'if (isinstance(error, json.JSONDecodeError)', 'if False and (isinstance(error, json.JSONDecodeError)'),
+    ('submit-swallows-dead-socket', 'daemon/substrate_client.py', '                if is_transport_dead(e):\n                    raise\n', ''),
+    ('refusal-never-done', 'daemon/substrate_client.py', '                if self.attestation_on_chain(receipt_id):\n', '                if False:\n'),
+    ('refusal-always-done', 'daemon/substrate_client.py', '                if self.attestation_on_chain(receipt_id):\n', '                if True:\n'),
+    ('any-attester-counts-as-ours', 'daemon/substrate_client.py', 'self.keypair.public_key in {\n            _account_id_bytes(str(signer)) for signer in entry[1]\n        }', 'bool(entry[1])'),
+    ('timeouts-not-deferred', 'daemon/substrate_client.py', 'return is_transport_dead(error) or any(isinstance(e, RPCTimeoutError) for e in _error_chain(error))', 'return is_transport_dead(error)'),
+    ('keepalive-interval-past-proxy-window', 'daemon/substrate_client.py', '"MATERIOS_RPC_KEEPALIVE_SECS", 30.0', '"MATERIOS_RPC_KEEPALIVE_SECS", 120.0'),
+    ('rpc-failure-dropped-with-its-block', 'daemon/cert_daemon.py', 'if isinstance(res, BaseException) and is_rpc_unavailable(res):', 'if False:'),
+    ('rpc-retries-unbounded', 'daemon/cert_daemon.py', 'if entry.retries > MAX_RECEIPT_RPC_RETRIES:', 'if False:'),
+    ('rpc-retry-count-reset', 'daemon/cert_daemon.py', 'await self._defer_receipt(receipt_id, error, pending)', 'await self._defer_receipt(receipt_id, error)'),
+    ('deferred-receipt-not-retried', 'daemon/cert_daemon.py', '            if pending.last_error:\n', '            if False:\n'),
+    ('deferred-retry-signs-again', 'daemon/cert_daemon.py', 'if await asyncio.to_thread(self.client.attestation_on_chain, receipt_id):', 'if False:'),
+    ('cert-stored-before-submit', 'daemon/cert_daemon.py', '        cert_hash = hashlib.sha256(cert_bytes).digest()\n', '        cert_hash = hashlib.sha256(cert_bytes).digest()\n        self.cert_store.save(receipt_id, cert_bytes)\n'),
+    ('done-reported-as-submitted', 'daemon/cert_daemon.py', '            if not outcome.already_on_chain:\n', '            if True:\n'),
+    ('keepalive-off', 'daemon/cert_daemon.py', '                    await asyncio.to_thread(self.client.keepalive)\n', '                    pass\n'),
+    ('keepalive-waits-behind-submit', 'daemon/cert_daemon.py', '            if self._chain_write_lock.locked():\n                continue\n', ''),
+    ('keepalive-never-started', 'daemon/cert_daemon.py', '        keepalive = asyncio.create_task(self._keep_write_conn_alive())\n', '        keepalive = asyncio.create_task(asyncio.Event().wait())\n'),
+    ('keepalive-outlives-the-daemon', 'daemon/cert_daemon.py', '        keepalive.cancel()\n', ''),
+]
+SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS)]
 
-def run(directory):
-    return subprocess.run([sys.executable, '-B', '-m', 'pytest', '-x', '-q', '-p', 'no:cacheprovider', *TESTS],
-                          cwd=directory, capture_output=True, text=True,
-                          env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, timeout=180)
 
-
-def mutate(name, filename, before, after):
-    """None when the suite kills the mutant, else why not."""
-    with tempfile.TemporaryDirectory(prefix='operator-kit-frv2-mutant-') as scratch:
+def in_copy(tests, filename=None, before=None, after=None):
+    """``tests`` run in an isolated copy of daemon/ and tests/, with one
+    mutation applied when ``filename`` is given."""
+    with tempfile.TemporaryDirectory(prefix='operator-kit-mutant-') as scratch:
         scratch = Path(scratch)
         for directory in ('daemon', 'tests'):
             shutil.copytree(ROOT / directory, scratch / directory, ignore=shutil.ignore_patterns('__pycache__'))
-        source = scratch / filename
-        source.write_text(source.read_text().replace(before, after))
-        result = run(scratch)
-        if result.returncode != 1 or ' failed' not in result.stdout or 'ERROR collecting' in result.stdout:
-            return f'{name}: SURVIVED or invalid mutant\n{result.stdout}\n{result.stderr}'
-        return None
+        if filename:
+            source = scratch / filename
+            source.write_text(source.read_text().replace(before, after))
+        return subprocess.run([sys.executable, '-B', '-m', 'pytest', '-x', '-q', '-p', 'no:cacheprovider', *tests],
+                              cwd=scratch, capture_output=True, text=True,
+                              env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}, timeout=180)
+
+
+def mutate(tests, name, filename, before, after):
+    """None when the suite kills the mutant, else why not."""
+    result = in_copy(tests, filename, before, after)
+    if result.returncode != 1 or ' failed' not in result.stdout or 'ERROR collecting' in result.stdout:
+        return f'{name}: SURVIVED or invalid mutant\n{result.stdout}\n{result.stderr}'
+    return None
 
 
 if __name__ == '__main__':
-    for name, filename, before, _ in MUTANTS:
+    mutants = [(tests, *mutant) for tests, suite in SUITES for mutant in suite]
+    for _, name, filename, before, _ in mutants:
         if (ROOT / filename).read_text().count(before) != 1:
             sys.exit(f'{name}: expected exactly one mutation site')
-    baseline = run(ROOT)
-    if baseline.returncode:
-        sys.exit(baseline.stdout + baseline.stderr)
+    for tests, _ in SUITES:
+        baseline = in_copy(tests)
+        if baseline.returncode:
+            sys.exit(baseline.stdout + baseline.stderr)
     with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as pool:
-        for (name, *_), failure in zip(MUTANTS, pool.map(lambda mutant: mutate(*mutant), MUTANTS)):
+        for (_, name, *_), failure in zip(mutants, pool.map(lambda mutant: mutate(*mutant), mutants)):
             if failure:
                 sys.exit(failure)
             print(f'KILLED {name}', flush=True)
-    print(f'{len(MUTANTS)}/{len(MUTANTS)} mutants killed')
+    print(f'{len(mutants)}/{len(mutants)} mutants killed')

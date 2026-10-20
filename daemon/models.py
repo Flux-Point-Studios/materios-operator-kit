@@ -55,7 +55,7 @@ class VerificationResult:
 @dataclass
 class PendingReceipt:
     receipt_id: str
-    receipt: ReceiptRecord
+    receipt: Optional[ReceiptRecord]  # None once deferred by an RPC failure: its retry reads it again
     first_seen: float  # time.time()
     retries: int = 0
-    last_error: str = ""
+    last_error: str = ""  # the RPC failure that deferred it; empty while it waits on a locator

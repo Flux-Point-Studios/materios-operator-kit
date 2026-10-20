@@ -50,12 +50,15 @@ _metrics = {
     # ``ws_force_reconnects_total``   — successful force-replaces of the
     #                                   SubstrateInterface after the
     #                                   consecutive-timeout threshold tripped.
+    # ``ws_transport_replacements_total`` — force-replaces started because a
+    #                                   call hit a dead socket.
     # ``ws_consecutive_reconnect_failures`` — current streak of failed
     #                                   reconnect attempts. Gauge — 0 means
     #                                   we're online or the last reconnect
     #                                   succeeded.
     "ws_rpc_timeouts_total": 0,
     "ws_force_reconnects_total": 0,
+    "ws_transport_replacements_total": 0,
     "ws_consecutive_reconnect_failures": 0,
 }
 _metrics_lock = threading.Lock()
