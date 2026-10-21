@@ -72,6 +72,9 @@ def _make_daemon(
     config = DaemonConfig()
     daemon = CertDaemon.__new__(CertDaemon)
     daemon.config = config
+    daemon._chain_write_lock = None
+    daemon._pending_lock = None
+    daemon._concurrency_sem = None
     daemon.client = MagicMock()
     daemon.client.keypair = SimpleNamespace(
         ss58_address=ATTESTOR_SS58,

@@ -123,27 +123,40 @@ def test_a_dead_read_socket_replaces_the_read_conn_only():
     assert fresh.calls == ["system_health", "system_health"]
 
 
-def test_calls_failing_together_on_one_dead_socket_replace_it_once():
+def test_calls_on_a_socket_that_dies_run_one_at_a_time_and_replace_it_once():
+    """One call at a time runs on a socket (#72). The call on it finds it
+    dead and replaces it. The call waiting behind it never shares the socket
+    with it, and does not replace the replacement: it runs there."""
     client, endpoint = connected_client()
     write = endpoint.opened[0]
-    both_in_flight = threading.Barrier(2)
+    in_flight, release, on_socket, most_on_socket = threading.Event(), threading.Event(), [], []
 
-    def dies_with_both_in_flight(method, params):
+    def dies_while_the_second_call_waits(method, params):
         write.calls.append(method)
-        both_in_flight.wait(timeout=5)
+        on_socket.append(method)
+        most_on_socket.append(len(on_socket))
+        in_flight.set()
+        if len(write.calls) == 1:
+            release.wait(5)
+        on_socket.pop()
         raise BrokenPipeError(32, "Broken pipe")
 
-    write.rpc_request = dies_with_both_in_flight
+    write.rpc_request = dies_while_the_second_call_waits
     results = []
     callers = [threading.Thread(target=lambda: results.append(health(client))) for _ in range(2)]
-    for caller in callers:
-        caller.start()
+    callers[0].start()
+    assert in_flight.wait(5)
+    callers[1].start()
+    time.sleep(0.2)
+    release.set()
     for caller in callers:
         caller.join(timeout=10)
 
     assert results == [{"peers": 3, "isSyncing": False}] * 2
-    assert len(endpoint.opened) == 3, "one replacement, not one per failed call"
+    assert max(most_on_socket) == 1, "two calls were on the socket at once"
+    assert len(endpoint.opened) == 3, "one replacement, not one per call"
     assert client._write.si is endpoint.opened[2]
+    assert endpoint.opened[2].calls == ["system_health"] * 2
 
 
 def test_a_call_arriving_during_a_timeout_replace_waits_for_it():
@@ -235,45 +248,6 @@ def test_a_transport_replacement_is_logged_and_counted(caplog):
     assert "force-replace[write]: transport error BrokenPipeError in 'rpc_request'" in caplog.text
 
 
-def test_a_call_whose_socket_is_closed_under_it_runs_again_on_the_replacement():
-    """One call finds the write socket dead and replaces it, closing the
-    socket a second call is still using; that call then fails with EBADF. It
-    is the same dead socket: the call runs again on the replacement, and the
-    socket is replaced once."""
-    client, endpoint = connected_client()
-    write = endpoint.opened[0]
-    in_flight = threading.Event()
-
-    def dies_under_the_read(method, params):
-        write.calls.append(method)
-        if method != "state_getStorage":
-            raise BrokenPipeError(32, "Broken pipe")
-        in_flight.set()
-        deadline = time.monotonic() + 5
-        while not write.closed and time.monotonic() < deadline:
-            time.sleep(0.005)
-        raise OSError(errno.EBADF, "Bad file descriptor")
-
-    write.rpc_request = dies_under_the_read
-    outcome = {}
-
-    def read():
-        try:
-            outcome["read"] = client._call("rpc_request", "state_getStorage", ["0x00"], conn=client._write)["result"]
-        except Exception as error:
-            outcome["read"] = error
-
-    reader = threading.Thread(target=read)
-    reader.start()
-    assert in_flight.wait(5)
-    assert health(client) == {"peers": 3, "isSyncing": False}
-    reader.join(10)
-
-    assert outcome["read"] == {"peers": 3, "isSyncing": False}
-    assert len(endpoint.opened) == 3 and client._write.si is endpoint.opened[2]
-    assert endpoint.opened[2].calls.count("state_getStorage") == 1
-
-
 def test_a_kernel_timed_out_socket_is_one_replacement_and_no_rpc_timeout():
     client, endpoint = connected_client()
     endpoint.opened[0].failure = kernel_timeout()
@@ -289,10 +263,10 @@ def test_a_kernel_timed_out_socket_is_one_replacement_and_no_rpc_timeout():
 
 
 def test_a_timeout_on_a_socket_already_replaced_is_not_a_strike_against_its_replacement():
-    """A call wedged on the write socket outlasts the budget after a second
-    call found that socket dead and replaced it. The timeout is the dead
-    socket's: the replacement's timeout streak stays clear, so its own first
-    timeout does not replace it."""
+    """A call wedged on the write socket outlasts the budget after the poll
+    loop's reconnect replaced that socket. The timeout is the old socket's:
+    the replacement's timeout streak stays clear, so its own first timeout
+    does not replace it."""
     client, endpoint = connected_client()
     client._rpc_timeout_secs = 1.0
     client._reconnect_after_timeouts = 2
@@ -319,6 +293,7 @@ def test_a_timeout_on_a_socket_already_replaced_is_not_a_strike_against_its_repl
     deadline = time.monotonic() + 5
     while "state_getStorage" not in write.calls and time.monotonic() < deadline:
         time.sleep(0.005)
+    assert client.connect()
     assert health(client) == {"peers": 3, "isSyncing": False}
     reader.join(10)
     release.set()
@@ -330,4 +305,4 @@ def test_a_timeout_on_a_socket_already_replaced_is_not_a_strike_against_its_repl
     fresh.rpc_request = lambda method, params: time.sleep(10)
     with pytest.raises(RPCTimeoutError):
         health(client)
-    assert client._write.si is fresh and len(endpoint.opened) == 3
+    assert client._write.si is fresh and len(endpoint.opened) == 4

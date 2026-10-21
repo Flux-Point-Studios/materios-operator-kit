@@ -304,7 +304,7 @@ Requires `sendmail` or `msmtp` on the host.
 
 ## Optional: Committee Watchtower
 
-Monitor the overall committee health (all members, not just yours). Reads the **public** heartbeat endpoint — no API key needed.
+Monitor the health of every committee member, yours included. Reads the **public** heartbeat endpoint — no API key needed.
 
 ```yaml
   watchtower:
@@ -326,6 +326,7 @@ Monitor the overall committee health (all members, not just yours). Reads the **
 | Heartbeat not appearing on explorer | Daemon hasn't joined committee yet | Check logs for `join_committee` success; if faucet drip failed, retry or ask FPS team |
 | `join_committee` fails with `InsufficientBond` | Free MATRA below `BondRequirement` gap | Daemon auto-bonds on startup. If the warning says `Insufficient free MATRA to auto-bond`, request a faucet drip and restart. See [Auto-bond behaviour](#auto-bond-behaviour). |
 | `substrate_connected: false` in status | Can't reach RPC endpoint | Check that `wss://materios.fluxpointstudios.com/rpc` is reachable from your network |
+| `the read conn is down: reads run on the write conn` in logs | The daemon's second RPC connection, which carries reads, dropped and could not reconnect | The daemon keeps working on one connection and reopens the read connection in the background, logging each attempt. If the error repeats for more than a few minutes, check that the RPC endpoint accepts new connections |
 | High finality gap (>10) | Chain-wide issue, not your daemon | Check the explorer dashboard — if all validators show high gap, it's a chain stall |
 | `No locator found` in logs | Blob not yet uploaded for a receipt | Normal during brief windows — daemon retries automatically |
 | Attestation tx fails with "Priority too low" | Nonce collision (rare) | Daemon auto-recovers on next poll cycle |
