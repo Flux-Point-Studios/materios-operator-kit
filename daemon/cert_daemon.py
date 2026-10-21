@@ -794,10 +794,13 @@ class CertDaemon:
                 try:
                     # The failed run may have landed its attest before the
                     # socket died, and a refused one may have settled since;
-                    # either way there is nothing left to sign.
-                    settled = await asyncio.to_thread(
-                        self.client.attestation_on_chain, receipt_id, pending.cert_hash
-                    )
+                    # either way there is nothing left to sign. The verdict
+                    # reads the write conn, so it waits for the chain-write
+                    # lock rather than behind a submit on that socket.
+                    async with self._chain_write_lock:
+                        settled = await asyncio.to_thread(
+                            self.client.attestation_on_chain, receipt_id, pending.cert_hash
+                        )
                     if settled is None:
                         await self.process_receipt(receipt_id)
                     elif settled:

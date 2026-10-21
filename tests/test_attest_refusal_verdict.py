@@ -19,14 +19,13 @@ had certified first, read as done, but no metric counted them.
 import asyncio
 
 import pytest
-from substrateinterface.exceptions import SubstrateRequestException
 
 from daemon import cert_daemon
 from daemon import substrate_client as sc
 from daemon.substrate_client import AttestUnsettled
 from tests.fake_chain import (
     CALL_NOT_EXPECTED, OTHER_MEMBERS, RECEIPT_ID, FakeChain, canonical_cert_hash, certify_by_others,
-    connected_client, criticals, metric, receipt_scenario, signatures,
+    connected_client, criticals, metric, receipt_scenario, refuse_submits, signatures,
 )
 
 CERT_HASH = canonical_cert_hash(RECEIPT_ID)
@@ -158,15 +157,6 @@ def test_a_bad_hash_refusal_on_a_receipt_others_are_attesting_fails_at_once():
     assert not outcome.success and "Transaction call is not expected" in outcome.error_message
     assert endpoint.opened[0].calls.count("submit_extrinsic") == 1
     assert [signer for signer, _, _ in ledger.included] == [OTHER_MEMBERS[0]]
-
-
-def refuse_submits(endpoint, refusal):
-    """The write conn's pool refuses every submit with ``refusal``, for a
-    reason its best block does not show."""
-    write = endpoint.opened[0]
-    write.failure = SubstrateRequestException(refusal)
-    write.failing = {"submit_extrinsic"}
-    return write
 
 
 def test_an_unexplained_refusal_raises_the_node_verdict_after_one_submit():

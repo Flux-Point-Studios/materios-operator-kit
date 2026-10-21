@@ -39,6 +39,7 @@ SUBMITS = [
 def client(*receipts):
     c = object.__new__(SubstrateClient)
     c.config = SimpleNamespace(signer_uri="//Alice", tx_max_retries=3)
+    c._ensure_wrapper_state()
     answers = iter(receipts)
 
     def call(method, *args, **kwargs):
@@ -58,11 +59,12 @@ def test_submission_composes_signs_and_returns_the_hash(method, args, function, 
     c = client(OK)
     assert getattr(c, method)(*args) == "0x" + "5e" * 32
     compose, sign, submit = c._call.call_args_list
-    assert compose.kwargs == dict(call_module="IntentSettlement", call_function=function, call_params=params)
-    assert sign.kwargs == dict(call="compose_call", keypair=sign.kwargs["keypair"])
+    assert compose.kwargs == dict(call_module="IntentSettlement", call_function=function, call_params=params,
+                                  conn=c._write)
+    assert sign.kwargs == dict(call="compose_call", keypair=sign.kwargs["keypair"], conn=c._write)
     assert sign.kwargs["keypair"].public_key == Keypair.create_from_uri("//Alice").public_key
     assert submit.args == ("submit_extrinsic", "create_signed_extrinsic")
-    assert submit.kwargs == {"wait_for_inclusion": True}
+    assert submit.kwargs == {"wait_for_inclusion": True, "conn": c._write}
 
 
 @pytest.mark.parametrize("method, args, function, params", SUBMITS)
