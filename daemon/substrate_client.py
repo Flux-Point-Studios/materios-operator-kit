@@ -1,4 +1,5 @@
 import collections
+import contextlib
 import errno
 import functools
 import hashlib
@@ -772,8 +773,12 @@ class SubstrateClient:
                         "the read conn is down: reads run on the write conn, behind its submits, "
                         "until a background reopen succeeds"
                     )
+                    # The reopen holds the replace lock only while it dials: a
+                    # read that failed on the conn's old socket takes that lock,
+                    # and must not wait out the backoff behind it.
                     self._read_reopen = threading.Thread(
-                        target=self._reopen_read_conn, name="substrate-read-reopen", daemon=True
+                        target=self._reconnect, args=(conn, conn.replace_lock),
+                        name="substrate-read-reopen", daemon=True,
                     )
                     self._read_reopen.start()
                 conn = self._write
@@ -789,13 +794,6 @@ class SubstrateClient:
                 f"the {conn.name} conn and could not reconnect it"
             )
         return conn, si, lock
-
-    def _reopen_read_conn(self) -> None:
-        """One reconnect cycle for the read conn, with its backoff, off the
-        thread whose read found it empty."""
-        with self._read.replace_lock:
-            if self._read.si is None:
-                self._force_replace(self._read)
 
     def _call_once(
         self, conn: "_WsConn", si: SubstrateInterface, lock: _FifoLock, method_name: str, args: tuple,
@@ -922,14 +920,11 @@ class SubstrateClient:
                 self._force_replace(conn)
 
     def _force_replace(self, conn: "_WsConn") -> None:
-        """Close a conn's websocket and construct a new one, in isolation.
+        """Close a conn's websocket and construct a new one, in isolation,
+        under the conn's replace lock, which the caller holds.
 
-        Exponential backoff between failed reconnects: 1, 2, 4, 8, 16, 30
-        (capped). After ``self._reconnect_max_attempts`` failures we return
-        without a working SI on that conn: the next call on the write conn
-        starts a fresh cycle first, and the next read starts one for the read
-        conn in the background. The conn's timeout streak is reset on the way
-        out so the next RPC starts clean. The *other* conn is never touched.
+        The conn's timeout streak is reset on the way out so the next RPC
+        starts clean. The *other* conn is never touched.
         """
         old_si = conn.si
         # Emptied before the close, so a call that the close wakes, or that is
@@ -949,46 +944,61 @@ class SubstrateClient:
         # we don't want a still-wedged WS to keep stacking force-replace
         # attempts in a single call.
         conn.consecutive_timeouts = 0
+        self._reconnect(conn, contextlib.nullcontext())
+
+    def _reconnect(self, conn: "_WsConn", attempt_lock: contextlib.AbstractContextManager) -> None:
+        """Dial ``conn`` until it holds an SI, each attempt under
+        ``attempt_lock`` and each backoff sleep outside it.
+
+        Exponential backoff between failed reconnects: 1, 2, 4, 8, 16, 30
+        (capped), with the streak carried across cycles. An attempt that finds
+        the conn already holding an SI ends the cycle. After
+        ``self._reconnect_max_attempts`` failures we return without a working
+        SI on that conn: the next call on the write conn starts a fresh cycle
+        first, and the next read starts one for the read conn in the background.
+        """
         attempt = 0
         while attempt < self._reconnect_max_attempts:
-            try:
-                new_si = self._create_substrate_interface()
-            except Exception as e:  # noqa: BLE001
-                conn.consecutive_reconnect_failures += 1
+            with attempt_lock:
+                if conn.si is not None:
+                    return
                 try:
-                    health_server.update_metrics(
-                        ws_consecutive_reconnect_failures=conn.consecutive_reconnect_failures
+                    new_si = self._create_substrate_interface()
+                except Exception as e:  # noqa: BLE001
+                    conn.consecutive_reconnect_failures += 1
+                    try:
+                        health_server.update_metrics(
+                            ws_consecutive_reconnect_failures=conn.consecutive_reconnect_failures
+                        )
+                    except Exception:
+                        pass
+                    # Backoff: 1, 2, 4, 8, 16, then 30s cap.
+                    # ``2 ** (n-1)`` for n=1..5 = 1, 2, 4, 8, 16; clamped at 30.
+                    delay = min(30, 1 << (conn.consecutive_reconnect_failures - 1))
+                    logger.warning(
+                        f"force-replace[{conn.name}]: SubstrateInterface ctor failed "
+                        f"(attempt {attempt + 1}/{self._reconnect_max_attempts}, "
+                        f"streak={conn.consecutive_reconnect_failures}): "
+                        f"{type(e).__name__}: {e}; sleeping {delay}s"
                     )
-                except Exception:
-                    pass
-                # Backoff: 1, 2, 4, 8, 16, then 30s cap.
-                # ``2 ** (n-1)`` for n=1..5 = 1, 2, 4, 8, 16; clamped at 30.
-                delay = min(30, 1 << (conn.consecutive_reconnect_failures - 1))
-                logger.warning(
-                    f"force-replace[{conn.name}]: SubstrateInterface ctor failed "
-                    f"(attempt {attempt + 1}/{self._reconnect_max_attempts}, "
-                    f"streak={conn.consecutive_reconnect_failures}): "
-                    f"{type(e).__name__}: {e}; sleeping {delay}s"
-                )
-                self._backoff_sleep(delay)
-                attempt += 1
-                continue
-            # Success.
-            conn.si = new_si
-            try:
-                health_server.increment_metric("ws_force_reconnects_total")
-                health_server.update_metrics(
-                    ws_consecutive_reconnect_failures=0,
-                    substrate_connected=True,
-                )
-            except Exception:
-                pass
-            conn.consecutive_reconnect_failures = 0
-            logger.warning(
-                f"force-replace[{conn.name}]: new SubstrateInterface online "
-                f"(chain={getattr(new_si, 'chain', '?')})"
-            )
-            return
+                else:
+                    conn.si = new_si
+                    try:
+                        health_server.increment_metric("ws_force_reconnects_total")
+                        health_server.update_metrics(
+                            ws_consecutive_reconnect_failures=0,
+                            substrate_connected=True,
+                        )
+                    except Exception:
+                        pass
+                    conn.consecutive_reconnect_failures = 0
+                    logger.warning(
+                        f"force-replace[{conn.name}]: new SubstrateInterface online "
+                        f"(chain={getattr(new_si, 'chain', '?')})"
+                    )
+                    return
+            self._backoff_sleep(delay)
+            attempt += 1
         # Bailed without a working SI. The next user-call enters _call and
         # finds this conn's si is None: a read degrades to the write conn and
         # starts a background reopen, a write runs a fresh reconnect cycle first.
