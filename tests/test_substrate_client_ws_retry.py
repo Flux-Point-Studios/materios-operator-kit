@@ -239,11 +239,13 @@ def test_success_resets_consecutive_timeout_counter():
     client = _make_client(rpc_timeout_secs=0.1, reconnect_after=2)
     fake = _FakeSI()
     state = {"slow_next": True}
+    release = threading.Event()
 
     def maybe_slow():
         if state["slow_next"]:
             state["slow_next"] = False
-            time.sleep(60)
+            # Past the budget; the next call waits until this one leaves the socket.
+            release.wait(5)
         return "ok"
 
     fake.set_method("foo", maybe_slow)
@@ -251,6 +253,7 @@ def test_success_resets_consecutive_timeout_counter():
     with pytest.raises(RPCTimeoutError):
         client._call("foo", conn=client._write)
     assert client._write.consecutive_timeouts == 1
+    release.set()
     assert client._call("foo", conn=client._write) == "ok"
     assert client._write.consecutive_timeouts == 0
 

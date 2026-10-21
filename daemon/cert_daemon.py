@@ -864,7 +864,10 @@ class CertDaemon:
           - `free_matra < delta` → warn (with faucet URL hint) and return;
             does NOT submit a tx, does NOT crash. Daemon still tries to join.
           - Otherwise → submit `bond(required - current)` and log the tx hash.
+
+        The bond submits under the chain-write lock, as every submit does.
         """
+        self._ensure_concurrency_primitives()
         try:
             my_address = self.client.keypair.ss58_address
             required = self.client.get_bond_requirement()
@@ -906,7 +909,8 @@ class CertDaemon:
                 f"({current} + {delta} = {required})"
             )
             try:
-                success, tx_hash = self.client.submit_bond(delta)
+                async with self._chain_write_lock:
+                    success, tx_hash = await asyncio.to_thread(self.client.submit_bond, delta)
             except Exception as e:
                 # Defensive: never let a transient RPC glitch kill startup.
                 logger.warning(f"Auto-bond submit raised {type(e).__name__}: {e}")
@@ -936,8 +940,10 @@ class CertDaemon:
         landed). If the chain still reports `InsufficientBond` after the
         initial bond (e.g. governance raised the floor mid-flight), we re-run
         `_ensure_bond()` and retry the join exactly ONCE more — never an
-        infinite loop on the same failure mode.
+        infinite loop on the same failure mode. The join submits under the
+        chain-write lock, as every submit does.
         """
+        self._ensure_concurrency_primitives()
         try:
             my_address = self.client.keypair.ss58_address
             # Route through the bounded-timeout wrapper (task #288) — a
@@ -973,7 +979,8 @@ class CertDaemon:
 
             bond_retry_used = False
             for attempt in range(2):  # at most: original attempt + 1 bond-fallback
-                receipt = self.client.submit_join_committee()
+                async with self._chain_write_lock:
+                    receipt = await asyncio.to_thread(self.client.submit_join_committee)
 
                 if receipt.is_success:
                     logger.info(f"Successfully joined attestation committee!")

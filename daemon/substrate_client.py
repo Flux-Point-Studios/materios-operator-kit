@@ -1,3 +1,4 @@
+import collections
 import errno
 import functools
 import hashlib
@@ -8,7 +9,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.base import ExtrinsicReceipt, QueryMapResult
 from substrateinterface.exceptions import SubstrateRequestException
@@ -43,6 +44,12 @@ RUNTIME_CODE_KEY = "0x" + b":code".hex()
 # frame_system's genesis stores this as BlockHash(0); block 1 overwrites it
 # with the real genesis hash.
 BLOCK_ZERO_PLACEHOLDER = b"\x45" * 32
+
+# How often a call waiting for an SI's lock checks whether that SI was
+# replaced. Closing a socket does not always wake a worker blocked reading it
+# (websocket-client skips the shutdown once it has marked the socket closed),
+# so a waiting call cannot count on that worker leaving.
+REPLACED_CHECK_SECS = 0.05
 
 
 class ChainIdRefused(Exception):
@@ -180,9 +187,17 @@ def slash_contract_fingerprint(v14: dict) -> str:
 #   3. Reconnect failures retry with exponential backoff: 1s, 2s, 4s, 8s,
 #      16s, then capped at 30s. The streak gauge surfaces to /metrics.
 #   4. A call that fails on a dead socket (``is_transport_dead``) replaces
-#      that conn's SI at once and is retried once on the fresh one. A conn left
-#      without an SI reconnects on its next call. A timeout on an SI the conn
-#      has already replaced does not count toward the new SI's streak.
+#      that conn's SI at once and is retried once on the fresh one. A write
+#      conn left without an SI reconnects on its next call; a read conn left
+#      without one sends reads to the write conn and is reopened in the
+#      background. A timeout on an SI the conn has already replaced does not
+#      count toward the new SI's streak.
+#   5. One call at a time runs on each SI (#72). substrate-interface's
+#      websocket transport reads every reply off one socket into one shared
+#      queue, so concurrent calls take each other's replies and the robbed
+#      call waits out its budget. A call that times out leaves its worker on
+#      the socket, and the next call waits within its own budget for that
+#      worker to leave or for the SI to be replaced.
 #
 # Metrics surfaced on success/failure:
 #   - cert_daemon_ws_rpc_timeouts_total (counter)
@@ -445,6 +460,45 @@ def _extract_voucher_fields_for_digest(row: dict) -> dict:
     }
 
 
+class _FifoLock:
+    """A lock granted in arrival order: a release hands it to the longest
+    waiter. A caller that releases and asks again at once queues behind the
+    others instead of starving them, so a wait is bounded by the calls ahead
+    of it (#72). Any thread may release it."""
+
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+        self._held = False
+        self._waiters: collections.deque[threading.Event] = collections.deque()
+
+    def acquire(self, timeout: float, give_up: Callable[[], bool]) -> bool:
+        """Whether the lock was granted within ``timeout`` seconds. A waiter
+        checks ``give_up`` every REPLACED_CHECK_SECS and leaves the queue
+        once it holds."""
+        with self._mutex:
+            if not self._held:
+                self._held = True
+                return True
+            granted = threading.Event()
+            self._waiters.append(granted)
+        deadline = time.monotonic() + timeout
+        while not granted.wait(max(0.0, min(REPLACED_CHECK_SECS, deadline - time.monotonic()))):
+            if give_up() or time.monotonic() >= deadline:
+                with self._mutex:
+                    if not granted.is_set():
+                        self._waiters.remove(granted)
+                        return False
+                break
+        return True
+
+    def release(self) -> None:
+        with self._mutex:
+            if self._waiters:
+                self._waiters.popleft().set()
+            else:
+                self._held = False
+
+
 class _WsConn:
     """One ``SubstrateInterface`` plus its independent bounded-timeout and
     reconnect state.
@@ -459,11 +513,16 @@ class _WsConn:
     a submit goes to, which run under the chain-write lock that serializes
     submits. Each conn force-replaces itself in isolation: a wedged write
     socket never trips a read reconnect, and vice versa.
+
+    ``bound`` pairs the SI with the lock that admits one call at a time onto
+    it (#72). Every SI gets a fresh lock, so a worker abandoned on a replaced
+    SI never holds up its replacement. Reading ``bound`` once gives an SI and
+    its own lock, even while another thread replaces them.
     """
 
     __slots__ = (
         "name",
-        "si",
+        "bound",
         "consecutive_timeouts",
         "consecutive_reconnect_failures",
         "replace_lock",
@@ -471,12 +530,20 @@ class _WsConn:
 
     def __init__(self, name: str) -> None:
         self.name = name
-        self.si: Optional[SubstrateInterface] = None
+        self.si = None
         self.consecutive_timeouts = 0
         self.consecutive_reconnect_failures = 0
         # Held while a dead or missing SI is replaced, so calls that fail
         # together on one socket replace it once.
         self.replace_lock = threading.Lock()
+
+    @property
+    def si(self) -> Optional[SubstrateInterface]:
+        return self.bound[0]
+
+    @si.setter
+    def si(self, value: Optional[SubstrateInterface]) -> None:
+        self.bound = (value, _FifoLock())
 
 
 class SubstrateClient:
@@ -537,6 +604,11 @@ class SubstrateClient:
         self._reconnect_lock: threading.RLock = threading.RLock()
         # Injectable so backoff tests can run instantaneously.
         self._backoff_sleep = time.sleep
+        # Set by connect(). A client that never connected (a fixture that
+        # wires only the write conn) never dials a read conn.
+        self._dialled = False
+        # The background reopen of a read conn left without an SI, once started.
+        self._read_reopen: Optional[threading.Thread] = None
 
     @functools.cached_property
     def keypair(self) -> Keypair:
@@ -550,10 +622,11 @@ class SubstrateClient:
         submit-held write socket can't block poll-loop reads. Subsequent
         forced reconnects go through ``_force_replace`` per conn, sharing
         the same constructor helper. Returns True once the write conn (the
-        one that must never be down) is live; a failed read conn is logged
-        and reads fall back to the write conn until its next reconnect.
+        one that must never be down) is live; a failed read conn is logged,
+        and reads run on the write conn until a background reopen succeeds.
         """
         self._ensure_wrapper_state()
+        self._dialled = True
         for conn in (self._write, self._read):
             try:
                 conn.si = self._create_substrate_interface()
@@ -628,6 +701,10 @@ class SubstrateClient:
             self._read = _WsConn("read")
         if not hasattr(self, "_backoff_sleep"):
             self._backoff_sleep = time.sleep
+        if not hasattr(self, "_dialled"):
+            self._dialled = False
+        if not hasattr(self, "_read_reopen"):
+            self._read_reopen = None
 
     def _call(self, method_name: str, *args, conn: "_WsConn", **kwargs) -> Any:
         """Invoke ``<conn>.si.<method_name>(*args, **kwargs)`` under a bounded
@@ -639,7 +716,8 @@ class SubstrateClient:
         see the node a submit goes to. tests/test_conn_routing.py pins each
         call site's conn. If the read conn was never opened (pre-split
         fixtures) or is mid-reconnect, a read degrades to the write conn
-        rather than failing.
+        rather than failing; a read conn this client dialled is then reopened
+        in the background.
 
         Nothing a call returns reads the chain afterwards. A submit's
         ``ExtrinsicReceipt`` has its block and events read within the call,
@@ -658,16 +736,20 @@ class SubstrateClient:
         watchdog's ``/ready last_poll_age`` reflects the freshest chain
         interaction.
 
-        Threading model: each call runs on a fresh daemonised thread. When
-        the call wedges, the wrapper raises ``RPCTimeoutError`` and abandons
-        the worker; the wedged thread exits when the OS reaps the socket
-        (``close()`` in force-replace) or at process exit.
+        Threading model: each call runs on a fresh daemonised thread, and one
+        call at a time runs on each SI. The worker holds the SI's lock until
+        it leaves the socket. When the call wedges, the wrapper raises
+        ``RPCTimeoutError`` and abandons the worker, which keeps the lock: no
+        other call goes onto that socket until the worker exits, when the OS
+        reaps the socket (``close()`` in force-replace) or at process exit.
+        A call waiting for the lock that sees its SI replaced runs once more
+        on the replacement, as after a dead socket.
         """
         self._ensure_wrapper_state()
         for attempt in (1, 2):
-            live, si = self._live_conn(conn, method_name)
+            live, si, lock = self._live_conn(conn, method_name)
             try:
-                return self._call_once(live, si, method_name, args, kwargs)
+                return self._call_once(live, si, lock, method_name, args, kwargs)
             except Exception as error:
                 if not is_transport_dead(error):
                     raise
@@ -677,31 +759,66 @@ class SubstrateClient:
 
     def _live_conn(
         self, conn: "_WsConn", method_name: str
-    ) -> "tuple[_WsConn, SubstrateInterface]":
-        """The conn a call on ``conn`` runs on, and its SI. A conn whose last
-        replace gave up is reconnected here: nothing else reopens it while
-        the read path stays healthy."""
+    ) -> "tuple[_WsConn, SubstrateInterface, _FifoLock]":
+        """The conn a call on ``conn`` runs on, its SI, and that SI's call
+        lock. A write conn whose last replace gave up is reconnected here.
+        A read conn without an SI sends the read to the write conn at once
+        and, once this client has dialled it, starts a background reopen:
+        nothing else reopens it while the write conn stays healthy (#70)."""
         with self._reconnect_lock:
-            # A read-conn request degrades to the write conn when the read
-            # conn was never opened (pre-split fixtures) or is mid-recovery.
             if conn is self._read and conn.si is None:
+                if self._dialled and (self._read_reopen is None or not self._read_reopen.is_alive()):
+                    logger.error(
+                        "the read conn is down: reads run on the write conn, behind its submits, "
+                        "until a background reopen succeeds"
+                    )
+                    self._read_reopen = threading.Thread(
+                        target=self._reopen_read_conn, name="substrate-read-reopen", daemon=True
+                    )
+                    self._read_reopen.start()
                 conn = self._write
-            si = conn.si
+            si, lock = conn.bound
         if si is None:
             with conn.replace_lock:
                 if conn.si is None:
                     self._force_replace(conn)
-                si = conn.si
+                si, lock = conn.bound
         if si is None:
             raise RPCTimeoutError(
                 f"_call({method_name!r}) found no live SubstrateInterface on "
                 f"the {conn.name} conn and could not reconnect it"
             )
-        return conn, si
+        return conn, si, lock
+
+    def _reopen_read_conn(self) -> None:
+        """One reconnect cycle for the read conn, with its backoff, off the
+        thread whose read found it empty."""
+        with self._read.replace_lock:
+            if self._read.si is None:
+                self._force_replace(self._read)
 
     def _call_once(
-        self, conn: "_WsConn", si: SubstrateInterface, method_name: str, args: tuple, kwargs: dict
+        self, conn: "_WsConn", si: SubstrateInterface, lock: _FifoLock, method_name: str, args: tuple,
+        kwargs: dict,
     ) -> Any:
+        deadline = time.monotonic() + self._rpc_timeout_secs
+        acquired = lock.acquire(self._rpc_timeout_secs, lambda: conn.si is not si)
+        # A call granted the socket only past its budget never runs, since its
+        # caller has given up on it. One whose SI was replaced while it waited
+        # runs again on the replacement instead.
+        if acquired and (conn.si is not si or time.monotonic() >= deadline):
+            lock.release()
+            acquired = False
+        if conn.si is not si:
+            raise WebSocketConnectionClosedException(
+                f"the {conn.name} conn's socket was replaced while {method_name!r} waited for it"
+            )
+        if not acquired:
+            self._on_rpc_timeout(conn, si, method_name)
+            raise RPCTimeoutError(
+                f"RPC {method_name!r} exceeded {self._rpc_timeout_secs:.1f}s budget on the "
+                f"{conn.name} conn, waiting behind a call still on its socket"
+            )
         result_holder: dict[str, Any] = {}
 
         def _invoke():
@@ -717,14 +834,20 @@ class SubstrateClient:
                 result_holder["ok"] = result
             except BaseException as e:  # noqa: BLE001
                 result_holder["err"] = e
+            finally:
+                lock.release()
 
         worker = threading.Thread(
             target=_invoke,
             name=f"substrate-rpc-{conn.name}-{method_name}",
             daemon=True,
         )
-        worker.start()
-        worker.join(timeout=self._rpc_timeout_secs)
+        try:
+            worker.start()
+        except BaseException:
+            lock.release()
+            raise
+        worker.join(timeout=max(0.0, deadline - time.monotonic()))
         if worker.is_alive():
             # Thread still running past the budget — abandon it and report
             # timeout. The thread will die when the OS reaps the socket fd
@@ -803,11 +926,15 @@ class SubstrateClient:
 
         Exponential backoff between failed reconnects: 1, 2, 4, 8, 16, 30
         (capped). After ``self._reconnect_max_attempts`` failures we return
-        without a working SI on that conn — the next user-call kicks off a
-        fresh cycle. The conn's timeout streak is reset on the way out so the
-        next RPC starts clean. The *other* conn is never touched.
+        without a working SI on that conn: the next call on the write conn
+        starts a fresh cycle first, and the next read starts one for the read
+        conn in the background. The conn's timeout streak is reset on the way
+        out so the next RPC starts clean. The *other* conn is never touched.
         """
         old_si = conn.si
+        # Emptied before the close, so a call that the close wakes, or that is
+        # waiting for the old SI's lock, finds it replaced and never runs on it.
+        conn.si = None
         # Best-effort close on the dead WS. Failures here are ignored —
         # the underlying socket is already in an unknown state.
         if old_si is not None:
@@ -818,7 +945,6 @@ class SubstrateClient:
                     f"force-replace[{conn.name}]: old SI close() raised "
                     f"{type(e).__name__}: {e}; continuing"
                 )
-        conn.si = None
         # Reset the timeout streak whether or not the reconnect succeeds —
         # we don't want a still-wedged WS to keep stacking force-replace
         # attempts in a single call.
@@ -863,9 +989,9 @@ class SubstrateClient:
                 f"(chain={getattr(new_si, 'chain', '?')})"
             )
             return
-        # Bailed without a working SI. The next user-call enters _call,
-        # finds this conn's si is None, and (for reads) degrades to the
-        # write conn or (for writes) runs a fresh reconnect cycle first.
+        # Bailed without a working SI. The next user-call enters _call and
+        # finds this conn's si is None: a read degrades to the write conn and
+        # starts a background reopen, a write runs a fresh reconnect cycle first.
         try:
             health_server.update_metrics(
                 ws_consecutive_reconnect_failures=conn.consecutive_reconnect_failures,
@@ -873,11 +999,13 @@ class SubstrateClient:
             )
         except Exception:
             pass
+        next_step = (
+            "reads run on the write conn until a background reopen succeeds"
+            if conn is self._read else "the next call on it reconnects first"
+        )
         logger.error(
-            f"force-replace[{conn.name}]: gave up after "
-            f"{self._reconnect_max_attempts} attempts; {conn.name} conn "
-            f"remains disconnected (streak={conn.consecutive_reconnect_failures}). "
-            f"Next user-call will retry."
+            f"force-replace[{conn.name}]: gave up after {self._reconnect_max_attempts} attempts; "
+            f"{next_step} (streak={conn.consecutive_reconnect_failures})"
         )
 
     def rpc(self, method: str, params: list) -> Any:
