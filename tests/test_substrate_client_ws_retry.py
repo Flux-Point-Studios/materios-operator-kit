@@ -97,7 +97,7 @@ def test_call_returns_value_when_underlying_method_returns_promptly():
     fake = _FakeSI()
     fake.set_method("foo", lambda: 42)
     client.substrate = fake
-    assert client._call("foo") == 42
+    assert client._call("foo", conn=client._write) == 42
     assert client._write.consecutive_timeouts == 0
     assert client._write.consecutive_reconnect_failures == 0
 
@@ -114,7 +114,7 @@ def test_call_passes_args_and_kwargs_through_to_underlying_method():
 
     fake.set_method("foo", foo)
     client.substrate = fake
-    assert client._call("foo", 1, 2, c="three") == "ok"
+    assert client._call("foo", 1, 2, c="three", conn=client._write) == "ok"
     assert captured == {"args": (1, 2), "c": "three"}
 
 
@@ -141,7 +141,7 @@ def test_call_raises_RPCTimeoutError_when_underlying_method_blocks_past_budget()
 
     start = time.monotonic()
     with pytest.raises(RPCTimeoutError):
-        client._call("slow")
+        client._call("slow", conn=client._write)
     elapsed = time.monotonic() - start
     # Allow generous slack so test stays robust under CI load — what matters
     # is "well under 60s". 5s is a safe ceiling on every CI we use; the
@@ -165,7 +165,7 @@ def test_underlying_exception_propagates_as_itself_not_RPCTimeoutError():
     fake.set_method("bad", bad)
     client.substrate = fake
     with pytest.raises(SubstrateRequestException):
-        client._call("bad")
+        client._call("bad", conn=client._write)
     # Real exceptions should NOT count as timeouts.
     assert client._write.consecutive_timeouts == 0
 
@@ -198,12 +198,12 @@ def test_consecutive_timeouts_trigger_force_replace_of_substrate_interface():
         client.substrate = factory()  # first instance via factory
         # 1st call: times out
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")
+            client._call("foo", conn=client._write)
         assert client._write.consecutive_timeouts == 1
         assert state["si_count"] == 1  # no reconnect yet
         # 2nd call: times out, hits reconnect threshold
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")
+            client._call("foo", conn=client._write)
         # The wrapper should have closed the first SI and created a new one
         # BEFORE returning from the timeout (so the next call uses the new SI).
         assert old_fakes[0].close_calls == 1, "first SI should have been closed"
@@ -211,7 +211,7 @@ def test_consecutive_timeouts_trigger_force_replace_of_substrate_interface():
         # Counter resets after the reconnect.
         assert client._write.consecutive_timeouts == 0
         # 3rd call on the new SI succeeds
-        assert client._call("foo") == "ok-after-reconnect"
+        assert client._call("foo", conn=client._write) == "ok-after-reconnect"
 
 
 def test_single_timeout_does_not_trigger_reconnect():
@@ -222,11 +222,11 @@ def test_single_timeout_does_not_trigger_reconnect():
     client.substrate = fake
     with patch.object(client, "_create_substrate_interface") as ctor:
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")
+            client._call("foo", conn=client._write)
         assert ctor.call_count == 0
         assert fake.close_calls == 0
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")
+            client._call("foo", conn=client._write)
         assert ctor.call_count == 0
         # Still under threshold.
         assert client._write.consecutive_timeouts == 2
@@ -249,9 +249,9 @@ def test_success_resets_consecutive_timeout_counter():
     fake.set_method("foo", maybe_slow)
     client.substrate = fake
     with pytest.raises(RPCTimeoutError):
-        client._call("foo")
+        client._call("foo", conn=client._write)
     assert client._write.consecutive_timeouts == 1
-    assert client._call("foo") == "ok"
+    assert client._call("foo", conn=client._write) == "ok"
     assert client._write.consecutive_timeouts == 0
 
 
@@ -288,13 +288,13 @@ def test_reconnect_failures_use_exponential_backoff_with_30s_cap():
     with patch.object(client, "_create_substrate_interface", side_effect=factory):
         # First timeout — counter goes to 1, no reconnect yet.
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")
+            client._call("foo", conn=client._write)
         # Second timeout — triggers reconnect. The reconnect retries (with
         # backoff) until the 7th constructor call succeeds. The wrapper
         # should still raise RPCTimeoutError for this CALL (we don't retry
         # the user's call inside the reconnect loop — caller decides).
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")
+            client._call("foo", conn=client._write)
 
     # 6 failed reconnect attempts → 6 backoff sleeps. Values:
     #   sleep(1), sleep(2), sleep(4), sleep(8), sleep(16), sleep(30)  (capped)
@@ -331,9 +331,9 @@ def test_reconnect_failure_gauge_surfaces_streak():
 
     with patch.object(client, "_create_substrate_interface", side_effect=factory):
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")  # counter=1
+            client._call("foo", conn=client._write)  # counter=1
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")  # counter=2 → reconnect → 4 failures
+            client._call("foo", conn=client._write)  # counter=2 → reconnect → 4 failures
 
     assert client._write.consecutive_reconnect_failures == 4
 
@@ -352,7 +352,7 @@ def test_successful_call_bumps_health_last_poll_ts():
     client.substrate = fake
 
     with patch("daemon.health_server.update_metrics") as upd:
-        assert client._call("foo") == "ok"
+        assert client._call("foo", conn=client._write) == "ok"
 
     assert upd.call_count >= 1, "health_server.update_metrics should fire on success"
     found = False
@@ -374,9 +374,9 @@ def test_timeout_increments_rpc_timeouts_total():
 
     with patch("daemon.health_server.increment_metric") as inc:
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")
+            client._call("foo", conn=client._write)
         with pytest.raises(RPCTimeoutError):
-            client._call("foo")
+            client._call("foo", conn=client._write)
 
     timeout_calls = [c for c in inc.call_args_list if c.args and c.args[0] == "ws_rpc_timeouts_total"]
     assert len(timeout_calls) == 2, (
@@ -404,9 +404,9 @@ def test_force_reconnect_increments_force_reconnects_counter():
     with patch.object(client, "_create_substrate_interface", side_effect=factory):
         with patch("daemon.health_server.increment_metric") as inc:
             with pytest.raises(RPCTimeoutError):
-                client._call("foo")  # 1
+                client._call("foo", conn=client._write)  # 1
             with pytest.raises(RPCTimeoutError):
-                client._call("foo")  # 2 → reconnect
+                client._call("foo", conn=client._write)  # 2 → reconnect
 
     force_calls = [c for c in inc.call_args_list if c.args and c.args[0] == "ws_force_reconnects_total"]
     assert len(force_calls) == 1, (

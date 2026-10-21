@@ -127,7 +127,7 @@ def test_hung_write_does_not_block_read():
 
     # Hold the write socket in the background.
     t = threading.Thread(
-        target=lambda: c._call("submit_extrinsic"), daemon=True
+        target=lambda: c._call("submit_extrinsic", conn=c._write), daemon=True
     )
     t.start()
     time.sleep(0.1)  # ensure the write is in flight

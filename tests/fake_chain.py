@@ -12,6 +12,7 @@ death the test scripts.
 import errno
 import hashlib
 import os
+import threading
 from types import SimpleNamespace
 
 import websocket._socket
@@ -136,7 +137,11 @@ class FakeSI:
     (or only those named in ``failing``) raises it, as a dead socket does. With
     ``idle_limit`` the socket dies once it has been idle that long on the
     chain's clock, as behind a proxy that drops idle websockets. A set ``best``
-    keeps this node's best block at that frozen block, as a node that lags."""
+    keeps this node's best block at that frozen block, as a node that lags.
+
+    A submit holds the socket until ``inclusion`` is set, as one waiting for
+    inclusion does: ``holding`` is set meanwhile, and a call made then waits
+    behind it and is named in ``queued``."""
 
     def __init__(self, ledger: FakeChain, idle_limit: float | None = None):
         self.ledger = ledger
@@ -150,9 +155,16 @@ class FakeSI:
         self.best: str | None = None
         self.calls: list[str] = []
         self.closed = False
+        self.inclusion = threading.Event()
+        self.inclusion.set()
+        self.holding = threading.Event()
+        self.queued: list[str] = []
 
     def _use(self, name: str) -> None:
         self.calls.append(name)
+        if self.holding.is_set():
+            self.queued.append(name)
+            self.inclusion.wait()
         if self.idle_limit is not None and self.ledger.clock - self.last_used > self.idle_limit:
             self.failure = self.failure or BrokenPipeError(32, "Broken pipe")
         if self.failure is not None and (self.failing is None or name in self.failing):
@@ -200,6 +212,9 @@ class FakeSI:
 
     def submit_extrinsic(self, extrinsic, wait_for_inclusion=False):
         self._use("submit_extrinsic")
+        self.holding.set()
+        self.inclusion.wait()
+        self.holding.clear()
         params = extrinsic.call.params
         self.ledger.apply_attest(extrinsic.signer, extrinsic.nonce, params["receipt_id"],
                                  bytes(params["claimed_hash"]))
@@ -254,7 +269,7 @@ def connected_client(ledger=None, **endpoint_kwargs):
 
 
 def health(client):
-    return client._call("rpc_request", "system_health", [])["result"]
+    return client._call("rpc_request", "system_health", [], conn=client._write)["result"]
 
 
 def attest_daemon(ledger: FakeChain, endpoint, tmp_path, *, last_processed_block: int = 99):
@@ -315,17 +330,26 @@ def certify_by_others(ledger: FakeChain) -> None:
         ledger.apply_attest(member, 0, RECEIPT_ID)
 
 
+def refuse_submits(endpoint, refusal):
+    """The write conn's pool refuses every submit with ``refusal``, for a
+    reason its best block does not show."""
+    write = endpoint.opened[0]
+    write.failure = SubstrateRequestException(refusal)
+    write.failing = {"submit_extrinsic"}
+    return write
+
+
 def fail_receipt_reads(daemon, failures):
     """``get_receipt`` raises each of ``failures`` in turn, then reads the chain."""
     read = daemon.client.get_receipt
     pending = iter(failures)
     attempts = []
 
-    def get_receipt(receipt_id, *at):
+    def get_receipt(receipt_id):
         attempts.append(receipt_id)
         for failure in pending:
             raise failure
-        return read(receipt_id, *at)
+        return read(receipt_id)
 
     daemon.client.get_receipt = get_receipt
     return attempts

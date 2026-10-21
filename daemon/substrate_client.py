@@ -448,14 +448,16 @@ class _WsConn:
     """One ``SubstrateInterface`` plus its independent bounded-timeout and
     reconnect state.
 
-    Two run concurrently: a ``write`` conn for extrinsic submits and a
-    ``read`` conn for poll-loop reads (``get_events`` / ``get_block_hash``).
-    A ``submit_extrinsic(wait_for_inclusion=True)`` holds the write socket
-    for seconds; keeping reads on a separate socket means that hold cannot
-    block the poll loop — the get_events-behind-submit wedge (tasks #288/#500)
-    that silently stalled attestation across the committee. Each conn
-    force-replaces itself in isolation: a wedged write socket never trips a
-    read reconnect, and vice versa.
+    Two run concurrently: a ``write`` conn that signs and submits, and a
+    ``read`` conn for reads. A ``submit_extrinsic(wait_for_inclusion=True)``
+    holds the write socket for seconds, and a call made on that socket
+    meanwhile waits behind it, past its budget under load: the
+    get_events-behind-submit wedge (tasks #288/#500) that silently stalled
+    attestation across the committee. The only reads on the write conn are
+    the two that must see the node a submit goes to, and both run under the
+    chain-write lock that serializes submits. Each conn force-replaces itself
+    in isolation: a wedged write socket never trips a read reconnect, and
+    vice versa.
     """
 
     __slots__ = (
@@ -479,9 +481,9 @@ class _WsConn:
 class SubstrateClient:
     def __init__(self, config: DaemonConfig):
         self.config = config
-        # Two independent websocket connections (task #500): `write` carries
-        # extrinsic submits, `read` carries poll-loop reads. `self.substrate`
-        # is a property aliasing the write conn for backward compatibility.
+        # Two independent websocket connections (task #500): `write` signs and
+        # submits, `read` carries reads. `self.substrate` aliases the write
+        # conn's interface for test fixtures.
         self._write = _WsConn("write")
         self._read = _WsConn("read")
         # (runtime code hash, its settlement contract) from the last metadata read.
@@ -584,12 +586,8 @@ class SubstrateClient:
 
     @property
     def substrate(self) -> Optional[SubstrateInterface]:
-        """Backward-compat alias for the *write* connection's interface.
-
-        Pre-split code and every existing test fixture reference
-        ``client.substrate`` directly (get and set); mapping it to the write
-        conn keeps the extrinsic-submit path and those call sites unchanged.
-        """
+        """The write connection's interface, which test fixtures set and read.
+        Daemon code reaches the chain only through ``_call``."""
         self._ensure_wrapper_state()
         return self._write.si
 
@@ -630,17 +628,17 @@ class SubstrateClient:
         if not hasattr(self, "_backoff_sleep"):
             self._backoff_sleep = time.sleep
 
-    def _call(
-        self, method_name: str, *args, conn: "Optional[_WsConn]" = None, **kwargs
-    ) -> Any:
+    def _call(self, method_name: str, *args, conn: "_WsConn", **kwargs) -> Any:
         """Invoke ``<conn>.si.<method_name>(*args, **kwargs)`` under a bounded
-        timeout, defaulting to the write connection.
+        timeout.
 
-        Read wrappers pass ``conn=self._read`` so poll-loop reads
-        (``get_events`` / ``get_block_hash``) run on a socket that a
-        submit-held write socket can never block. If the read conn was
-        never opened (pre-split fixtures) or is mid-reconnect, the call
-        degrades to the write conn rather than failing.
+        Every call names its conn. Reads pass ``conn=self._read``, a socket
+        that a submit holding the write socket can never block; the write
+        conn carries signing, submits, the keepalive, and the reads that must
+        see the node a submit goes to. tests/test_conn_routing.py pins each
+        call site's conn. If the read conn was never opened (pre-split
+        fixtures) or is mid-reconnect, a read degrades to the write conn
+        rather than failing.
 
         If the call exceeds the budget we raise :class:`RPCTimeoutError`;
         consecutive timeouts on that conn trigger a force-replace of *its*
@@ -660,16 +658,15 @@ class SubstrateClient:
         (``close()`` in force-replace) or at process exit.
         """
         self._ensure_wrapper_state()
-        requested = conn or self._write
         for attempt in (1, 2):
-            conn, si = self._live_conn(requested, method_name)
+            live, si = self._live_conn(conn, method_name)
             try:
-                return self._call_once(conn, si, method_name, args, kwargs)
+                return self._call_once(live, si, method_name, args, kwargs)
             except Exception as error:
                 if not is_transport_dead(error):
                     raise
-                self._replace_dead_conn(conn, si, method_name, error)
-                if attempt == 2 or conn.si is None:
+                self._replace_dead_conn(live, si, method_name, error)
+                if attempt == 2 or live.si is None:
                     raise
 
     def _live_conn(
@@ -876,7 +873,7 @@ class SubstrateClient:
 
     def keepalive(self) -> None:
         """One cheap RPC on the write conn, through the bounded call."""
-        self._call("rpc_request", "system_health", [])
+        self._call("rpc_request", "system_health", [], conn=self._write)
 
     def get_finalized_head_number(self) -> int:
         head_hash = self._call("get_chain_finalised_head", conn=self._read)
@@ -1016,6 +1013,7 @@ class SubstrateClient:
                 module="OrinqReceipts",
                 storage_function="Receipts",
                 params=[rid],
+                conn=self._read,
             )
             if result is None or result.value is None:
                 return None
@@ -1045,29 +1043,29 @@ class SubstrateClient:
         their own extrinsics outside this module's typed helpers (task #156).
         Returns the SCALE-encoded call object as-is.
         """
-        return self._call("compose_call", **kwargs)
+        return self._call("compose_call", **kwargs, conn=self._write)
 
     def create_signed_extrinsic(self, **kwargs):
         """Sister wrapper to :meth:`compose_call`; bounded-timeout-wrap."""
-        return self._call("create_signed_extrinsic", **kwargs)
+        return self._call("create_signed_extrinsic", **kwargs, conn=self._write)
 
     def submit_extrinsic(self, extrinsic, wait_for_inclusion: bool = True):
         """Sister wrapper to :meth:`compose_call`; bounded-timeout-wrap."""
         return self._call(
-            "submit_extrinsic", extrinsic, wait_for_inclusion=wait_for_inclusion
+            "submit_extrinsic", extrinsic, wait_for_inclusion=wait_for_inclusion, conn=self._write
         )
 
     def encode_scale(self, *, type_string: str, value: Any) -> Any:
-        """Wrap ``self.substrate.encode_scale`` so external SCALE-encoding
-        callers (e.g. evidence_submitter's payload builder) inherit the
-        bounded-timeout safety.
+        """SCALE-encode ``value`` as ``type_string`` through the bounded call
+        on the read conn, for evidence_submitter's payload builder.
 
-        ``encode_scale`` is a CPU-only operation in normal flows, but it
-        does dispatch through the same SI which holds the metadata cache
-        — if the SI itself is in a partially-collapsed state any call
-        through it can hang. Cheap to wrap; large upside.
+        substrate-interface first reads the head's runtime, three RPCs, so
+        it runs off the write conn. The read conn's runtime may differ from
+        the one a call is signed under across an upgrade: encode only types
+        every runtime encodes alike, such as the evidence payload's
+        ``Vec<Bytes>``.
         """
-        return self._call("encode_scale", type_string=type_string, value=value)
+        return self._call("encode_scale", type_string=type_string, value=value, conn=self._read)
 
     def get_committee_members(self):
         """Return ``OrinqReceipts.CommitteeMembers`` storage as-is.
@@ -1100,14 +1098,16 @@ class SubstrateClient:
             call_module="OrinqReceipts",
             call_function="join_committee",
             call_params={},
+            conn=self._write,
         )
         extrinsic = self._call(
             "create_signed_extrinsic",
             call=call,
             keypair=self.keypair,
+            conn=self._write,
         )
         return self._call(
-            "submit_extrinsic", extrinsic, wait_for_inclusion=True
+            "submit_extrinsic", extrinsic, wait_for_inclusion=True, conn=self._write
         )
 
     def submit_bond(self, amount: int) -> tuple[bool, Optional[str]]:
@@ -1122,13 +1122,15 @@ class SubstrateClient:
             call_module="OrinqReceipts",
             call_function="bond",
             call_params={"amount": amount},
+            conn=self._write,
         )
         extrinsic = self._call(
             "create_signed_extrinsic",
             call=call,
             keypair=self.keypair,
+            conn=self._write,
         )
-        receipt = self._call("submit_extrinsic", extrinsic, wait_for_inclusion=True)
+        receipt = self._call("submit_extrinsic", extrinsic, wait_for_inclusion=True, conn=self._write)
         if receipt.is_success:
             logger.info(
                 f"Bond of {amount} base units posted successfully, "
@@ -1191,6 +1193,7 @@ class SubstrateClient:
             "query_map",
             module="IntentSettlement",
             storage_function="ClaimSettlementRequests",
+            conn=self._read,
         )
         for key, value in rows:
             try:
@@ -1205,12 +1208,18 @@ class SubstrateClient:
     def get_settlement_request(self, claim_id: bytes) -> Optional[dict]:
         """``ClaimSettlementRequests[claim_id]`` in the row shape of
         :meth:`list_pending_settlement_requests`, or None when no request is
-        pending (or its voucher is gone)."""
+        pending (or its voucher is gone).
+
+        Read at the write conn's best block: callers reread a request under
+        the chain-write lock right before a supersede or slash goes to that
+        conn's node, and a lagging read conn could still show a request that
+        node has replaced."""
         value = self._call(
             "query",
             module="IntentSettlement",
             storage_function="ClaimSettlementRequests",
             params=["0x" + claim_id.hex()],
+            conn=self._write,
         )
         if value is None or value.value is None:
             return None
@@ -1293,16 +1302,16 @@ class SubstrateClient:
         """
         try:
             chain_id_const = self._call(
-                "get_constant", "IntentSettlement", "MateriosChainId"
+                "get_constant", "IntentSettlement", "MateriosChainId", conn=self._read
             )
             network_magic_const = self._call(
-                "get_constant", "IntentSettlement", "NetworkMagic"
+                "get_constant", "IntentSettlement", "NetworkMagic", conn=self._read
             )
             script_hash_const = self._call(
-                "get_constant", "IntentSettlement", "AegisPolicyV1ScriptHash"
+                "get_constant", "IntentSettlement", "AegisPolicyV1ScriptHash", conn=self._read
             )
             settlement_version_const = self._call(
-                "get_constant", "IntentSettlement", "SettlementVersion"
+                "get_constant", "IntentSettlement", "SettlementVersion", conn=self._read
             )
         except Exception as e:  # noqa: BLE001
             logger.info(
@@ -1414,6 +1423,7 @@ class SubstrateClient:
                 module="IntentSettlement",
                 storage_function="VoucherDigests",
                 params=[claim_param],
+                conn=self._read,
             )
             if result is not None and result.value is not None:
                 try:
@@ -1439,6 +1449,7 @@ class SubstrateClient:
                 module="IntentSettlement",
                 storage_function="Vouchers",
                 params=[claim_param],
+                conn=self._read,
             )
         except SubstrateRequestException as e:
             logger.warning(
@@ -1535,6 +1546,7 @@ class SubstrateClient:
                 module="IntentSettlement",
                 storage_function="Vouchers",
                 params=[claim_param],
+                conn=self._read,
             )
         except (SubstrateRequestException, Exception):  # noqa: BLE001
             return None
@@ -1578,7 +1590,7 @@ class SubstrateClient:
         """
         try:
             consts = self._call(
-                "get_constant", "IntentSettlement", "MinFinalityDepth"
+                "get_constant", "IntentSettlement", "MinFinalityDepth", conn=self._read
             )
             if consts is None:
                 return None
@@ -1623,14 +1635,15 @@ class SubstrateClient:
                     call_module="IntentSettlement",
                     call_function=function,
                     call_params=params,
+                    conn=self._write,
                 )
                 extrinsic = self._call(
                     "create_signed_extrinsic",
-                    call=call, keypair=self.keypair,
+                    call=call, keypair=self.keypair, conn=self._write,
                 )
                 receipt = self._call(
                     "submit_extrinsic",
-                    extrinsic, wait_for_inclusion=True,
+                    extrinsic, wait_for_inclusion=True, conn=self._write,
                 )
                 if not receipt.is_success:
                     logger.warning(f"{function} failed for {subject}: {receipt.error_message}")
@@ -1839,7 +1852,7 @@ class SubstrateClient:
         before submitting via the multi-sig envelope methods."""
         try:
             stored = self._call(
-                "query", "IntentSettlement", "MinSignerThreshold"
+                "query", "IntentSettlement", "MinSignerThreshold", conn=self._read
             ).value
             stored_int = int(stored or 0)
             return stored_int if stored_int > 0 else 2
@@ -1885,6 +1898,7 @@ class SubstrateClient:
                 "query_map",
                 module="IntentSettlement",
                 storage_function="PolicyExpireRequests",
+                conn=self._read,
             )
         except SubstrateRequestException as e:
             logger.warning(
@@ -1960,6 +1974,7 @@ class SubstrateClient:
                 module="IntentSettlement",
                 storage_function="Intents",
                 params=[intent_param],
+                conn=self._read,
             )
         except SubstrateRequestException as e:
             logger.warning(
@@ -2024,6 +2039,7 @@ class SubstrateClient:
                 module="IntentSettlement",
                 storage_function="Intents",
                 params=[intent_param],
+                conn=self._read,
             )
         except SubstrateRequestException as e:
             logger.warning(
@@ -2117,14 +2133,14 @@ class SubstrateClient:
                 })
         return certified
 
-    def get_receipt(self, receipt_id: str, block_hash: Optional[str] = None) -> Optional[ReceiptRecord]:
-        """The receipt at ``block_hash``, by default at the best block."""
+    def get_receipt(self, receipt_id: str) -> Optional[ReceiptRecord]:
+        """The receipt at the read conn's best block."""
         result = self._call(
             "query",
             module="OrinqReceipts",
             storage_function="Receipts",
             params=[receipt_id],
-            block_hash=block_hash,
+            conn=self._read,
         )
         if result.value is None:
             return None
@@ -2176,14 +2192,16 @@ class SubstrateClient:
                         "receipt_id": receipt_id,
                         "claimed_hash": list(cert_hash),
                     },
+                    conn=self._write,
                 )
                 extrinsic = self._call(
                     "create_signed_extrinsic",
                     call=call,
                     keypair=self.keypair,
+                    conn=self._write,
                 )
                 receipt = self._call(
-                    "submit_extrinsic", extrinsic, wait_for_inclusion=True
+                    "submit_extrinsic", extrinsic, wait_for_inclusion=True, conn=self._write
                 )
                 if not receipt.is_success:
                     last_error = str(receipt.error_message)
@@ -2237,17 +2255,27 @@ class SubstrateClient:
         member and the receipt is certified under ``cert_hash``, or records
         this signer's attest under it. It can never count when the signer is
         not a member, or the receipt is certified or attested under another
-        hash."""
-        head = self._call("get_chain_head")
-        members = self._call("query", "OrinqReceipts", "CommitteeMembers", block_hash=head).value
+        hash.
+
+        Callers hold the chain-write lock, so no submit holds the write
+        socket while it reads."""
+        head = self._call("get_chain_head", conn=self._write)
+        members = self._call(
+            "query", "OrinqReceipts", "CommitteeMembers", block_hash=head, conn=self._write
+        ).value
         if self.keypair.public_key not in _account_ids(members):
             return False
-        receipt = self.get_receipt(receipt_id, head)
+        receipt = self._call(
+            "query", "OrinqReceipts", "Receipts", [receipt_id], block_hash=head, conn=self._write
+        ).value
         if receipt is None:
             return None
-        if receipt.availability_cert_hash != bytes(32):
-            return cert_hash is None or cert_hash == receipt.availability_cert_hash
-        entry = self._call("query", "OrinqReceipts", "Attestations", [receipt_id], block_hash=head).value
+        certified_under = _to_bytes32(receipt["availability_cert_hash"])
+        if certified_under != bytes(32):
+            return cert_hash is None or cert_hash == certified_under
+        entry = self._call(
+            "query", "OrinqReceipts", "Attestations", [receipt_id], block_hash=head, conn=self._write
+        ).value
         if entry is None:
             return None
         if cert_hash is not None and cert_hash != _to_bytes32(entry[0]):

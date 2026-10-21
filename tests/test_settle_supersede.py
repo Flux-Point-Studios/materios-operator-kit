@@ -356,7 +356,7 @@ def rpc(results):
     """A SubstrateClient whose RPC layer answers from ``results`` by method."""
     client = object.__new__(SubstrateClient)
     client.config = SimpleNamespace(signer_uri="//Alice", tx_max_retries=3)
-    client._read = object()
+    client._read, client._write = object(), object()
 
     def call(method, *args, **kwargs):
         answer = results[method]
@@ -392,10 +392,11 @@ def test_supersede_extrinsic_carries_the_signed_evidence():
     compose, sign, submit = client._call.call_args_list
     assert compose.args == ("compose_call",)
     assert compose.kwargs == dict(call_module="IntentSettlement", call_function="supersede_settlement_request",
-                                  call_params=SUPERSEDE_PARAMS)
+                                  call_params=SUPERSEDE_PARAMS, conn=client._write)
     assert sign.kwargs["call"] == "call"
     assert sign.kwargs["keypair"].public_key == ALICE.public_key
-    assert submit.args == ("submit_extrinsic", "xt") and submit.kwargs == {"wait_for_inclusion": True}
+    assert submit.args == ("submit_extrinsic", "xt")
+    assert submit.kwargs == {"wait_for_inclusion": True, "conn": client._write}
 
 
 def test_a_refused_supersede_is_not_retried():
@@ -451,7 +452,7 @@ def test_one_pending_request_reads_like_a_listed_row():
     assert row == asdict(_default_pending_request(submitted_block=1000, bond_amount=7))
     query = next(c for c in client._call.call_args_list if c.args[0] == "query")
     assert query.kwargs == dict(module="IntentSettlement", storage_function="ClaimSettlementRequests",
-                                params=["0x" + CLAIM_ID.hex()])
+                                params=["0x" + CLAIM_ID.hex()], conn=client._write)
 
 
 def test_an_absent_request_reads_as_none():

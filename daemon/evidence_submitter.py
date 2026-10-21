@@ -205,7 +205,7 @@ def _content_hash_from_receipt_id_via_chain(
 
 
 def _build_arm_trustzone_payload_bytes(
-    substrate: Any, payload: dict
+    client: Any, payload: dict
 ) -> bytes:
     """Translate the gateway's `arm_trustzone` payload shape into the
     SCALE-encoded `Vec<Vec<u8>>` byte string the pallet expects.
@@ -222,7 +222,7 @@ def _build_arm_trustzone_payload_bytes(
         chain order (root → leaf).
 
     Implementation: base64-decode each entry, then SCALE-encode the resulting
-    list via substrate-interface's `encode_scale("Vec<Bytes>", ...)`.
+    list via the client's `encode_scale("Vec<Bytes>", ...)`.
     """
     chain = payload.get("cert_chain_b64")
     if not isinstance(chain, list) or len(chain) == 0:
@@ -243,7 +243,7 @@ def _build_arm_trustzone_payload_bytes(
             ) from e
     # `Vec<Bytes>` is the substrate-interface alias for `Vec<Vec<u8>>` — each
     # inner `Bytes` is a length-prefixed byte string.
-    encoded = substrate.encode_scale(type_string="Vec<Bytes>", value=der_certs)
+    encoded = client.encode_scale(type_string="Vec<Bytes>", value=der_certs)
     if hasattr(encoded, "data"):
         # Older substrate-interface returned a `ScaleBytes`; .data is the raw
         # bytestring without the leading length prefix expected by encode.
@@ -258,14 +258,14 @@ def _build_arm_trustzone_payload_bytes(
 
 
 def _build_evidence_payload_bytes(
-    substrate: Any, evidence_type: str, payload: dict
+    client: Any, evidence_type: str, payload: dict
 ) -> bytes:
     """Dispatch to the per-evidence-type payload builder. Only `arm_trustzone`
     is implemented in Phase 2 (the only fully-supported variant). Other
     types raise NotImplementedError — the caller logs WARN and skips ack.
     """
     if evidence_type == "arm_trustzone":
-        return _build_arm_trustzone_payload_bytes(substrate, payload)
+        return _build_arm_trustzone_payload_bytes(client, payload)
     raise NotImplementedError(
         f"evidence_type {evidence_type!r} payload assembly is Phase 3+ — "
         f"verifier in pallet returns NotImplemented for this variant. Skipping."
@@ -640,16 +640,9 @@ class EvidenceSubmitter:
         # NotImplementedError and shape-validation ValueError are TERMINAL —
         # the gateway row's bytes won't morph into something the pallet
         # accepts on retry, so record the local skip-bit.
-        # NOTE: passes the raw ``self.client.substrate`` because the
-        # payload assembly's ``encode_scale`` is a SCALE-encoding CPU
-        # path, not a network RPC. The SI's metadata cache lookup that
-        # backs it never blocks on the WS. If a chain reset wipes the
-        # metadata mid-call, the resulting exception is caught by the
-        # ``except Exception`` block below and the row is correctly
-        # marked terminal.
         try:
             payload_bytes = _build_evidence_payload_bytes(
-                self.client.substrate, evidence_type, payload
+                self.client, evidence_type, payload
             )
         except NotImplementedError as e:
             logger.warning(

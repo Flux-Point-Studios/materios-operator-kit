@@ -259,7 +259,7 @@ def test_a_call_whose_socket_is_closed_under_it_runs_again_on_the_replacement():
 
     def read():
         try:
-            outcome["read"] = client._call("rpc_request", "state_getStorage", ["0x00"])["result"]
+            outcome["read"] = client._call("rpc_request", "state_getStorage", ["0x00"], conn=client._write)["result"]
         except Exception as error:
             outcome["read"] = error
 
@@ -310,7 +310,7 @@ def test_a_timeout_on_a_socket_already_replaced_is_not_a_strike_against_its_repl
 
     def wedged_read():
         try:
-            client._call("rpc_request", "state_getStorage", ["0x00"])
+            client._call("rpc_request", "state_getStorage", ["0x00"], conn=client._write)
         except RPCTimeoutError as error:
             outcome["wedged"] = error
 
