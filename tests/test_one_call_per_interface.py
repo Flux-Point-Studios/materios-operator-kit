@@ -87,7 +87,10 @@ def test_concurrent_reads_on_one_interface_each_get_their_own_reply():
 
 def wedge(si, method):
     """``si`` holds a call to ``method`` until the returned event is set or
-    ``si`` is closed; every other call it answers at once."""
+    ``si`` is closed; every other call it answers at once. Closing ``si``
+    wakes the held call and then lingers before returning, as
+    websocket-client's ``close()`` does: the woken reader takes the peer's
+    close frame, which ``close()`` then waits up to 3 s for."""
     leave = threading.Event()
     entered = threading.Event()
     answer, close = si.rpc_request, si.close
@@ -100,8 +103,13 @@ def wedge(si, method):
         leave.wait(10)
         return {"jsonrpc": "2.0", "id": 1, "result": "late"}
 
+    def close_and_linger():
+        close()
+        leave.set()
+        time.sleep(0.2)
+
     si.rpc_request = rpc_request
-    si.close = lambda: (close(), leave.set())
+    si.close = close_and_linger
     return entered, leave
 
 
@@ -131,7 +139,9 @@ def test_a_call_queued_on_a_replaced_interface_runs_on_the_replacement(close_wak
     queued behind it moves to the replacement within its own budget, whether
     or not closing the old socket woke the worker still reading it
     (websocket-client's close skips the shutdown that wakes a reader when it
-    has already marked the socket closed)."""
+    has already marked the socket closed). A woken worker hands the socket to
+    the queued call while the close still lingers, so the conn must already
+    have let go of the old interface."""
     client, endpoint = connected_client()
     client._rpc_timeout_secs = 1.0
     client._reconnect_after_timeouts = 1
@@ -150,7 +160,7 @@ def test_a_call_queued_on_a_replaced_interface_runs_on_the_replacement(close_wak
     first = threading.Thread(target=wedged)
     first.start()
     assert entered.wait(5)
-    time.sleep(0.3)
+    time.sleep(0.5)
     started = time.monotonic()
     assert client.rpc("queued", []) == HEALTH
     elapsed = time.monotonic() - started
@@ -162,6 +172,30 @@ def test_a_call_queued_on_a_replaced_interface_runs_on_the_replacement(close_wak
     assert read.calls == ["wedged"] and replacement.calls == ["queued"]
     assert client._read.si is replacement
     assert elapsed < client._rpc_timeout_secs, f"the queued call waited out its budget ({elapsed:.2f}s)"
+
+
+def test_one_budget_covers_the_wait_for_the_socket_and_the_call():
+    """A call granted the socket late gets only what is left of its budget: one
+    that waited 0.8 of it and then wedges raises a budget after it arrived."""
+    client, endpoint = connected_client()
+    budget = client._rpc_timeout_secs = 1.0
+    client._reconnect_after_timeouts = 10
+    read = endpoint.opened[1]
+    entered, leave = wedge(read, "holder")
+    _, release = wedge(read, "wedged")
+    holder = threading.Thread(target=client.rpc, args=("holder", []))
+    holder.start()
+    assert entered.wait(5)
+    threading.Timer(0.8 * budget, leave.set).start()
+    started = time.monotonic()
+    with pytest.raises(RPCTimeoutError):
+        client.rpc("wedged", [])
+    elapsed = time.monotonic() - started
+    release.set()
+    holder.join(5)
+
+    assert read.calls == ["holder", "wedged"]
+    assert elapsed < 1.4 * budget, f"the call raised {elapsed:.2f}s after it arrived, on a {budget}s budget"
 
 
 def test_calls_waiting_for_an_interface_run_in_the_order_they_arrived():
