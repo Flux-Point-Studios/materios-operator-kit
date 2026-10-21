@@ -58,4 +58,5 @@ class PendingReceipt:
     receipt: Optional[ReceiptRecord]  # None once deferred by an RPC failure: its retry reads it again
     first_seen: float  # time.time()
     retries: int = 0
-    last_error: str = ""  # the RPC failure that deferred it; empty while it waits on a locator
+    last_error: str = ""  # what deferred it; empty while it waits on a locator
+    cert_hash: Optional[bytes] = None  # the hash its refused attest claimed, which its recheck holds the chain to

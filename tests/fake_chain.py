@@ -2,16 +2,25 @@
 dead-socket tests.
 
 ``FakeChain`` holds what the runtime decides an attest by: each signer's nonce,
-each receipt's recorded attesters and certification, and spec 242's pool rule
-(an attest the runtime would not count is refused as 1010 "Transaction call is
-not expected", a spent nonce as 1010 "Transaction is outdated"). ``FakeSI`` is
-one websocket onto it, whose death the test scripts.
+the committee, each receipt's recorded attesters and certification, and spec
+242's pool rule (an attest the runtime would not count is refused as 1010
+"Transaction call is not expected", a spent nonce as 1010 "Transaction is
+outdated"). Its live state is the best block's; ``head`` freezes that state
+under a block hash a read can pin. ``FakeSI`` is one websocket onto it, whose
+death the test scripts.
 """
+import errno
+import hashlib
+import os
 from types import SimpleNamespace
 
+import websocket._socket
 from substrateinterface.exceptions import SubstrateRequestException
 from substrateinterface.utils.ss58 import ss58_encode
+from websocket import WebSocketTimeoutException
 
+from daemon import health_server
+from daemon.cert_builder import scale_cert_encode
 from daemon.cert_daemon import CertDaemon
 from daemon.cert_store import CertStore
 from daemon.config import DaemonConfig
@@ -22,6 +31,37 @@ CALL_NOT_EXPECTED = {"code": 1010, "message": "Invalid Transaction", "data": "Tr
 OUTDATED = {"code": 1010, "message": "Invalid Transaction", "data": "Transaction is outdated"}
 RECEIPT_ID = "0x" + "ab" * 32
 GENESIS = "0x" + "00" * 32
+RECEIPT_FIELD = "0x" + "11" * 32
+OTHER_MEMBERS = (b"\x07" * 32, b"\x08" * 32)
+
+
+def canonical_cert_hash(receipt_id: str) -> bytes:
+    """The hash spec 242 accepts for a ``FakeChain`` receipt: its cert at GENESIS."""
+    field = bytes.fromhex(RECEIPT_FIELD[2:])
+    return hashlib.sha256(scale_cert_encode(
+        chain_genesis=GENESIS, receipt_id=receipt_id, content_hash=field,
+        base_root_sha256=field, storage_locator_hash=field,
+    )).digest()
+
+
+class _TimedOutSocket:
+    """A socket the kernel failed with ETIMEDOUT: its peer went silent and
+    TCP keepalive's probes went unanswered (tcp(7))."""
+
+    def gettimeout(self):
+        return None
+
+    def recv(self, _bufsize):
+        raise TimeoutError(errno.ETIMEDOUT, os.strerror(errno.ETIMEDOUT))
+
+
+def kernel_timeout() -> WebSocketTimeoutException:
+    """What websocket-client raises on a read of a kernel-timed-out socket."""
+    try:
+        websocket._socket.recv(_TimedOutSocket(), 1)
+    except WebSocketTimeoutException as error:
+        return error
+    raise AssertionError("websocket-client returned from a timed-out socket")
 
 
 class FakeChain:
@@ -34,15 +74,19 @@ class FakeChain:
         self.blocks: dict[int, list[str]] = {}
         self.included: list[tuple[bytes, int, str]] = []
         self.clock = 0.0
+        self.frozen: dict[str, SimpleNamespace] = {}
+        self.finalized: str | None = None
 
     def add_receipt(self, receipt_id: str, block: int) -> None:
         self.attesters[receipt_id] = set()
         self.blocks.setdefault(block, []).append(receipt_id)
 
-    def apply_attest(self, signer: bytes, nonce: int, receipt_id: str) -> None:
+    def apply_attest(self, signer: bytes, nonce: int, receipt_id: str, claimed: bytes | None = None) -> None:
         if nonce < self.nonces.get(signer, 0):
             raise SubstrateRequestException(OUTDATED)
-        if (signer not in self.members or receipt_id in self.certified
+        if (signer not in self.members or receipt_id not in self.attesters
+                or receipt_id in self.certified
+                or (claimed is not None and claimed != canonical_cert_hash(receipt_id))
                 or signer in self.attesters[receipt_id]):
             raise SubstrateRequestException(CALL_NOT_EXPECTED)
         self.nonces[signer] = nonce + 1
@@ -51,29 +95,48 @@ class FakeChain:
         if len(self.attesters[receipt_id]) >= self.threshold:
             self.certified.add(receipt_id)
 
-    def receipt_row(self, receipt_id: str) -> dict:
-        certified = receipt_id in self.certified
-        row = {name: "0x" + "11" * 32 for name in (
+    def head(self) -> str:
+        """A new best block's hash, with the state as it stands now frozen under it."""
+        block_hash = f"0x{len(self.frozen) + 1:064x}"
+        self.frozen[block_hash] = SimpleNamespace(
+            members=frozenset(self.members),
+            certified=frozenset(self.certified),
+            attesters={receipt: frozenset(signers) for receipt, signers in self.attesters.items()},
+        )
+        return block_hash
+
+    def at(self, block_hash: str | None):
+        """The state at ``block_hash``; the best block's when None."""
+        return self if block_hash is None else self.frozen[block_hash]
+
+    @staticmethod
+    def receipt_row(state, receipt_id: str) -> dict:
+        certified = receipt_id in state.certified
+        row = {name: RECEIPT_FIELD for name in (
             "content_hash", "base_root_sha256", "storage_locator_hash", "schema_hash",
             "base_manifest_hash", "safety_manifest_hash", "monitor_config_hash",
             "attestation_evidence_hash")}
-        row.update(availability_cert_hash="0x" + ("cc" if certified else "00") * 32,
+        cert_hash = canonical_cert_hash(receipt_id) if certified else bytes(32)
+        row.update(availability_cert_hash="0x" + cert_hash.hex(),
                    created_at_millis=0, submitter="5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY")
         return row
 
-    def attestation_row(self, receipt_id: str):
-        signers = self.attesters.get(receipt_id)
+    @staticmethod
+    def attestation_row(state, receipt_id: str):
+        signers = state.attesters.get(receipt_id)
         # The runtime removes the entry once the receipt is certified.
-        if not signers or receipt_id in self.certified:
+        if not signers or receipt_id in state.certified:
             return None
-        return ("0x" + "cc" * 32, [ss58_encode(signer, 0) for signer in sorted(signers)])
+        return ("0x" + canonical_cert_hash(receipt_id).hex(),
+                [ss58_encode(signer, 0) for signer in sorted(signers)])
 
 
 class FakeSI:
     """One websocket onto a ``FakeChain``. Once ``failure`` is set, every call
     (or only those named in ``failing``) raises it, as a dead socket does. With
     ``idle_limit`` the socket dies once it has been idle that long on the
-    chain's clock, as behind a proxy that drops idle websockets."""
+    chain's clock, as behind a proxy that drops idle websockets. A set ``best``
+    keeps this node's best block at that frozen block, as a node that lags."""
 
     def __init__(self, ledger: FakeChain, idle_limit: float | None = None):
         self.ledger = ledger
@@ -84,6 +147,7 @@ class FakeSI:
         self.lose_submit_response = False
         self.idle_limit = idle_limit
         self.last_used = ledger.clock
+        self.best: str | None = None
         self.calls: list[str] = []
         self.closed = False
 
@@ -102,14 +166,25 @@ class FakeSI:
         self._use(method)
         return {"jsonrpc": "2.0", "id": 1, "result": {"peers": 3, "isSyncing": False}}
 
+    def get_chain_head(self):
+        self._use("get_chain_head")
+        return self.best or self.ledger.head()
+
+    def get_chain_finalised_head(self):
+        self._use("get_chain_finalised_head")
+        return self.ledger.finalized
+
     def query(self, module, storage_function, params=None, block_hash=None):
         self._use("query")
+        state = self.ledger.at(block_hash or self.best)
+        if storage_function == "CommitteeMembers":
+            return SimpleNamespace(value=[ss58_encode(member, 0) for member in sorted(state.members)])
         receipt_id = params[0]
         if storage_function == "Receipts":
-            known = receipt_id in self.ledger.attesters
-            return SimpleNamespace(value=self.ledger.receipt_row(receipt_id) if known else None)
+            known = receipt_id in state.attesters
+            return SimpleNamespace(value=self.ledger.receipt_row(state, receipt_id) if known else None)
         if storage_function == "Attestations":
-            return SimpleNamespace(value=self.ledger.attestation_row(receipt_id))
+            return SimpleNamespace(value=self.ledger.attestation_row(state, receipt_id))
         raise AssertionError(f"unexpected storage read {module}.{storage_function}")
 
     def compose_call(self, call_module, call_function, call_params):
@@ -125,7 +200,9 @@ class FakeSI:
 
     def submit_extrinsic(self, extrinsic, wait_for_inclusion=False):
         self._use("submit_extrinsic")
-        self.ledger.apply_attest(extrinsic.signer, extrinsic.nonce, extrinsic.call.params["receipt_id"])
+        params = extrinsic.call.params
+        self.ledger.apply_attest(extrinsic.signer, extrinsic.nonce, params["receipt_id"],
+                                 bytes(params["claimed_hash"]))
         if self.lose_submit_response:
             self.failure = ConnectionResetError(104, "Connection reset by peer")
             raise self.failure
@@ -139,7 +216,7 @@ class FakeSI:
         self._use("get_events")
         return [SimpleNamespace(value={
             "module_id": "OrinqReceipts", "event_id": "ReceiptSubmitted",
-            "attributes": {"receipt_id": rid, "content_hash": "0x" + "11" * 32, "submitter": ""},
+            "attributes": {"receipt_id": rid, "content_hash": RECEIPT_FIELD, "submitter": ""},
         }) for rid in self.ledger.blocks.get(int(block_hash, 16), [])]
 
 
@@ -182,9 +259,11 @@ def health(client):
 
 def attest_daemon(ledger: FakeChain, endpoint, tmp_path, *, last_processed_block: int = 99):
     """A ``CertDaemon`` whose real ``SubstrateClient`` dials ``endpoint``, with
-    blob resolution and verification stubbed to pass and the cert store on
-    disk. Discord messages land in ``daemon.discord``."""
-    config = DaemonConfig(checkpoint_enabled=False, cert_store_dir=str(tmp_path / "certs"))
+    blob resolution and verification stubbed to pass, and the cert store and
+    state file on disk under ``tmp_path``. Discord messages land in
+    ``daemon.discord``."""
+    config = DaemonConfig(checkpoint_enabled=False, cert_store_dir=str(tmp_path / "certs"),
+                          state_file=str(tmp_path / "daemon-state.json"))
     daemon = CertDaemon.__new__(CertDaemon)
     daemon.config = config
     daemon.client = dialling_client(endpoint, config)
@@ -212,7 +291,6 @@ def attest_daemon(ledger: FakeChain, endpoint, tmp_path, *, last_processed_block
     daemon._chain_write_lock = None
     daemon._pending_lock = None
     daemon._concurrency_sem = None
-    daemon.save_state = lambda: None
     daemon.discord = []
 
     async def send_discord(message, level="info"):
@@ -220,3 +298,50 @@ def attest_daemon(ledger: FakeChain, endpoint, tmp_path, *, last_processed_block
 
     daemon.send_discord = send_discord
     return daemon
+
+
+def receipt_scenario(tmp_path):
+    """RECEIPT_ID submitted in block 100, a committee of the daemon and
+    OTHER_MEMBERS, and the daemon about to process the block."""
+    ledger = FakeChain()
+    ledger.add_receipt(RECEIPT_ID, block=100)
+    ledger.members.update(OTHER_MEMBERS)
+    endpoint = fake_endpoint(ledger)
+    return ledger, endpoint, attest_daemon(ledger, endpoint, tmp_path)
+
+
+def certify_by_others(ledger: FakeChain) -> None:
+    for member in OTHER_MEMBERS:
+        ledger.apply_attest(member, 0, RECEIPT_ID)
+
+
+def fail_receipt_reads(daemon, failures):
+    """``get_receipt`` raises each of ``failures`` in turn, then reads the chain."""
+    read = daemon.client.get_receipt
+    pending = iter(failures)
+    attempts = []
+
+    def get_receipt(receipt_id, *at):
+        attempts.append(receipt_id)
+        for failure in pending:
+            raise failure
+        return read(receipt_id, *at)
+
+    daemon.client.get_receipt = get_receipt
+    return attempts
+
+
+def included(ledger: FakeChain) -> list[str]:
+    return [receipt for _, _, receipt in ledger.included]
+
+
+def signatures(endpoint) -> int:
+    return sum(si.calls.count("create_signed_extrinsic") for si in endpoint.opened)
+
+
+def criticals(daemon) -> list[str]:
+    return [message for level, message in daemon.discord if level == "critical"]
+
+
+def metric(name: str):
+    return health_server._metrics.get(name, 0)
