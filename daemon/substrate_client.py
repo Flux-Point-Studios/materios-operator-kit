@@ -1,3 +1,4 @@
+import errno
 import functools
 import hashlib
 import json
@@ -11,7 +12,7 @@ from typing import Any, Iterator, Optional
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.exceptions import SubstrateRequestException
 from substrateinterface.utils.ss58 import ss58_decode
-from websocket import WebSocketConnectionClosedException
+from websocket import WebSocketConnectionClosedException, WebSocketTimeoutException
 
 from daemon import health_server
 from daemon.config import DaemonConfig
@@ -177,9 +178,10 @@ def slash_contract_fingerprint(v14: dict) -> str:
 #      and constructs a new SI. A successful call resets the streak.
 #   3. Reconnect failures retry with exponential backoff: 1s, 2s, 4s, 8s,
 #      16s, then capped at 30s. The streak gauge surfaces to /metrics.
-#   4. A call that fails on a dead socket (``TRANSPORT_DEAD_ERRORS``) replaces
+#   4. A call that fails on a dead socket (``is_transport_dead``) replaces
 #      that conn's SI at once and is retried once on the fresh one. A conn left
-#      without an SI reconnects on its next call.
+#      without an SI reconnects on its next call. A timeout on an SI the conn
+#      has already replaced does not count toward the new SI's streak.
 #
 # Metrics surfaced on success/failure:
 #   - cert_daemon_ws_rpc_timeouts_total (counter)
@@ -204,16 +206,23 @@ class RPCTimeoutError(Exception):
 # call on it fails the same way. substrate-interface reconnects by itself only
 # when websocket-client has already cleared the socket, which a failed send
 # (EPIPE) never does. CPython builds an OSError carrying EPIPE, ECONNRESET or
-# ECONNABORTED as the matching subclass below. Node verdicts
-# (SubstrateRequestException, a 1010) and validation errors (ValueError) are
-# not transport failures.
+# ECONNABORTED as the matching subclass below. websocket-client raises
+# WebSocketTimeoutException for a socket the kernel failed with ETIMEDOUT
+# (TCP keepalive probes unanswered): the daemon sets no websocket timeout, so
+# nothing else raises it. Node verdicts (SubstrateRequestException, a 1010)
+# and validation errors (ValueError) are not transport failures.
 TRANSPORT_DEAD_ERRORS = (
     BrokenPipeError,
     ConnectionResetError,
     ConnectionAbortedError,
     WebSocketConnectionClosedException,
+    WebSocketTimeoutException,
     ssl.SSLEOFError,
 )
+# A call whose socket another call closed under it fails with EBADF (plain or
+# TLS alike), or ENOTSOCK once the descriptor is reused; a socket no longer
+# connected fails with ENOTCONN. None of these has an OSError subclass.
+TRANSPORT_DEAD_ERRNOS = frozenset({errno.EBADF, errno.ENOTSOCK, errno.ENOTCONN})
 
 
 def _error_chain(error: Optional[BaseException]) -> Iterator[BaseException]:
@@ -227,13 +236,32 @@ def _error_chain(error: Optional[BaseException]) -> Iterator[BaseException]:
 
 def is_transport_dead(error: BaseException) -> bool:
     """Whether ``error``, or an error that caused it, says the socket is dead."""
-    return any(isinstance(e, TRANSPORT_DEAD_ERRORS) for e in _error_chain(error))
+    return any(
+        isinstance(e, TRANSPORT_DEAD_ERRORS) or (isinstance(e, OSError) and e.errno in TRANSPORT_DEAD_ERRNOS)
+        for e in _error_chain(error)
+    )
 
 
-def is_rpc_unavailable(error: BaseException) -> bool:
-    """Whether ``error`` means the RPC did not serve the call at all: a dead
-    socket, or no answer within the timeout budget."""
-    return is_transport_dead(error) or any(isinstance(e, RPCTimeoutError) for e in _error_chain(error))
+class AttestUnsettled(Exception):
+    """The node refused this signer's attest of a receipt, and the chain, read
+    at the refusing node's best block, neither holds the attest nor rules it
+    out yet. ``cert_hash`` is the hash the attest claimed."""
+
+    def __init__(self, receipt_id: str, cert_hash: bytes, refusal: BaseException):
+        super().__init__(
+            f"attest of {receipt_id} refused before the chain settled it: {type(refusal).__name__}: {refusal}"
+        )
+        self.cert_hash = cert_hash
+
+
+def should_defer(error: BaseException) -> bool:
+    """Whether a receipt whose processing raised ``error`` is retried on a
+    later tick: the RPC did not serve a call at all (a dead socket, or no
+    answer within the timeout budget), or the node refused its attest for a
+    state the chain does not show yet."""
+    return is_transport_dead(error) or any(
+        isinstance(e, (RPCTimeoutError, AttestUnsettled)) for e in _error_chain(error)
+    )
 
 
 def _read_float_env(name: str, default: float) -> float:
@@ -336,6 +364,11 @@ def _account_id_bytes(account: str) -> bytes:
     if len(raw) != 32:
         raise ValueError("account id must be 32 bytes")
     return raw
+
+
+def _account_ids(accounts) -> frozenset[bytes]:
+    """The AccountId32s of a decoded storage list of accounts."""
+    return frozenset(_account_id_bytes(str(account)) for account in accounts)
 
 
 def _signature_params(sigs: list) -> list[tuple[str, str]]:
@@ -686,7 +719,7 @@ class SubstrateClient:
             # Thread still running past the budget — abandon it and report
             # timeout. The thread will die when the OS reaps the socket fd
             # (close() in force-replace) or at process exit.
-            self._on_rpc_timeout(conn, method_name)
+            self._on_rpc_timeout(conn, si, method_name)
             raise RPCTimeoutError(
                 f"RPC {method_name!r} exceeded {self._rpc_timeout_secs:.1f}s "
                 f"budget on the {conn.name} conn"
@@ -733,14 +766,19 @@ class SubstrateClient:
             # Never let a metrics bump kill a successful RPC.
             pass
 
-    def _on_rpc_timeout(self, conn: "_WsConn", method_name: str) -> None:
-        """Bookkeeping for a timed-out call: bump the conn's counters, possibly
-        trigger a force-replace of that conn's SI."""
-        conn.consecutive_timeouts += 1
+    def _on_rpc_timeout(self, conn: "_WsConn", si: SubstrateInterface, method_name: str) -> None:
+        """Bookkeeping for a call that timed out on ``si``: bump the conn's
+        counters, possibly trigger a force-replace of that conn's SI. A conn
+        that already replaced ``si`` while the call was wedged on it found that
+        socket dead: the timeout was the dead socket's, not a strike against
+        its replacement."""
         try:
             health_server.increment_metric("ws_rpc_timeouts_total")
         except Exception:
             pass
+        if conn.si is not si:
+            return
+        conn.consecutive_timeouts += 1
         logger.warning(
             f"substrate RPC {method_name!r} timed out after "
             f"{self._rpc_timeout_secs:.1f}s on the {conn.name} conn "
@@ -1046,7 +1084,7 @@ class SubstrateClient:
         32 bytes of each ``OrinqReceipts.CommitteeMembers`` account, which the
         runtime's committee adapter uses as the pubkey."""
         members = self.get_committee_members()
-        return frozenset(_account_id_bytes(m) for m in (members.value if hasattr(members, "value") else members))
+        return _account_ids(members.value if hasattr(members, "value") else members)
 
     def submit_join_committee(self):
         """Submit ``OrinqReceipts.join_committee()`` and return the included
@@ -2079,12 +2117,14 @@ class SubstrateClient:
                 })
         return certified
 
-    def get_receipt(self, receipt_id: str) -> Optional[ReceiptRecord]:
+    def get_receipt(self, receipt_id: str, block_hash: Optional[str] = None) -> Optional[ReceiptRecord]:
+        """The receipt at ``block_hash``, by default at the best block."""
         result = self._call(
             "query",
             module="OrinqReceipts",
             storage_function="Receipts",
             params=[receipt_id],
+            block_hash=block_hash,
         )
         if result.value is None:
             return None
@@ -2118,10 +2158,12 @@ class SubstrateClient:
         alone would falsely report acceptance and silently rack up strikes
         until auto-ejection.
 
-        A refused attest is done when :meth:`attestation_on_chain` holds: the
-        attest landed through a reply the socket lost, or other members
-        certified the receipt first. A dead socket that ``_call``'s retry did
-        not get past propagates, and the caller retries the receipt later.
+        A refused attest is settled by :meth:`attestation_on_chain`: done when
+        the attest landed through a reply the socket lost, or other members
+        certified the receipt under the same hash first; a failure when the
+        chain can never count it; otherwise :class:`AttestUnsettled`
+        propagates, as does a dead socket that ``_call``'s retry did not get
+        past, and the caller retries the receipt later.
         """
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
@@ -2155,16 +2197,21 @@ class SubstrateClient:
                 logger.info(f"Cert attested for {receipt_id}, block {receipt.block_hash}")
                 return SubmitCertOutcome(success=True)
             except SubstrateRequestException as e:
-                if self.attestation_on_chain(receipt_id):
+                settled = self.attestation_on_chain(receipt_id, cert_hash)
+                if settled is None:
+                    raise AttestUnsettled(receipt_id, cert_hash, e) from e
+                if settled:
                     logger.info(
-                        f"Cert tx for {receipt_id} refused ({e}); the receipt is "
-                        f"certified or already carries this signer's attest"
+                        f"Cert tx for {receipt_id} refused ({e}); already on chain: the receipt "
+                        f"is certified under this hash or carries this signer's attest of it"
                     )
                     return SubmitCertOutcome(success=True, already_on_chain=True)
-                last_error = f"{type(e).__name__}: {e}"
-                logger.error(f"Cert tx attempt {attempt + 1} failed for {receipt_id}: {e}")
-                if attempt < self.config.tx_max_retries - 1:
-                    time.sleep(2 ** attempt)
+                logger.error(
+                    f"Cert tx for {receipt_id} refused ({e}); the chain can never count it: this "
+                    f"signer is not a committee member, or the receipt is certified or attested "
+                    f"under another hash"
+                )
+                return SubmitCertOutcome(success=False, error_message=f"{type(e).__name__}: {e}")
             except Exception as e:
                 if is_transport_dead(e):
                     raise
@@ -2174,23 +2221,38 @@ class SubstrateClient:
                     time.sleep(2 ** attempt)
         return SubmitCertOutcome(success=False, error_message=last_error)
 
-    def attestation_on_chain(self, receipt_id: str) -> bool:
-        """Whether the chain already holds what this signer's attest would add:
-        the receipt is certified, or its ``Attestations`` entry records this
-        signer. Spec 242's pool refuses an attest in either state as 1010
-        "Transaction call is not expected"; its other 1010 refusals (not a
-        member, unknown receipt, non-canonical hash) leave this False."""
-        receipt = self.get_receipt(receipt_id)
-        if receipt is None:
+    def attestation_on_chain(self, receipt_id: str, cert_hash: Optional[bytes]) -> Optional[bool]:
+        """Whether this signer's attest of ``receipt_id`` is settled on chain:
+        True once it is done, False when it can never count, None while
+        neither. ``cert_hash`` is the hash the signer claimed, None before it
+        has claimed one.
+
+        Spec 242's pool refuses as 1010 "Transaction call is not expected" an
+        attest by a non-member, of an unknown or certified receipt, of a
+        non-canonical hash, or that the receipt already records. It judges at
+        its node's best block, so the receipt, the committee and the receipt's
+        attestation are read together at one best block of the write conn's
+        node: a lagging node, or reads at two blocks, can miss a certification,
+        which removes the attestation. The attest is done when the signer is a
+        member and the receipt is certified under ``cert_hash``, or records
+        this signer's attest under it. It can never count when the signer is
+        not a member, or the receipt is certified or attested under another
+        hash."""
+        head = self._call("get_chain_head")
+        members = self._call("query", "OrinqReceipts", "CommitteeMembers", block_hash=head).value
+        if self.keypair.public_key not in _account_ids(members):
             return False
+        receipt = self.get_receipt(receipt_id, head)
+        if receipt is None:
+            return None
         if receipt.availability_cert_hash != bytes(32):
-            return True
-        entry = self._call(
-            "query", "OrinqReceipts", "Attestations", [receipt_id], conn=self._read
-        ).value
-        return entry is not None and self.keypair.public_key in {
-            _account_id_bytes(str(signer)) for signer in entry[1]
-        }
+            return cert_hash is None or cert_hash == receipt.availability_cert_hash
+        entry = self._call("query", "OrinqReceipts", "Attestations", [receipt_id], block_hash=head).value
+        if entry is None:
+            return None
+        if cert_hash is not None and cert_hash != _to_bytes32(entry[0]):
+            return False
+        return True if self.keypair.public_key in _account_ids(entry[1]) else None
 
     def _scan_for_bad_attest(
         self, receipt, receipt_id: str

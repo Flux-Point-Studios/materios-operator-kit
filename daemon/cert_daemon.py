@@ -9,7 +9,7 @@ import aiohttp
 
 from daemon.config import DaemonConfig
 from daemon.models import AttestationLevel, PendingReceipt
-from daemon.substrate_client import SubstrateClient, is_rpc_unavailable
+from daemon.substrate_client import AttestUnsettled, SubstrateClient, should_defer
 from daemon.locator_registry import LocatorRegistry
 from daemon.blob_verifier import BlobVerifier
 from daemon.cert_builder import scale_cert_encode
@@ -90,10 +90,15 @@ FALLBACK_WINDOW: int = _default_fallback_window()
 MAX_CLAMPS_PER_TICK: int = 5
 
 # Retries a receipt gets after the RPC failed its processing (a dead socket
-# that `_call`'s own retry did not get past, or a timeout), one per poll tick,
+# that `_call`'s own retry did not get past, or a timeout), or after the node
+# refused its attest for a state the chain did not show yet, one per poll tick,
 # before it is dropped as RPC_RETRIES_EXHAUSTED. While the endpoint is down,
 # each retry waits out a reconnect cycle first.
 MAX_RECEIPT_RPC_RETRIES: int = 5
+
+# Deferred receipts kept at once, which bounds the state file written every
+# block; past it a receipt is dropped, by name, instead of deferred.
+MAX_DEFERRED_RECEIPTS: int = 256
 
 
 def _is_pruned_state_error(exc) -> bool:
@@ -250,11 +255,24 @@ class CertDaemon:
             try:
                 with open(self.config.state_file) as f:
                     state = json.load(f)
+                deferred = {
+                    receipt_id: PendingReceipt(
+                        receipt_id=receipt_id,
+                        receipt=None,
+                        first_seen=time.time(),
+                        retries=entry["retries"],
+                        last_error=entry["last_error"],
+                        cert_hash=bytes.fromhex(entry["cert_hash"]) if entry["cert_hash"] else None,
+                    )
+                    for receipt_id, entry in state.get("deferred", {}).items()
+                }
                 self.last_processed_block = state.get("last_processed_block", 0)
                 self._stored_chain_genesis = state.get("chain_genesis", "")
+                self.pending.update(deferred)
                 logger.info(
                     f"Loaded state: last_processed_block={self.last_processed_block} "
-                    f"chain_genesis={self._stored_chain_genesis[:16] or '(none)'}"
+                    f"chain_genesis={self._stored_chain_genesis[:16] or '(none)'} "
+                    f"deferred_receipts={len(deferred)}"
                 )
             except Exception as e:
                 logger.warning(f"Failed to load state: {e}")
@@ -327,6 +345,15 @@ class CertDaemon:
                 "last_processed_block": self.last_processed_block,
                 "chain_genesis": getattr(self, "_live_chain_genesis", "")
                 or getattr(self, "_stored_chain_genesis", ""),
+                "deferred": {
+                    receipt_id: {
+                        "retries": entry.retries,
+                        "last_error": entry.last_error,
+                        "cert_hash": entry.cert_hash.hex() if entry.cert_hash else None,
+                    }
+                    for receipt_id, entry in self.pending.items()
+                    if entry.last_error
+                },
             }
             tmp = self.config.state_file + ".tmp"
             with open(tmp, "w") as f:
@@ -358,10 +385,11 @@ class CertDaemon:
             `last_processed_block = N`, every receipt in (prior, N] has been
             seen exactly once.
           - A receipt whose processing the RPC failed (a dead socket or a
-            timeout) does not leave with its block: it moves to
-            `self.pending`, and `retry_pending` runs it again on later ticks,
-            at most `MAX_RECEIPT_RPC_RETRIES` times. The cursor never waits
-            on it.
+            timeout), or whose refused attest the chain has not settled, does
+            not leave with its block: it moves to `self.pending`, which
+            `save_state` persists with the cursor, and `retry_pending` runs it
+            again on later ticks, in this process or the next, at most
+            `MAX_RECEIPT_RPC_RETRIES` times. The cursor never waits on it.
           - After a clamp, we re-enter the outer loop with the new cursor.
             If the clamped cursor is ALSO past pruning, we clamp again, up
             to `MAX_CLAMPS_PER_TICK` — then bail and let the next tick
@@ -392,7 +420,7 @@ class CertDaemon:
                             return_exceptions=True,
                         )
                         for ev, res in zip(events, results):
-                            if isinstance(res, BaseException) and is_rpc_unavailable(res):
+                            if isinstance(res, BaseException) and should_defer(res):
                                 await self._defer_receipt(ev["receipt_id"], res)
                             elif isinstance(res, BaseException):
                                 logger.warning(
@@ -439,23 +467,36 @@ class CertDaemon:
     async def _defer_receipt(
         self, receipt_id: str, error: BaseException, entry: Optional[PendingReceipt] = None
     ) -> None:
-        """Keep a receipt whose processing the RPC failed in `pending`, so
-        `retry_pending` runs it again on a later tick; `entry` carries the
-        retries it has already had. Drops it, by name, once those reach
-        MAX_RECEIPT_RPC_RETRIES."""
+        """Keep a receipt whose processing the RPC failed, or whose refused
+        attest the chain has not settled, in `pending`, so `retry_pending`
+        runs it again on a later tick; `entry` carries the retries it has
+        already had. Drops it, by name, once those reach
+        MAX_RECEIPT_RPC_RETRIES, a refused attest's drop being a failed cert,
+        or when MAX_DEFERRED_RECEIPTS others already wait."""
         entry = entry or PendingReceipt(receipt_id=receipt_id, receipt=None, first_seen=time.time())
         entry.retries += 1
         entry.last_error = f"{type(error).__name__}: {error}"
+        refused = isinstance(error, AttestUnsettled)
+        if refused:
+            entry.cert_hash = error.cert_hash
         if entry.retries > MAX_RECEIPT_RPC_RETRIES:
             logger.error(
                 f"dropping receipt {receipt_id[:16]}...: RPC_RETRIES_EXHAUSTED after "
                 f"{MAX_RECEIPT_RPC_RETRIES} retries; last error {entry.last_error}"
             )
+            if refused:
+                await self._cert_failed(receipt_id, entry.last_error)
             return
         async with self._pending_lock:
+            if sum(1 for waiting in self.pending.values() if waiting.last_error) >= MAX_DEFERRED_RECEIPTS:
+                logger.error(
+                    f"dropping receipt {receipt_id[:16]}...: DEFERRED_LIMIT of "
+                    f"{MAX_DEFERRED_RECEIPTS} deferred receipts reached; its error {entry.last_error}"
+                )
+                return
             self.pending[receipt_id] = entry
         logger.warning(
-            f"process_receipt for {receipt_id[:16]}... failed on the RPC "
+            f"process_receipt for {receipt_id[:16]}... deferred "
             f"({entry.last_error}); retry {entry.retries}/{MAX_RECEIPT_RPC_RETRIES} "
             f"on a later tick"
         )
@@ -671,7 +712,9 @@ class CertDaemon:
         if outcome.success:
             async with self._pending_lock:
                 self.pending.pop(receipt_id, None)
-            if not outcome.already_on_chain:
+            if outcome.already_on_chain:
+                health_server.increment_metric("certs_already_on_chain_total")
+            else:
                 health_server.increment_metric("certs_submitted_total")
                 await self.send_discord(
                     f"Cert submitted for `{receipt_id[:16]}...` (L{verification.attestation_level})",
@@ -708,11 +751,11 @@ class CertDaemon:
                     "critical",
                 )
         else:
-            health_server.increment_metric("verification_failures_total")
-            await self.send_discord(
-                f"Failed to submit cert tx for `{receipt_id[:16]}...` after {self.config.tx_max_retries} retries",
-                "critical",
-            )
+            await self._cert_failed(receipt_id, outcome.error_message)
+
+    async def _cert_failed(self, receipt_id: str, error: Optional[str]) -> None:
+        health_server.increment_metric("verification_failures_total")
+        await self.send_discord(f"Failed to submit cert tx for `{receipt_id[:16]}...`: {error}", "critical")
 
     async def _keep_write_conn_alive(self):
         """Exercise the write conn every ``client.keepalive_secs``: it idles
@@ -750,16 +793,24 @@ class CertDaemon:
                     self.pending.pop(receipt_id, None)
                 try:
                     # The failed run may have landed its attest before the
-                    # socket died; then there is nothing left to sign.
-                    if await asyncio.to_thread(self.client.attestation_on_chain, receipt_id):
-                        logger.info(
-                            f"retry of {receipt_id[:16]}... skipped: certified or "
-                            f"already attested by this signer"
+                    # socket died, and a refused one may have settled since;
+                    # either way there is nothing left to sign.
+                    settled = await asyncio.to_thread(
+                        self.client.attestation_on_chain, receipt_id, pending.cert_hash
+                    )
+                    if settled is None:
+                        await self.process_receipt(receipt_id)
+                    elif settled:
+                        logger.info(f"retry of {receipt_id[:16]}... skipped: already on chain")
+                        health_server.increment_metric("certs_already_on_chain_total")
+                    else:
+                        await self._cert_failed(
+                            receipt_id,
+                            "the chain can never count its attest: this signer is not a committee "
+                            "member, or the receipt is certified or attested under another hash",
                         )
-                        continue
-                    await self.process_receipt(receipt_id)
                 except Exception as error:
-                    if is_rpc_unavailable(error):
+                    if should_defer(error):
                         await self._defer_receipt(receipt_id, error, pending)
                     else:
                         logger.warning(
@@ -778,14 +829,23 @@ class CertDaemon:
                     )
                 continue
 
-            # Found locator — process it
-            await self.process_receipt(receipt_id)
+            # Found locator — process it. A deferral starts its own retry
+            # count: this entry's counts locator polls.
+            try:
+                await self.process_receipt(receipt_id)
+            except Exception as error:
+                if not should_defer(error):
+                    raise
+                await self._defer_receipt(receipt_id, error)
+                continue
             to_remove.append(receipt_id)
 
         if to_remove:
             async with self._pending_lock:
                 for rid in to_remove:
                     self.pending.pop(rid, None)
+        if snapshot:
+            self.save_state()
 
     async def _ensure_bond(self):
         """Ensure the daemon's signer has `AttestorBonds[addr] >= BondRequirement`.

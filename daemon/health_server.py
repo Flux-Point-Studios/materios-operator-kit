@@ -35,6 +35,9 @@ def drain_notifications() -> list:
 _metrics = {
     "blocks_processed_total": 0,
     "certs_submitted_total": 0,
+    # Receipts found done on chain instead of submitted: a refused attest the
+    # chain shows landed, or that others certified under the same hash.
+    "certs_already_on_chain_total": 0,
     "verification_failures_total": 0,
     "bad_attest_strikes_total": 0,
     "auto_slashed_total": 0,

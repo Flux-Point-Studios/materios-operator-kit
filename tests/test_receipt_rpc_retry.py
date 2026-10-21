@@ -5,22 +5,24 @@ idempotent.
 The cursor still advances block by block; the receipt waits in ``pending``,
 which already drives fast polling and ``retry_pending``. Retries are bounded
 and the give-up is logged by name. A retried attest can never count twice:
-the runtime keeps one entry per signer, spec 242's pool refuses an attest it
-would not count as 1010 "Transaction call is not expected", and that refusal
-is DONE when the chain shows the receipt certified or this signer's attest
-recorded, which leaves non-member and unknown-receipt refusals as failures.
+the runtime keeps one entry per signer, and spec 242's pool refuses an attest
+it would not count as 1010 "Transaction call is not expected". How that
+refusal is settled is pinned in test_attest_refusal_verdict.py.
 """
 import asyncio
+import errno
 
 import pytest
-from substrateinterface.exceptions import SubstrateRequestException
 
 from daemon import cert_daemon, health_server
 from daemon import substrate_client as sc
 from daemon.substrate_client import RPCTimeoutError
-from tests.fake_chain import RECEIPT_ID, FakeChain, attest_daemon, connected_client, fake_endpoint
+from tests.fake_chain import (
+    RECEIPT_ID, FakeChain, canonical_cert_hash, connected_client, fail_receipt_reads, included, kernel_timeout,
+    receipt_scenario,
+)
 
-CERT_HASH = b"\xcc" * 32
+CERT_HASH = canonical_cert_hash(RECEIPT_ID)
 
 
 def wrapped(cause):
@@ -37,6 +39,8 @@ RPC_FAILURES = [
     BrokenPipeError(32, "Broken pipe"),
     wrapped(ConnectionResetError(104, "Connection reset by peer")),
     RPCTimeoutError("RPC 'query' exceeded 30.0s budget on the write conn"),
+    OSError(errno.EBADF, "Bad file descriptor"),
+    kernel_timeout(),
 ]
 
 
@@ -45,34 +49,8 @@ def instant_submit_backoff(monkeypatch):
     monkeypatch.setattr(sc.time, "sleep", lambda _seconds: None)
 
 
-def receipt_scenario(tmp_path):
-    ledger = FakeChain()
-    ledger.add_receipt(RECEIPT_ID, block=100)
-    endpoint = fake_endpoint(ledger)
-    return ledger, endpoint, attest_daemon(ledger, endpoint, tmp_path)
-
-
-def fail_receipt_reads(daemon, failures):
-    """``get_receipt`` raises each of ``failures`` in turn, then reads the chain."""
-    read = daemon.client.get_receipt
-    pending = iter(failures)
-    attempts = []
-
-    def get_receipt(receipt_id):
-        attempts.append(receipt_id)
-        for failure in pending:
-            raise failure
-        return read(receipt_id)
-
-    daemon.client.get_receipt = get_receipt
-    return attempts
-
-
-def included(ledger):
-    return [receipt for _, _, receipt in ledger.included]
-
-
-@pytest.mark.parametrize("failure", RPC_FAILURES, ids=["BrokenPipeError", "wrapped-reset", "RPCTimeoutError"])
+@pytest.mark.parametrize("failure", RPC_FAILURES,
+                         ids=["BrokenPipeError", "wrapped-reset", "RPCTimeoutError", "EBADF", "kernel-timeout"])
 def test_a_receipt_the_rpc_failed_is_retried_on_a_later_tick(failure, tmp_path):
     ledger, _, daemon = receipt_scenario(tmp_path)
     fail_receipt_reads(daemon, [failure])
@@ -237,18 +215,3 @@ def test_a_receipt_certified_while_it_was_verified_raises_no_alarm(tmp_path):
     assert daemon.discord == [] and daemon.pending == {}
     assert health_server._metrics.get("certs_submitted_total", 0) == certs_before
     assert included(ledger) == []
-
-
-def test_a_refusal_the_chain_cannot_explain_still_raises_the_node_verdict():
-    ledger = FakeChain()
-    ledger.add_receipt(RECEIPT_ID, block=100)
-    client, endpoint = connected_client(ledger)
-    ledger.members.add(client.keypair.public_key)
-    refusal = SubstrateRequestException({"code": 1014, "message": "Priority is too low"})
-    endpoint.opened[0].failure = refusal
-    endpoint.opened[0].failing = {"submit_extrinsic"}
-
-    outcome = client.submit_availability_cert(RECEIPT_ID, CERT_HASH)
-
-    assert not outcome.success and "Priority is too low" in outcome.error_message
-    assert endpoint.opened[0].calls.count("submit_extrinsic") == client.config.tx_max_retries

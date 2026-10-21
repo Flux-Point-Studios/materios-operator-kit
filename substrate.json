@@ -4,7 +4,7 @@
     {
       "id": "daemon-core",
       "name": "Daemon core",
-      "desc": "Shared runtime plumbing for every operator-kit daemon module: configuration, the Substrate chain client (bounded per-call timeout and reconnect, a call that hits a dead socket replacing only its own connection and retrying once, a connection a failed reconnect left empty reopened on its next call, raw reads that never derive a signer, one submission path for committee-signed settlement calls, the committee key set, voucher digests bound to the live chain_getBlockHash(0) with a placeholder, zero or disagreeing runtime MateriosChainId refused, and the settlement runtime context read once per runtime code and announced in logs and metrics; scripts/settlement-runtime.py prints it for a candidate runtime), data models, Cardano address decoding, the health server, heartbeat reporting and Discord delivery.",
+      "desc": "Shared runtime plumbing for every operator-kit daemon module: configuration, the Substrate chain client (bounded per-call timeout and reconnect, a call that hits a dead socket (reset, closed under it by another call, or timed out by the kernel) replacing only its own connection and retrying once, a timeout on a socket already replaced not counted against its replacement, a connection a failed reconnect left empty reopened on its next call, raw reads that never derive a signer, one submission path for committee-signed settlement calls, the committee key set, voucher digests bound to the live chain_getBlockHash(0) with a placeholder, zero or disagreeing runtime MateriosChainId refused, and the settlement runtime context read once per runtime code and announced in logs and metrics; scripts/settlement-runtime.py prints it for a candidate runtime), data models, Cardano address decoding, the health server, heartbeat reporting and Discord delivery.",
       "kind": "toolkit",
       "paths": [
         "daemon/config.py",
@@ -24,7 +24,7 @@
     {
       "id": "cert-daemon",
       "name": "Cert daemon",
-      "desc": "Committee attestor: watches receipts, resolves blob locators through the gateway, verifies content (including the self-rooted short-circuit), attests availability certificates on chain and heartbeats. A receipt the RPC failed is retried on later ticks (bounded), an attest the chain already holds counts as done, and a keepalive exercises the idle submit connection inside a proxy's idle window.",
+      "desc": "Committee attestor: watches receipts, resolves blob locators through the gateway, verifies content (including the self-rooted short-circuit), attests availability certificates on chain and heartbeats. A receipt the RPC failed, or whose refused attest the chain has not settled, is retried on later ticks (bounded, and kept with the cursor across restarts). A refused attest is read at the refusing node's best block: done, and counted, when the receipt is certified under its hash or carries this signer's attest; a failure when the signer is not a committee member or the hash differs. A keepalive exercises the idle submit connection inside a proxy's idle window.",
       "kind": "agent",
       "paths": [
         "daemon/cert_daemon.py",
