@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterator, Optional
 from substrateinterface import SubstrateInterface, Keypair
+from substrateinterface.base import ExtrinsicReceipt, QueryMapResult
 from substrateinterface.exceptions import SubstrateRequestException
 from substrateinterface.utils.ss58 import ss58_decode
 from websocket import WebSocketConnectionClosedException, WebSocketTimeoutException
@@ -453,11 +454,11 @@ class _WsConn:
     holds the write socket for seconds, and a call made on that socket
     meanwhile waits behind it, past its budget under load: the
     get_events-behind-submit wedge (tasks #288/#500) that silently stalled
-    attestation across the committee. The only reads on the write conn are
-    the two that must see the node a submit goes to, and both run under the
-    chain-write lock that serializes submits. Each conn force-replaces itself
-    in isolation: a wedged write socket never trips a read reconnect, and
-    vice versa.
+    attestation across the committee. The only reads on the write conn are a
+    submit's own outcome, within its call, and the two that must see the node
+    a submit goes to, which run under the chain-write lock that serializes
+    submits. Each conn force-replaces itself in isolation: a wedged write
+    socket never trips a read reconnect, and vice versa.
     """
 
     __slots__ = (
@@ -640,6 +641,11 @@ class SubstrateClient:
         fixtures) or is mid-reconnect, a read degrades to the write conn
         rather than failing.
 
+        Nothing a call returns reads the chain afterwards. A submit's
+        ``ExtrinsicReceipt`` has its block and events read within the call,
+        so its outcome needs no further RPC, and a ``query_map`` returns the
+        list of all its rows.
+
         If the call exceeds the budget we raise :class:`RPCTimeoutError`;
         consecutive timeouts on that conn trigger a force-replace of *its*
         ``SubstrateInterface`` (the other conn is untouched). A call that
@@ -700,8 +706,15 @@ class SubstrateClient:
 
         def _invoke():
             try:
-                method = getattr(si, method_name)
-                result_holder["ok"] = method(*args, **kwargs)
+                result = getattr(si, method_name)(*args, **kwargs)
+                # Both read the chain through ``si`` when first used: a
+                # receipt its block and events, a map its next pages. Read
+                # them here, within this call's budget.
+                if isinstance(result, ExtrinsicReceipt):
+                    result.process_events()
+                elif isinstance(result, QueryMapResult):
+                    result = list(result)
+                result_holder["ok"] = result
             except BaseException as e:  # noqa: BLE001
                 result_holder["err"] = e
 
@@ -1054,18 +1067,6 @@ class SubstrateClient:
         return self._call(
             "submit_extrinsic", extrinsic, wait_for_inclusion=wait_for_inclusion, conn=self._write
         )
-
-    def encode_scale(self, *, type_string: str, value: Any) -> Any:
-        """SCALE-encode ``value`` as ``type_string`` through the bounded call
-        on the read conn, for evidence_submitter's payload builder.
-
-        substrate-interface first reads the head's runtime, three RPCs, so
-        it runs off the write conn. The read conn's runtime may differ from
-        the one a call is signed under across an upgrade: encode only types
-        every runtime encodes alike, such as the evidence payload's
-        ``Vec<Bytes>``.
-        """
-        return self._call("encode_scale", type_string=type_string, value=value, conn=self._read)
 
     def get_committee_members(self):
         """Return ``OrinqReceipts.CommitteeMembers`` storage as-is.

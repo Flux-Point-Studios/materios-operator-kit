@@ -6,7 +6,9 @@ there waits behind it. Reads run on the read conn. A listed function runs
 every one of its calls on the write conn: signing and submitting, the
 keepalive that keeps that socket alive, and two reads that must see the node
 a submit goes to. Both of those run under the chain-write lock, so no submit
-holds the socket while they read.
+holds the socket while they read. No daemon code reaches a SubstrateInterface
+but through ``_call``: not ``client.substrate``, and not a conn's ``si``
+outside the functions that open, hold or replace it.
 """
 import ast
 from pathlib import Path
@@ -28,24 +30,31 @@ WRITE_CONN_FUNCTIONS = {
     "attestation_on_chain": "judges a refused attest at one best block of the node that refused it (#66 F2)",
     "get_settlement_request": "rereads a request under the chain-write lock right before its supersede or slash",
 }
+# The functions that open, hold or replace a conn's SubstrateInterface.
+SI_KEEPERS = {"connect", "connected", "substrate", "_call", "_live_conn", "_replace_dead_conn", "_on_rpc_timeout",
+              "_force_replace"}
+
+
+def by_function(source: str):
+    """Every node of ``source``, with its innermost enclosing function's name."""
+    def visit(node, function):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function = node.name
+        yield function, node
+        for child in ast.iter_child_nodes(node):
+            yield from visit(child, function)
+
+    return visit(ast.parse(source), None)
 
 
 def chain_calls(source: str) -> list[tuple[str, str | None, int]]:
     """(innermost enclosing function, ``conn=`` source or None, line) of every
     ``_call`` in ``source``."""
-    found = []
-
-    def visit(node, function):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            function = node.name
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_call":
-            conn = next((ast.unparse(k.value) for k in node.keywords if k.arg == "conn"), None)
-            found.append((function, conn, node.lineno))
-        for child in ast.iter_child_nodes(node):
-            visit(child, function)
-
-    visit(ast.parse(source), None)
-    return found
+    return [
+        (function, next((ast.unparse(k.value) for k in node.keywords if k.arg == "conn"), None), node.lineno)
+        for function, node in by_function(source)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_call"
+    ]
 
 
 def misrouted(source: str) -> list[tuple[str, str | None, int]]:
@@ -58,11 +67,14 @@ def misrouted(source: str) -> list[tuple[str, str | None, int]]:
 
 
 def raw_interface_uses(source: str) -> list[int]:
-    """Lines of ``source`` that reach ``client.substrate``, the write conn's
-    SubstrateInterface: a call on it runs on the write conn outside ``_call``."""
+    """Lines of ``source`` that reach a SubstrateInterface outside ``_call``:
+    ``client.substrate``, the write conn's, or a read of a conn's ``si``
+    outside SI_KEEPERS. A call on either runs outside ``_call``'s budget."""
     return [
-        node.lineno for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Attribute) and node.attr == "substrate"
+        node.lineno for function, node in by_function(source)
+        if isinstance(node, ast.Attribute)
+        and (node.attr == "substrate"
+             or (node.attr == "si" and isinstance(node.ctx, ast.Load) and function not in SI_KEEPERS))
     ]
 
 
@@ -79,7 +91,13 @@ def test_every_write_conn_function_still_makes_a_chain_call():
     assert sorted(WRITE_CONN_FUNCTIONS.keys() - functions) == []
 
 
-def test_no_module_reaches_the_raw_write_interface():
+def test_every_si_keeper_still_reads_an_interface():
+    readers = {function for source in daemon_sources().values() for function, node in by_function(source)
+               if isinstance(node, ast.Attribute) and node.attr == "si" and isinstance(node.ctx, ast.Load)}
+    assert sorted(SI_KEEPERS - readers) == []
+
+
+def test_no_module_reaches_an_interface_outside_the_bounded_call():
     assert {name: raw_interface_uses(source) for name, source in daemon_sources().items()
             if raw_interface_uses(source)} == {}
 
@@ -114,7 +132,21 @@ class Client:
         ("keepalive", "self._read"),
         ("nested", "self._write"),
     ]
-    assert raw_interface_uses("payload = encode(self.client.substrate, rows)\n") == [1]
+    assert raw_interface_uses('''
+payload = encode(self.client.substrate, rows)
+
+def __init__(self):
+    self.si = None
+
+def build(self, rows):
+    return encode(self.client._write.si, rows)
+
+def get_min_signer_threshold(self):
+    return self._write.si.query("IntentSettlement", "MinSignerThreshold")
+
+def _force_replace(self, conn):
+    old_si = conn.si
+''') == [2, 8, 11]
 
 
 def test_a_call_that_names_no_conn_is_refused():

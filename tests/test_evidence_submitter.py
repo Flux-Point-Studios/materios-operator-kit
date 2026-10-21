@@ -37,11 +37,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import logging
 import os
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -53,10 +52,11 @@ from daemon.evidence_submitter import (
     _build_arm_trustzone_payload_bytes,
     _build_evidence_payload_bytes,
     _classify_chain_error,
-    _content_hash_from_receipt_id_via_chain,
     _is_pallet_disabled_error,
     maybe_create_evidence_submitter,
 )
+from daemon.config import DaemonConfig
+from daemon.substrate_client import SubstrateClient
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +82,6 @@ def _run(coro):
 def _make_substrate_mock(
     *,
     receipts_query_value: dict | None = None,
-    encode_scale_return: bytes = b"\x04\x00",  # one-element vec, single 0-byte cert
     submit_success: bool = True,
     error_message: str | None = None,
     extrinsic_hash: str = "0x" + ("ee" * 32),
@@ -97,9 +96,6 @@ def _make_substrate_mock(
         }
     )
     si.query = MagicMock(return_value=receipts_result)
-
-    # encode_scale (Vec<Bytes> → SCALE bytes)
-    si.encode_scale = MagicMock(return_value=encode_scale_return)
 
     # compose_call → opaque object
     si.compose_call = MagicMock(return_value=MagicMock(name="composed_call"))
@@ -146,11 +142,6 @@ def _make_client_mock(substrate=None) -> MagicMock:
     client.submit_extrinsic = MagicMock(
         side_effect=lambda extrinsic, wait_for_inclusion=True: si.submit_extrinsic(
             extrinsic, wait_for_inclusion=wait_for_inclusion
-        )
-    )
-    client.encode_scale = MagicMock(
-        side_effect=lambda type_string, value: si.encode_scale(
-            type_string=type_string, value=value
         )
     )
 
@@ -265,64 +256,45 @@ def test_evidence_type_variant_map_pinned():
 # ---------------------------------------------------------------------------
 
 class TestBuildArmTrustZonePayload:
-    def test_valid_chain_calls_encode_scale(self):
-        substrate = _make_substrate_mock()
+    def test_valid_chain_encodes_as_scale_vec_of_byte_strings(self):
         payload = {
-            "cert_chain_b64": [_b64(b"\x01\x02"), _b64(b"\x03\x04\x05")],
+            "cert_chain_b64": [_b64(b"\x01\x02"), _b64(b"\x03\x04\x05"), _b64(bytes(64))],
             "device_model": "Pixel-X",
             "security_level": "StrongBox",
         }
-        out = _build_arm_trustzone_payload_bytes(substrate, payload)
-        # encode_scale was called with the decoded bytes list
-        substrate.encode_scale.assert_called_once()
-        kwargs = substrate.encode_scale.call_args.kwargs
-        assert kwargs["type_string"] == "Vec<Bytes>"
-        assert kwargs["value"] == [b"\x01\x02", b"\x03\x04\x05"]
-        # And we got bytes back (the mock returns bytes).
-        assert isinstance(out, bytes)
+        # Compact count 3 (0x0c), then each cert behind its compact length:
+        # 2 (0x08), 3 (0x0c), and 64, the first length past the one-byte
+        # mode, as 0x0101 little-endian.
+        assert _build_arm_trustzone_payload_bytes(payload) == (
+            b"\x0c" + b"\x08\x01\x02" + b"\x0c\x03\x04\x05" + b"\x01\x01" + bytes(64)
+        )
 
     def test_empty_chain_raises(self):
         with pytest.raises(ValueError, match="missing or empty"):
-            _build_arm_trustzone_payload_bytes(
-                _make_substrate_mock(), {"cert_chain_b64": []}
-            )
+            _build_arm_trustzone_payload_bytes({"cert_chain_b64": []})
 
     def test_missing_chain_raises(self):
         with pytest.raises(ValueError, match="missing or empty"):
-            _build_arm_trustzone_payload_bytes(
-                _make_substrate_mock(), {"device_model": "X"}
-            )
+            _build_arm_trustzone_payload_bytes({"device_model": "X"})
 
     def test_non_string_entry_raises(self):
         with pytest.raises(ValueError, match="must be a base64 string"):
-            _build_arm_trustzone_payload_bytes(
-                _make_substrate_mock(),
-                {"cert_chain_b64": [123]},
-            )
+            _build_arm_trustzone_payload_bytes({"cert_chain_b64": [123]})
 
     def test_bad_base64_raises(self):
         with pytest.raises(ValueError, match="not valid base64"):
-            _build_arm_trustzone_payload_bytes(
-                _make_substrate_mock(),
-                {"cert_chain_b64": ["@@not-valid-base64@@"]},
-            )
+            _build_arm_trustzone_payload_bytes({"cert_chain_b64": ["@@not-valid-base64@@"]})
 
 
 class TestBuildEvidencePayloadDispatch:
     def test_arm_trustzone_dispatches(self):
-        substrate = _make_substrate_mock()
-        out = _build_evidence_payload_bytes(
-            substrate,
-            "arm_trustzone",
-            {"cert_chain_b64": [_b64(b"\x01")]},
-        )
-        assert isinstance(out, bytes)
-        substrate.encode_scale.assert_called_once()
+        out = _build_evidence_payload_bytes("arm_trustzone", {"cert_chain_b64": [_b64(b"\x01")]})
+        assert out == b"\x04\x04\x01"
 
     def test_other_types_raise_not_implemented(self):
         for kind in ("amd_sev_snp", "intel_tdx", "reproducible_build", "zk_vm_execution"):
             with pytest.raises(NotImplementedError):
-                _build_evidence_payload_bytes(_make_substrate_mock(), kind, {})
+                _build_evidence_payload_bytes(kind, {})
 
 
 # ---------------------------------------------------------------------------
@@ -354,38 +326,45 @@ class TestIsPalletDisabledError:
 # content_hash resolver
 # ---------------------------------------------------------------------------
 
+def _content_hash_on_chain(substrate) -> bytes | None:
+    """``SubstrateClient.get_receipt_content_hash`` over ``substrate``."""
+    client = SubstrateClient(DaemonConfig(rpc_url="ws://test-rpc:9944"))
+    client.substrate = substrate
+    return client.get_receipt_content_hash(RECEIPT_ID_HEX)
+
+
 class TestContentHashResolver:
     def test_returns_bytes_from_list(self):
         substrate = _make_substrate_mock(
             receipts_query_value={"content_hash": list(CONTENT_HASH_BYTES)}
         )
-        out = _content_hash_from_receipt_id_via_chain(substrate, RECEIPT_ID_HEX)
+        out = _content_hash_on_chain(substrate)
         assert out == CONTENT_HASH_BYTES
 
     def test_returns_bytes_from_hex_string(self):
         substrate = _make_substrate_mock(
             receipts_query_value={"content_hash": "0x" + CONTENT_HASH_BYTES.hex()}
         )
-        out = _content_hash_from_receipt_id_via_chain(substrate, RECEIPT_ID_HEX)
+        out = _content_hash_on_chain(substrate)
         assert out == CONTENT_HASH_BYTES
 
     def test_returns_bytes_from_raw_bytes(self):
         substrate = _make_substrate_mock(
             receipts_query_value={"content_hash": CONTENT_HASH_BYTES}
         )
-        out = _content_hash_from_receipt_id_via_chain(substrate, RECEIPT_ID_HEX)
+        out = _content_hash_on_chain(substrate)
         assert out == CONTENT_HASH_BYTES
 
     def test_returns_none_on_missing_receipt(self):
         substrate = _make_substrate_mock()
         substrate.query = MagicMock(return_value=SimpleNamespace(value=None))
-        out = _content_hash_from_receipt_id_via_chain(substrate, RECEIPT_ID_HEX)
+        out = _content_hash_on_chain(substrate)
         assert out is None
 
     def test_returns_none_on_query_exception(self):
         substrate = _make_substrate_mock()
         substrate.query = MagicMock(side_effect=RuntimeError("rpc down"))
-        out = _content_hash_from_receipt_id_via_chain(substrate, RECEIPT_ID_HEX)
+        out = _content_hash_on_chain(substrate)
         assert out is None
 
 
@@ -682,8 +661,6 @@ def test_tick_clamps_cursor_to_first_unacked_id():
     sub.fetch_pending = AsyncMock(return_value=(rows_in, 12))
 
     # Stub submit_one so row 10 returns None (transient miss), 11 + 12 succeed.
-    real_submit_one = sub.submit_one
-
     async def fake_submit_one(row):
         rid = int(row["id"])
         if rid == 10:
@@ -906,7 +883,7 @@ def test_payload_size_precheck_marks_row_terminal(monkeypatch):
     # actually invoking the SCALE encoder.
     monkeypatch.setattr(
         "daemon.evidence_submitter._build_evidence_payload_bytes",
-        lambda _s, _t, _p: big_bytes,
+        lambda _t, _p: big_bytes,
     )
 
     client = _make_client_mock(substrate)
@@ -934,7 +911,7 @@ def test_payload_at_exact_cap_is_allowed(monkeypatch):
     substrate = _make_substrate_mock()
     monkeypatch.setattr(
         "daemon.evidence_submitter._build_evidence_payload_bytes",
-        lambda _s, _t, _p: cap_bytes,
+        lambda _t, _p: cap_bytes,
     )
 
     client = _make_client_mock(substrate)

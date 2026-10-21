@@ -7,7 +7,8 @@ the committee, each receipt's recorded attesters and certification, and spec
 "Transaction call is not expected", a spent nonce as 1010 "Transaction is
 outdated"). Its live state is the best block's; ``head`` freezes that state
 under a block hash a read can pin. ``FakeSI`` is one websocket onto it, whose
-death the test scripts.
+death the test scripts. ``IncludingSI`` is one websocket onto a node that
+includes every submit, returning substrate-interface's own lazy results.
 """
 import errno
 import hashlib
@@ -16,6 +17,7 @@ import threading
 from types import SimpleNamespace
 
 import websocket._socket
+from substrateinterface.base import ExtrinsicReceipt, QueryMapResult
 from substrateinterface.exceptions import SubstrateRequestException
 from substrateinterface.utils.ss58 import ss58_encode
 from websocket import WebSocketTimeoutException
@@ -233,6 +235,94 @@ class FakeSI:
             "module_id": "OrinqReceipts", "event_id": "ReceiptSubmitted",
             "attributes": {"receipt_id": rid, "content_hash": RECEIPT_FIELD, "submitter": ""},
         }) for rid in self.ledger.blocks.get(int(block_hash, 16), [])]
+
+
+EXTRINSIC_HASH = "0x" + "5e" * 32
+INCLUSION_BLOCK = "0x" + "b1" * 32
+CONTENT_HASH = bytes(range(32))
+
+
+class IncludingSI:
+    """One websocket onto a node that includes every submit at once.
+
+    A submit returns substrate-interface's ``ExtrinsicReceipt``, which reads
+    its block and events through this interface the first time its outcome is
+    asked for. ``query_map`` returns its ``QueryMapResult`` over ``map_rows``,
+    two rows a page, which reads each further page through this interface as
+    iteration reaches it. ``calls`` records every call as (name, thread name,
+    whether ``lock`` is held). A call named in ``stalls`` first waits for that
+    event, once."""
+
+    chain = "Materios Fake"
+    metadata = None
+
+    def __init__(self):
+        self.lock = None
+        self.calls: list[tuple[str, str, bool]] = []
+        self.stalls: dict[str, threading.Event] = {}
+        self.map_rows = [[f"0x{index:02x}", index] for index in range(3)]
+
+    def _use(self, name: str) -> None:
+        self.calls.append((name, threading.current_thread().name, self.lock is not None and self.lock.locked()))
+        stall = self.stalls.pop(name, None)
+        if stall is not None:
+            stall.wait(5)
+
+    def names(self) -> list[str]:
+        return [name for name, _, _ in self.calls]
+
+    def implements_scaleinfo(self) -> bool:
+        return True
+
+    def query(self, module, storage_function, params=None, block_hash=None):
+        self._use("query")
+        return SimpleNamespace(value={"content_hash": "0x" + CONTENT_HASH.hex()})
+
+    def query_map(self, module, storage_function, params=None, block_hash=None, start_key=None,
+                  page_size=2, max_results=None, ignore_decoding_errors=True):
+        self._use("query_map")
+        keys = [key for key, _ in self.map_rows]
+        start = keys.index(start_key) + 1 if start_key else 0
+        page = self.map_rows[start:start + page_size]
+        return QueryMapResult(records=page, page_size=page_size, module=module, storage_function=storage_function,
+                              params=params, block_hash=block_hash, substrate=self,
+                              last_key=page[-1][0] if page else None)
+
+    def compose_call(self, call_module, call_function, call_params):
+        self._use("compose_call")
+        return SimpleNamespace(module=call_module, function=call_function, params=call_params)
+
+    def create_signed_extrinsic(self, call, keypair):
+        self._use("create_signed_extrinsic")
+        return SimpleNamespace(call=call, signer=keypair.public_key)
+
+    def submit_extrinsic(self, extrinsic, wait_for_inclusion=False):
+        self._use("submit_extrinsic")
+        return ExtrinsicReceipt(substrate=self, extrinsic_hash=EXTRINSIC_HASH, block_hash=INCLUSION_BLOCK)
+
+    def get_block(self, block_hash=None):
+        self._use("get_block")
+        return {"extrinsics": [SimpleNamespace(extrinsic_hash=bytes.fromhex(EXTRINSIC_HASH[2:]))]}
+
+    def get_events(self, block_hash=None):
+        self._use("get_events")
+        return [SimpleNamespace(extrinsic_idx=0, value={
+            "module_id": "System", "event_id": "ExtrinsicSuccess", "attributes": {"dispatch_info": {"weight": 0}},
+        })]
+
+
+def including_client(budget: float = 30.0):
+    """A ``SubstrateClient`` whose conns are ``IncludingSI``s, with that RPC
+    budget, and those (write, read) interfaces."""
+    opened = []
+
+    def connect():
+        opened.append(IncludingSI())
+        return opened[-1]
+
+    client = dialling_client(connect)
+    client._rpc_timeout_secs = budget
+    return client, *opened
 
 
 def fake_endpoint(ledger: FakeChain, idle_limit: float | None = None):

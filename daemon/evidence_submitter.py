@@ -59,6 +59,7 @@ import time
 from typing import Any, Literal, Optional
 
 import aiohttp
+from scalecodec.base import RuntimeConfigurationObject
 
 logger = logging.getLogger(__name__)
 
@@ -151,62 +152,7 @@ EVIDENCE_TYPE_TO_PALLET_VARIANT: dict[str, str] = {
 }
 
 
-def _hex_to_h256_bytes(hex_str: str) -> list[int]:
-    """Convert a 64-hex string (with or without 0x prefix) to a list of 32
-    integers — substrate-interface's expected wire form for `[u8; 32]`."""
-    s = hex_str.lower()
-    if s.startswith("0x"):
-        s = s[2:]
-    if len(s) != 64:
-        raise ValueError(f"expected 64 hex chars, got {len(s)}: {hex_str[:16]}…")
-    raw = bytes.fromhex(s)
-    return list(raw)
-
-
-def _content_hash_from_receipt_id_via_chain(
-    substrate: Any, receipt_id_hex: str
-) -> Optional[bytes]:
-    """Resolve a 64-hex `receipt_id` back to the receipt's `content_hash` by
-    reading `OrinqReceipts.Receipts(receipt_id)` from chain.
-
-    Returns the 32-byte content_hash on success; None if the receipt isn't
-    on chain yet (the daemon should wait + retry next tick).
-
-    Why we need this: the pallet's `submit_evidence(receipt_id, content_hash,
-    entry)` requires both. The gateway's pending row carries `receipt_id`
-    only; the canonical relation is `receipt_id == sha256(content_hash)`,
-    so we recover content_hash from the on-chain Receipt struct (NOT by
-    re-deriving — that's not invertible).
-    """
-    try:
-        rid = receipt_id_hex if receipt_id_hex.startswith("0x") else "0x" + receipt_id_hex
-        result = substrate.query(
-            module="OrinqReceipts", storage_function="Receipts", params=[rid]
-        )
-        if result is None or result.value is None:
-            return None
-        ch = result.value.get("content_hash")
-        if ch is None:
-            return None
-        if isinstance(ch, str):
-            s = ch[2:] if ch.startswith("0x") else ch
-            return bytes.fromhex(s)
-        if isinstance(ch, (list, tuple)):
-            return bytes(ch)
-        if isinstance(ch, (bytes, bytearray)):
-            return bytes(ch)
-        return None
-    except Exception as e:  # noqa: BLE001 — broad catch is intentional
-        logger.warning(
-            f"Failed to resolve content_hash for receipt_id={receipt_id_hex[:16]}…: "
-            f"{type(e).__name__}: {e}"
-        )
-        return None
-
-
-def _build_arm_trustzone_payload_bytes(
-    client: Any, payload: dict
-) -> bytes:
+def _build_arm_trustzone_payload_bytes(payload: dict) -> bytes:
     """Translate the gateway's `arm_trustzone` payload shape into the
     SCALE-encoded `Vec<Vec<u8>>` byte string the pallet expects.
 
@@ -222,7 +168,8 @@ def _build_arm_trustzone_payload_bytes(
         chain order (root → leaf).
 
     Implementation: base64-decode each entry, then SCALE-encode the resulting
-    list via the client's `encode_scale("Vec<Bytes>", ...)`.
+    list as `Vec<Bytes>`. That encoding is fixed by the type, the same under
+    every runtime, so it reads nothing from the chain.
     """
     chain = payload.get("cert_chain_b64")
     if not isinstance(chain, list) or len(chain) == 0:
@@ -241,31 +188,19 @@ def _build_arm_trustzone_payload_bytes(
             raise ValueError(
                 f"arm_trustzone cert_chain_b64[{i}] is not valid base64: {e}"
             ) from e
-    # `Vec<Bytes>` is the substrate-interface alias for `Vec<Vec<u8>>` — each
-    # inner `Bytes` is a length-prefixed byte string.
-    encoded = client.encode_scale(type_string="Vec<Bytes>", value=der_certs)
-    if hasattr(encoded, "data"):
-        # Older substrate-interface returned a `ScaleBytes`; .data is the raw
-        # bytestring without the leading length prefix expected by encode.
-        return bytes(encoded.data)
-    if isinstance(encoded, (bytes, bytearray)):
-        return bytes(encoded)
-    # Newer versions return a hex string with leading '0x'.
-    s = str(encoded)
-    if s.startswith("0x"):
-        return bytes.fromhex(s[2:])
-    return bytes.fromhex(s)
+    # `Vec<Bytes>` is scalecodec's name for `Vec<Vec<u8>>`: a compact count,
+    # then each inner byte string behind its compact length.
+    encoded = RuntimeConfigurationObject().create_scale_object("Vec<Bytes>").encode(der_certs)
+    return bytes(encoded.data)
 
 
-def _build_evidence_payload_bytes(
-    client: Any, evidence_type: str, payload: dict
-) -> bytes:
+def _build_evidence_payload_bytes(evidence_type: str, payload: dict) -> bytes:
     """Dispatch to the per-evidence-type payload builder. Only `arm_trustzone`
     is implemented in Phase 2 (the only fully-supported variant). Other
     types raise NotImplementedError — the caller logs WARN and skips ack.
     """
     if evidence_type == "arm_trustzone":
-        return _build_arm_trustzone_payload_bytes(client, payload)
+        return _build_arm_trustzone_payload_bytes(payload)
     raise NotImplementedError(
         f"evidence_type {evidence_type!r} payload assembly is Phase 3+ — "
         f"verifier in pallet returns NotImplemented for this variant. Skipping."
@@ -636,14 +571,12 @@ class EvidenceSubmitter:
             )
             return None
 
-        # 2. Translate gateway payload → pallet payload bytes. Both
-        # NotImplementedError and shape-validation ValueError are TERMINAL —
-        # the gateway row's bytes won't morph into something the pallet
-        # accepts on retry, so record the local skip-bit.
+        # 2. Translate gateway payload → pallet payload bytes. Assembly reads
+        # nothing from the chain, so whatever it raises comes from the row's
+        # own bytes: TERMINAL. The gateway row's bytes won't morph into
+        # something the pallet accepts on retry, so record the local skip-bit.
         try:
-            payload_bytes = _build_evidence_payload_bytes(
-                self.client, evidence_type, payload
-            )
+            payload_bytes = _build_evidence_payload_bytes(evidence_type, payload)
         except NotImplementedError as e:
             logger.warning(
                 f"evidence_submitter: row {row_id} {evidence_type} unsupported: {e}"

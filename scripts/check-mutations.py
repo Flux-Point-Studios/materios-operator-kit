@@ -122,7 +122,8 @@ TRANSPORT_TESTS = ['tests/test_dead_write_conn.py', 'tests/test_receipt_rpc_retr
                    'tests/test_write_conn_keepalive.py', 'tests/test_substrate_client_ws_retry.py',
                    'daemon/tests/test_read_write_ws_split.py', 'tests/test_attest_refusal_verdict.py',
                    'tests/test_deferred_receipt_restart.py', 'tests/test_reads_off_the_write_conn.py',
-                   'tests/test_conn_routing.py']
+                   'tests/test_conn_routing.py', 'tests/test_lazy_results_read_inside_the_call.py',
+                   'tests/test_evidence_rows_outlive_rpc_timeouts.py']
 TRANSPORT_MUTANTS = [
     ('transport-branch-deleted', 'daemon/substrate_client.py', '                if not is_transport_dead(error):\n                    raise\n                self._replace_dead_conn', '                raise\n                self._replace_dead_conn'),
     ('transport-set-broken-pipe-only', 'daemon/substrate_client.py', 'TRANSPORT_DEAD_ERRORS = (\n    BrokenPipeError,\n    ConnectionResetError,\n    ConnectionAbortedError,\n    WebSocketConnectionClosedException,\n    WebSocketTimeoutException,\n    ssl.SSLEOFError,\n)', 'TRANSPORT_DEAD_ERRORS = (BrokenPipeError,)'),
@@ -169,11 +170,15 @@ TRANSPORT_MUTANTS = [
     ('settlement-listing-on-the-write-conn', 'daemon/substrate_client.py', 'storage_function="ClaimSettlementRequests",\n            conn=self._read,', 'storage_function="ClaimSettlementRequests",\n            conn=self._write,'),
     ('locked-reread-on-the-read-conn', 'daemon/substrate_client.py', 'params=["0x" + claim_id.hex()],\n            conn=self._write,', 'params=["0x" + claim_id.hex()],\n            conn=self._read,'),
     ('keepalive-on-the-read-conn', 'daemon/substrate_client.py', '"system_health", [], conn=self._write)', '"system_health", [], conn=self._read)'),
-    ('evidence-encodes-on-the-raw-write-conn', 'daemon/evidence_submitter.py', '                self.client, evidence_type, payload\n', '                self.client.substrate, evidence_type, payload\n'),
+    ('outcome-read-after-the-call', 'daemon/substrate_client.py', '                if isinstance(result, ExtrinsicReceipt):\n                    result.process_events()\n', '                if False:\n                    pass\n'),
+    ('map-pages-read-after-the-call', 'daemon/substrate_client.py', '                    result = list(result)\n', '                    pass\n'),
+    ('evidence-assembly-reads-the-chain', 'daemon/evidence_submitter.py', 'payload_bytes = _build_evidence_payload_bytes(evidence_type, payload)', 'payload_bytes = self.client.rpc("chain_getHead", []) and _build_evidence_payload_bytes(evidence_type, payload)'),
+    ('evidence-submit-timeout-drops-the-row', 'daemon/evidence_submitter.py', '                    f"{type(e).__name__}: {e}"\n                )\n                return None\n\n        if not getattr(receipt, "is_success", False):', '                    f"{type(e).__name__}: {e}"\n                )\n                self._record_failed_row(row_id, "VerificationFailed", receipt_id=receipt_id_hex, evidence_type=evidence_type)\n                return None\n\n        if not getattr(receipt, "is_success", False):'),
     ('conn-defaults-to-write-again', 'daemon/substrate_client.py', '*args, conn: "_WsConn", **kwargs) -> Any:\n', '*args, conn: "_WsConn" = None, **kwargs) -> Any:\n        conn = conn or self._write\n'),
     ('guard-disabled', 'tests/test_conn_routing.py', '        if conn != ("self._write" if function in WRITE_CONN_FUNCTIONS else "self._read")\n', '        if False\n'),
     ('guard-takes-either-conn', 'tests/test_conn_routing.py', '        if conn != ("self._write" if function in WRITE_CONN_FUNCTIONS else "self._read")\n', '        if conn not in ("self._write", "self._read")\n'),
-    ('guard-blind-to-raw-interface', 'tests/test_conn_routing.py', 'if isinstance(node, ast.Attribute) and node.attr == "substrate"', 'if False'),
+    ('guard-blind-to-raw-interface', 'tests/test_conn_routing.py', '        and (node.attr == "substrate"\n', '        and (False\n'),
+    ('guard-blind-to-raw-si', 'tests/test_conn_routing.py', '             or (node.attr == "si" and isinstance(node.ctx, ast.Load) and function not in SI_KEEPERS))\n', '             or False)\n'),
     ('recheck-ignores-claimed-hash', 'daemon/cert_daemon.py', 'self.client.attestation_on_chain, receipt_id, pending.cert_hash', 'self.client.attestation_on_chain, receipt_id, None'),
     ('recheck-refusal-counted-done', 'daemon/cert_daemon.py', '                    elif settled:\n', '                    elif True:\n'),
     ('recheck-done-not-counted', 'daemon/cert_daemon.py', 'skipped: already on chain")\n                        health_server.increment_metric("certs_already_on_chain_total")\n', 'skipped: already on chain")\n'),
