@@ -204,6 +204,14 @@ and each install must use a different `--label`. See
 a full walkthrough, edge cases (health-port collision, faucet drip behaviour,
 macOS `realpath` caveat), and the manual smoke-test procedure.
 
+## Cardano checkpointing
+
+FPS runs the one daemon that anchors certified receipts to Cardano, with
+`CHECKPOINT_ENABLED=true`. The kit's compose file and `install.sh` set it to
+`"false"` for external attestors. The flush triggers, wall-clock-aligned
+flushes (`CHECKPOINT_ALIGN_SECONDS`) and the submission cut-off for an aligned
+anchor are described in [docs/CHECKPOINT_ANCHORING.md](docs/CHECKPOINT_ANCHORING.md).
+
 ## Updating
 
 Pull the latest image and restart:

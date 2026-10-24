@@ -42,6 +42,7 @@ class DaemonConfig:
     poll_interval_fast: int = 3  # seconds, when pending work exists
     poll_interval_idle: int = 12  # seconds, when idle
     max_leaf_wait_seconds: int = 90  # flush if oldest leaf pending > this
+    checkpoint_align_seconds: int = 0  # >0: interval trigger at UTC multiples of this, CHECKPOINT_INTERVAL ignored
     notify_token: str = ""  # X-Internal-Token for push-notify auth
     # Content validation (cv_ prefix)
     content_validation_enabled: bool = False
@@ -101,6 +102,7 @@ class DaemonConfig:
             poll_interval_fast=int(os.environ.get("POLL_INTERVAL_FAST", cls.poll_interval_fast)),
             poll_interval_idle=int(os.environ.get("POLL_INTERVAL_IDLE", cls.poll_interval_idle)),
             max_leaf_wait_seconds=int(os.environ.get("MAX_LEAF_WAIT_SECONDS", cls.max_leaf_wait_seconds)),
+            checkpoint_align_seconds=int(os.environ.get("CHECKPOINT_ALIGN_SECONDS", cls.checkpoint_align_seconds)),
             notify_token=os.environ.get("NOTIFY_TOKEN", cls.notify_token),
             content_validation_enabled=os.environ.get("CONTENT_VALIDATION_ENABLED", "false").lower() in ("true", "1", "yes"),
             cv_min_duration=float(os.environ.get("CV_MIN_DURATION", cls.cv_min_duration)),
