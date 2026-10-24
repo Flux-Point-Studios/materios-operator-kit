@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run targeted safety mutants in isolated copies of the test suite: slash
-signing, and the attest path's recovery from dead RPC sockets. Each suite runs
-only its own tests, and first proves they pass unmutated in that same layout."""
+signing, the attest path's recovery from dead RPC sockets, and the checkpoint
+flush schedule. Each suite runs only its own tests, and first proves they pass
+unmutated in that same layout."""
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -233,7 +234,27 @@ TRANSPORT_MUTANTS = [
     ('keepalive-never-started', 'daemon/cert_daemon.py', '        keepalive = asyncio.create_task(self._keep_write_conn_alive())\n', '        keepalive = asyncio.create_task(asyncio.Event().wait())\n'),
     ('keepalive-outlives-the-daemon', 'daemon/cert_daemon.py', '        keepalive.cancel()\n', ''),
 ]
-SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS)]
+CHECKPOINT_TESTS = ['tests/test_checkpoint_alignment.py']
+CHECKPOINT_MUTANTS = [
+    ('alignment-on-by-default', 'daemon/config.py', 'checkpoint_align_seconds: int = 0', 'checkpoint_align_seconds: int = 3600'),
+    ('alignment-env-ignored', 'daemon/config.py', 'int(os.environ.get("CHECKPOINT_ALIGN_SECONDS", cls.checkpoint_align_seconds))', 'cls.checkpoint_align_seconds'),
+    ('boundary-never-due', 'daemon/checkpoint.py', 'time.time() // self.align_seconds > self.last_sweep_time // self.align_seconds', 'False'),
+    ('boundary-due-every-tick', 'daemon/checkpoint.py', 'time.time() // self.align_seconds > self.last_sweep_time // self.align_seconds', 'time.time() // self.align_seconds >= self.last_sweep_time // self.align_seconds'),
+    ('boundary-counted-from-the-last-anchor', 'daemon/checkpoint.py', 'self.last_sweep_time // self.align_seconds', 'self.last_flush_time // self.align_seconds'),
+    ('interval-runs-when-aligned', 'daemon/checkpoint.py', 'if self.align_seconds > 0 or self.interval_minutes <= 0:', 'if self.interval_minutes <= 0:'),
+    ('size-trigger-off-when-aligned', 'daemon/checkpoint.py', '        # Batch size trigger\n', '        if self.align_seconds > 0:\n            return False\n        # Batch size trigger\n'),
+    ('age-trigger-off-when-aligned', 'daemon/checkpoint.py', '        # Oldest leaf age trigger\n', '        if self.align_seconds > 0:\n            return False\n        # Oldest leaf age trigger\n'),
+    ('empty-boundary-not-swept', 'daemon/checkpoint.py', '        if not self.pending_leaves:\n            self._swept(started)\n', '        if not self.pending_leaves:\n'),
+    ('unconfirmed-boundary-not-swept', 'daemon/checkpoint.py', '            self._swept(started)\n            return True  # nothing confirmed enough yet\n', '            return True  # nothing confirmed enough yet\n'),
+    ('failed-flush-sweeps', 'daemon/checkpoint.py', 'started = time.time()', 'started = self.last_sweep_time = time.time()'),
+    ('sweep-stamped-when-the-worker-answers', 'daemon/checkpoint.py', '            self.last_sweep_time = started\n', '            self.last_sweep_time = time.time()\n'),
+    ('sweep-not-persisted', 'daemon/checkpoint.py', '                        "last_sweep_time": self.last_sweep_time,\n', ''),
+    ('sweep-not-restored', 'daemon/checkpoint.py', 'self.last_sweep_time = state.get("last_sweep_time", 0.0)', 'self.last_sweep_time = 0.0'),
+    ('missed-boundary-not-caught-up', 'daemon/checkpoint.py', 'self.last_sweep_time = state.get("last_sweep_time", 0.0)', 'self.last_sweep_time = time.time()'),
+    ('age-backstop-never-flagged', 'daemon/checkpoint.py', 'if self.align_seconds > 0 and config.max_leaf_wait_seconds <= self.align_seconds:', 'if False:'),
+    ('equal-age-backstop-not-flagged', 'daemon/checkpoint.py', 'config.max_leaf_wait_seconds <= self.align_seconds', 'config.max_leaf_wait_seconds < self.align_seconds'),
+]
+SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS), (CHECKPOINT_TESTS, CHECKPOINT_MUTANTS)]
 
 
 def in_copy(tests, filename=None, before=None, after=None):

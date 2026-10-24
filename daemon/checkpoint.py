@@ -6,8 +6,14 @@ context-bound leaves, and submits the root to Cardano via the anchor worker.
 Leaf binding prevents replay/mixing:
     leaf_i = SHA256(b"materios-checkpoint-v1" || chain_id || receipt_id || cert_hash)
 
-Crash-proof: pending leaves and last checkpoint block are persisted to a
-JSON state file on PVC so nothing is lost across daemon restarts.
+Crash-proof: pending leaves, last checkpoint block and the last sweep are
+persisted to a JSON state file on PVC so nothing is lost across daemon restarts.
+
+With CHECKPOINT_ALIGN_SECONDS=N the time trigger is a UTC wall-clock boundary,
+a multiple of N seconds, passed since the last sweep: the start of the last
+flush that left no confirmed leaf pending. A flush with nothing to anchor is a
+sweep too, so an empty or unconfirmed boundary makes no anchor and a leaf added
+after it waits for the next boundary.
 """
 
 import hashlib
@@ -88,10 +94,12 @@ class CardanoCheckpointer:
         self.config = config
         self.batch_size = config.checkpoint_batch_size
         self.interval_minutes = config.checkpoint_interval
+        self.align_seconds = config.checkpoint_align_seconds
         self.state_file = state_file
         self.pending_leaves: list[dict] = []
         self.last_checkpointed_block: int = 0
         self.last_flush_time: float = 0.0
+        self.last_sweep_time: float = 0.0
         # Derive Keypair ONCE at startup. Used for:
         #   1. submitter_address — published in batch_metadata (NEVER include the
         #      raw signer_uri, which may be a BIP39 mnemonic; anchor worker
@@ -103,6 +111,12 @@ class CardanoCheckpointer:
         self.keypair: Keypair = Keypair.create_from_uri(config.signer_uri)
         self.submitter_address: str = self.keypair.ss58_address
         self._load_state()
+        if self.align_seconds > 0 and config.max_leaf_wait_seconds <= self.align_seconds:
+            logger.warning(
+                f"CHECKPOINT_ALIGN_SECONDS={self.align_seconds} but MAX_LEAF_WAIT_SECONDS="
+                f"{config.max_leaf_wait_seconds} is not above it: the age trigger will "
+                f"flush between boundaries"
+            )
 
     def _load_state(self):
         """Restore pending list + last checkpoint block from PVC."""
@@ -113,6 +127,7 @@ class CardanoCheckpointer:
                 self.pending_leaves = state.get("pending_leaves", [])
                 self.last_checkpointed_block = state.get("last_checkpointed_block", 0)
                 self.last_flush_time = state.get("last_flush_time", 0.0)
+                self.last_sweep_time = state.get("last_sweep_time", 0.0)
                 # Task #116: an M-of-N committee emits one AvailabilityCertified
                 # event per signer for the same (receipt_id, cert_hash). Earlier
                 # versions of add_cert appended every event, inflating the leaf
@@ -165,6 +180,7 @@ class CardanoCheckpointer:
                         "pending_leaves": self.pending_leaves,
                         "last_checkpointed_block": self.last_checkpointed_block,
                         "last_flush_time": self.last_flush_time,
+                        "last_sweep_time": self.last_sweep_time,
                     },
                     f,
                 )
@@ -209,7 +225,13 @@ class CardanoCheckpointer:
         )
 
     def should_flush(self) -> bool:
-        """Check if a flush is due (time, batch-size, or leaf-age trigger)."""
+        """Check if a flush is due (time, batch-size, or leaf-age trigger).
+
+        With alignment on, the time trigger is a boundary passed since the last
+        sweep, and it fires with nothing pending so that flush() sweeps it.
+        """
+        if self.align_seconds > 0 and time.time() // self.align_seconds > self.last_sweep_time // self.align_seconds:
+            return True
         if not self.pending_leaves:
             return False
         # Batch size trigger
@@ -222,7 +244,7 @@ class CardanoCheckpointer:
         if time.time() - oldest_ts > self.config.max_leaf_wait_seconds:
             return True
         # Time-based trigger
-        if self.interval_minutes <= 0:
+        if self.align_seconds > 0 or self.interval_minutes <= 0:
             return False
         elapsed = (time.time() - self.last_flush_time) / 60.0
         return elapsed >= self.interval_minutes
@@ -239,9 +261,12 @@ class CardanoCheckpointer:
         leaves to Cardano L1, which is unrecoverable.
 
         Only includes leaves confirmed by at least `finality_confirmations` blocks.
-        Returns True if checkpoint was submitted successfully.
+        Returns True if checkpoint was submitted successfully, or if no confirmed
+        leaf was pending; either way the flush is a sweep.
         """
+        started = time.time()
         if not self.pending_leaves:
+            self._swept(started)
             return True
 
         if not self.config.cardano_anchor_url:
@@ -267,6 +292,7 @@ class CardanoCheckpointer:
                 f"Checkpoint: no leaves confirmed yet "
                 f"(cutoff={confirmed_cutoff}, best={current_best_block})"
             )
+            self._swept(started)
             return True  # nothing confirmed enough yet
 
         chain_id_bytes = bytes.fromhex(chain_id_norm)
@@ -352,6 +378,7 @@ class CardanoCheckpointer:
 
             self.last_checkpointed_block = to_block
             self.last_flush_time = time.time()
+            self.last_sweep_time = started
             # Remove only the eligible leaves; keep unconfirmed ones
             self.pending_leaves = [l for l in self.pending_leaves if l["block_num"] > confirmed_cutoff]
             self._save_state()
@@ -363,6 +390,10 @@ class CardanoCheckpointer:
             logger.error("Checkpoint submission failed — will retry on next flush")
 
         return anchor_response is not None
+
+    def _swept(self, started: float):
+        self.last_sweep_time = started
+        self._save_state()
 
     def _save_batch_history(
         self,

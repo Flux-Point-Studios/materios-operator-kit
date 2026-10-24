@@ -47,7 +47,7 @@
     {
       "id": "checkpoint-anchoring",
       "name": "Checkpoint anchoring",
-      "desc": "Batches certified receipts into a Merkle root on a size, age or interval trigger and posts it to the anchor worker; keyed only on the AvailabilityCertified event, so it is source-agnostic.",
+      "desc": "Batches certified receipts into a Merkle root on a size, age or interval trigger and posts it to the anchor worker; keyed only on the AvailabilityCertified event, so it is source-agnostic. CHECKPOINT_ALIGN_SECONDS replaces the interval with UTC wall-clock boundaries, each flushed at the first poll tick after it with no drift; an empty or unconfirmed boundary makes no anchor, a persisted sweep time keeps a restart from repeating or skipping one, and the size and age triggers still fire between boundaries.",
       "kind": "pipeline",
       "paths": [
         "daemon/checkpoint.py",
