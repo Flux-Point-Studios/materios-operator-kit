@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run targeted safety mutants in isolated copies of the test suite: slash
-signing, the attest path's recovery from dead RPC sockets, and the checkpoint
-flush schedule. Each suite runs only its own tests, and first proves they pass
+signing, the attest path's recovery from dead RPC sockets, the checkpoint
+flush schedule, and the evidence submitter's handling of pallet refusals. Each suite runs only its own tests, and first proves they pass
 unmutated in that same layout."""
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -254,7 +254,26 @@ CHECKPOINT_MUTANTS = [
     ('age-backstop-never-flagged', 'daemon/checkpoint.py', 'if self.align_seconds > 0 and config.max_leaf_wait_seconds <= self.align_seconds:', 'if False:'),
     ('equal-age-backstop-not-flagged', 'daemon/checkpoint.py', 'config.max_leaf_wait_seconds <= self.align_seconds', 'config.max_leaf_wait_seconds < self.align_seconds'),
 ]
-SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS), (CHECKPOINT_TESTS, CHECKPOINT_MUTANTS)]
+EVIDENCE_TESTS = ['tests/test_evidence_submitter.py']
+EVIDENCE_MUTANTS = [
+    ('duplicate-evidence-retried', 'daemon/evidence_submitter.py', '    "DuplicateEvidence",\n', ''),
+    ('content-hash-mismatch-retried', 'daemon/evidence_submitter.py', '    "ContentHashMismatch",\n', ''),
+    ('unauthorized-submitter-retried', 'daemon/evidence_submitter.py', '    "UnauthorizedSubmitter",\n', ''),
+    ('evidence-type-full-retried', 'daemon/evidence_submitter.py', '    "EvidenceTypeFull",\n', ''),
+    ('reason-read-from-the-docs', 'daemon/evidence_submitter.py', 'str(err.get("name") or "") if isinstance(err, dict) else str(err)', 'str(err)'),
+    ('duplicate-acked-with-the-refused-hash', 'daemon/evidence_submitter.py', 'f"dispatch that stored it, which this daemon does not hold"\n                )\n', 'f"dispatch that stored it, which this daemon does not hold"\n                )\n                return receipt.extrinsic_hash\n'),
+    ('unauthorized-not-an-error', 'daemon/evidence_submitter.py', '                logger.error(\n                    f"evidence_submitter: row {row_id} refused: this daemon', '                logger.warning(\n                    f"evidence_submitter: row {row_id} refused: this daemon'),
+    ('unknown-receipt-retried-forever', 'daemon/evidence_submitter.py', 'if refusals <= MAX_UNKNOWN_RECEIPT_RETRIES:', 'if True:'),
+    ('unknown-receipt-terminal-at-once', 'daemon/evidence_submitter.py', 'if refusals <= MAX_UNKNOWN_RECEIPT_RETRIES:', 'if False:'),
+    ('unknown-receipt-one-retry-short', 'daemon/evidence_submitter.py', 'if refusals <= MAX_UNKNOWN_RECEIPT_RETRIES:', 'if refusals < MAX_UNKNOWN_RECEIPT_RETRIES:'),
+    ('unknown-receipt-refusals-not-counted', 'daemon/evidence_submitter.py', '                    self._unknown_receipt_refusals[row_id] = refusals\n', ''),
+    ('unknown-receipt-refusals-shared-across-rows', 'daemon/evidence_submitter.py', 'self._unknown_receipt_refusals.get(row_id, 0) + 1', 'sum(self._unknown_receipt_refusals.values()) + 1'),
+    ('unknown-receipt-refusals-outlive-the-landing', 'daemon/evidence_submitter.py', '        self._unknown_receipt_refusals.pop(row_id, None)\n\n', '\n'),
+    ('landed-row-resubmitted', 'daemon/evidence_submitter.py', '            ext_hash = self._unacked_landings.pop(row_id, None)\n', '            ext_hash = None\n'),
+    ('landing-forgotten-on-a-failed-ack', 'daemon/evidence_submitter.py', '                    self._unacked_landings[row_id] = ext_hash\n', '                    pass\n'),
+]
+SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS), (CHECKPOINT_TESTS, CHECKPOINT_MUTANTS),
+          (EVIDENCE_TESTS, EVIDENCE_MUTANTS)]
 
 
 def in_copy(tests, filename=None, before=None, after=None):

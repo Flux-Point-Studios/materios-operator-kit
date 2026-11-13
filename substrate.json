@@ -62,7 +62,7 @@
     {
       "id": "evidence-submitter",
       "name": "Evidence submitter",
-      "desc": "Lifts pending attestation evidence from the gateway to the tee-attestation pallet. The payload is SCALE-encoded without a chain call, so only a row's own bytes can drop it; a chain call that fails or times out leaves the row for a later tick, and the outcome is read under the chain-write lock.",
+      "desc": "Lifts pending attestation evidence from the gateway to the tee-attestation pallet. The payload is SCALE-encoded without a chain call, so a chain call that fails or times out leaves the row for a later tick, and the outcome is read under the chain-write lock. A pallet refusal no retry changes (failed verification, content hash mismatch, duplicate evidence, an unauthorized signer, a full evidence type or receipt) drops the row unacked, an unauthorized signer as an operator-facing error; an unknown receipt is retried on five later ticks first. A landed row whose ack failed is acked again with its landing's extrinsic hash, never resubmitted.",
       "kind": "pipeline",
       "paths": [
         "daemon/evidence_submitter.py"

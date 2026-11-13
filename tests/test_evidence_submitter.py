@@ -13,6 +13,14 @@ Coverage matrix:
       - skip on PalletDisabled error (kill-switch ON)
       - skip on generic submit failure (no ack)
 
+    Pallet refusals (materios#120/#121):
+      - ContentHashMismatch, EvidenceTypeFull, UnauthorizedSubmitter and
+        DuplicateEvidence are terminal under their own name, never acked
+      - UnauthorizedSubmitter logs an ERROR naming the daemon's key
+      - UnknownReceipt is retried on MAX_UNKNOWN_RECEIPT_RETRIES ticks, then
+        terminal
+      - a landed row whose ack failed is acked again, not resubmitted
+
     Payload assembly:
       - arm_trustzone with valid base64 chain → SCALE-encoded Vec<Vec<u8>>
       - arm_trustzone with empty cert_chain_b64 → ValueError
@@ -37,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import tempfile
 from types import SimpleNamespace
@@ -47,11 +56,12 @@ import pytest
 from daemon.evidence_submitter import (
     EVIDENCE_TYPE_TO_PALLET_VARIANT,
     MAX_EVIDENCE_PAYLOAD_BYTES,
+    MAX_UNKNOWN_RECEIPT_RETRIES,
     TERMINAL_ERROR_REASONS,
     EvidenceSubmitter,
     _build_arm_trustzone_payload_bytes,
     _build_evidence_payload_bytes,
-    _classify_chain_error,
+    _chain_error_reason,
     _is_pallet_disabled_error,
     maybe_create_evidence_submitter,
 )
@@ -838,29 +848,39 @@ def test_pallet_disabled_is_NOT_terminal():
     assert 60 not in sub._failed_rows
 
 
-def test_classify_chain_error():
-    """Direct unit coverage for the classifier."""
-    assert _classify_chain_error("VerificationFailed") == "terminal"
-    assert _classify_chain_error("TeeAttestation.VerificationFailed") == "terminal"
-    assert _classify_chain_error("TooManyEntries") == "terminal"
-    assert _classify_chain_error("PayloadTooLarge") == "terminal"
+def test_chain_error_reason():
+    """Direct unit coverage for the classifier: the terminal reason or
+    `UnknownReceipt` an error names, else None (retryable)."""
+    assert _chain_error_reason("VerificationFailed") == "VerificationFailed"
+    assert _chain_error_reason("TeeAttestation.VerificationFailed") == "VerificationFailed"
+    assert _chain_error_reason("TooManyEntries") == "TooManyEntries"
+    assert _chain_error_reason("PayloadTooLarge") == "PayloadTooLarge"
+    for name in PALLET_DOCS:
+        assert _chain_error_reason(_module_error(name)) == name
     # PalletDisabled overrides the substring search.
-    assert _classify_chain_error("PalletDisabled") == "retryable"
-    assert _classify_chain_error("TeeAttestation.PalletDisabled") == "retryable"
+    assert _chain_error_reason("PalletDisabled") is None
+    assert _chain_error_reason("TeeAttestation.PalletDisabled") is None
+    assert _chain_error_reason({"type": "Module", "name": "PalletDisabled", "docs": []}) is None
     # Anything unknown defaults to retryable so we don't lose receipts on
     # transient errors.
-    assert _classify_chain_error(None) == "retryable"
-    assert _classify_chain_error("") == "retryable"
-    assert _classify_chain_error("RuntimeError: rpc down") == "retryable"
-    assert _classify_chain_error("Module: 'TeeAttestation', Disabled") == "retryable"
+    assert _chain_error_reason(None) is None
+    assert _chain_error_reason("") is None
+    assert _chain_error_reason("RuntimeError: rpc down") is None
+    assert _chain_error_reason("Module: 'TeeAttestation', Disabled") is None
 
 
 def test_terminal_error_reasons_pinned():
-    """Sentinel: the terminal-reason map MUST include these three pallet
-    errors + the three pre-flight sentinels. Removing one would silently
-    re-introduce the retry-forever bug for that error."""
+    """Sentinel: the terminal-reason map MUST include these pallet errors +
+    the three pre-flight sentinels, and must not hold UnknownReceipt, which
+    later ticks retry. Removing one would silently re-introduce the
+    retry-forever bug for that error."""
     assert "VerificationFailed" in TERMINAL_ERROR_REASONS
     assert "TooManyEntries" in TERMINAL_ERROR_REASONS
+    assert "ContentHashMismatch" in TERMINAL_ERROR_REASONS
+    assert "EvidenceTypeFull" in TERMINAL_ERROR_REASONS
+    assert "UnauthorizedSubmitter" in TERMINAL_ERROR_REASONS
+    assert "DuplicateEvidence" in TERMINAL_ERROR_REASONS
+    assert "UnknownReceipt" not in TERMINAL_ERROR_REASONS
     assert "PayloadTooLarge" in TERMINAL_ERROR_REASONS
     assert "PayloadAssemblyError" in TERMINAL_ERROR_REASONS
     assert "UnsupportedEvidenceType" in TERMINAL_ERROR_REASONS
@@ -992,9 +1012,8 @@ def test_no_zero_placeholder_when_receipt_hash_unset():
     ext = _run(sub.submit_one(row))
     assert ext is None  # No silent 0x000... fallback.
     # Row is NOT terminal — the chain call may have succeeded; we just
-    # couldn't extract the hash. Next tick retries (and the pallet's
-    # idempotency at (receipt_id, attest_key_hash) handles a possible
-    # double-landing.)
+    # couldn't extract the hash. Next tick retries; if the evidence did
+    # land, the pallet refuses the retry as DuplicateEvidence (terminal).
     assert 130 not in sub._failed_rows
 
 
@@ -1112,3 +1131,173 @@ def test_tick_advances_cursor_when_all_rows_are_terminal(tmp_path):
     sub.mark_submitted.assert_not_called()
     # But cursor steps past the terminal rows (otherwise we re-loop on them).
     assert sub._cursor >= 101
+
+
+# ---------------------------------------------------------------------------
+# materios#120/#121: submit_evidence refuses evidence for what its receipt
+# already holds and for who signs, before verifying anything. A refusal
+# charges the call's full weight (about 67 ms of block time), so no refused
+# row may come back every tick.
+# ---------------------------------------------------------------------------
+
+PALLET_DOCS = {
+    "UnknownReceipt": "`receipt_id` names no receipt in the receipt registry.",
+    "ContentHashMismatch": (
+        "`content_hash` differs from the content hash the receipt registry "
+        "holds for `receipt_id`."
+    ),
+    "DuplicateEvidence": "The receipt already holds evidence from this attested key.",
+    "UnauthorizedSubmitter": (
+        "The signer is neither the receipt's submitter nor a member of the "
+        "receipt committee."
+    ),
+    "EvidenceTypeFull": (
+        "The receipt already holds `MAX_ENTRIES_PER_EVIDENCE_TYPE` entries of "
+        "this evidence type, from another key."
+    ),
+}
+REFUSED_EXTRINSIC_HASH = "0x" + ("d0" * 32)
+LANDED_EXTRINSIC_HASH = "0x" + ("ee" * 32)
+
+
+def _module_error(name: str) -> dict:
+    """substrate-interface's `error_message` for a dispatch that failed with
+    `TeeAttestation::<name>`."""
+    return {"type": "Module", "name": name, "docs": [PALLET_DOCS[name]]}
+
+
+def _refusing(name: str):
+    """A substrate mock whose every submit is included and refused with
+    `name`. A refused extrinsic is still in a block, under its own hash."""
+    substrate = _make_substrate_mock(
+        submit_success=False, error_message=_module_error(name)
+    )
+    substrate.submit_extrinsic.return_value.extrinsic_hash = REFUSED_EXTRINSIC_HASH
+    return substrate
+
+
+def _row(row_id: int) -> dict:
+    return {
+        "id": row_id,
+        "receipt_id": RECEIPT_ID_HEX,
+        "evidence_type": "arm_trustzone",
+        "payload": {"cert_chain_b64": [_b64(b"\x01")]},
+    }
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["ContentHashMismatch", "EvidenceTypeFull", "UnauthorizedSubmitter", "DuplicateEvidence"],
+)
+def test_a_refusal_retrying_cannot_change_is_terminal_under_its_own_name(name):
+    """None of these refusals depends on anything a later tick changes, so
+    the row is submitted once, recorded under the refusal's own name, never
+    acked (the refused extrinsic's hash is not the hash of a dispatch that
+    stored evidence) and stepped past."""
+    substrate = _refusing(name)
+    sub = _make_submitter(client=_make_client_mock(substrate))
+    sub.fetch_pending = AsyncMock(return_value=([_row(140)], 140))
+    sub.mark_submitted = AsyncMock(return_value=True)
+
+    _run(sub._tick())
+    _run(sub._tick())
+
+    assert substrate.submit_extrinsic.call_count == 1
+    assert sub._failed_rows[140]["reason"] == name
+    sub.mark_submitted.assert_not_called()
+    assert sub._cursor == 140
+
+
+def test_unauthorized_submitter_tells_the_operator_which_key_to_seat(caplog):
+    """Every row this key signs is refused the same way until the operator
+    seats it on the committee, so the refusal is an ERROR naming the key."""
+    sub = _make_submitter(
+        client=_make_client_mock(_refusing("UnauthorizedSubmitter"))
+    )
+
+    with caplog.at_level(logging.WARNING, logger="daemon.evidence_submitter"):
+        _run(sub.submit_one(_row(170)))
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert ATTESTOR_SS58 in errors[0]
+    assert "CommitteeMembers" in errors[0]
+    assert sub._failed_state_path in errors[0]
+
+
+def test_a_landed_row_whose_ack_failed_is_acked_again_not_resubmitted():
+    """The evidence is on chain once the submit lands. Submitting it again
+    would pay the full weight for a DuplicateEvidence refusal and lose the
+    one hash the gateway's ack may carry: the landing dispatch's."""
+    substrate = _make_substrate_mock()
+    sub = _make_submitter(client=_make_client_mock(substrate))
+    sub.fetch_pending = AsyncMock(return_value=([_row(160)], 160))
+    sub.mark_submitted = AsyncMock(side_effect=[False, True])
+
+    _run(sub._tick())
+    assert sub._cursor == 159
+    _run(sub._tick())
+
+    assert substrate.submit_extrinsic.call_count == 1
+    assert [c.args for c in sub.mark_submitted.await_args_list] == [
+        (160, LANDED_EXTRINSIC_HASH),
+        (160, LANDED_EXTRINSIC_HASH),
+    ]
+    assert sub._cursor == 160
+
+
+def test_unknown_receipt_is_retried_on_later_ticks_then_terminal():
+    """The daemon reads the receipt before it submits, so a pallet that
+    cannot find it ran on state behind the node the daemon read. Later ticks
+    retry the row, each paying the full weight, MAX_UNKNOWN_RECEIPT_RETRIES
+    times; the refusal after that is terminal."""
+    substrate = _refusing("UnknownReceipt")
+    sub = _make_submitter(client=_make_client_mock(substrate))
+    sub.fetch_pending = AsyncMock(return_value=([_row(180)], 180))
+    sub.mark_submitted = AsyncMock(return_value=True)
+
+    for _ in range(MAX_UNKNOWN_RECEIPT_RETRIES):
+        _run(sub._tick())
+        assert 180 not in sub._failed_rows
+        assert sub._cursor == 179
+    _run(sub._tick())
+    _run(sub._tick())
+
+    assert substrate.submit_extrinsic.call_count == MAX_UNKNOWN_RECEIPT_RETRIES + 1
+    assert sub._failed_rows[180]["reason"] == "UnknownReceipt"
+    sub.mark_submitted.assert_not_called()
+    assert sub._cursor == 180
+
+
+def test_unknown_receipt_retries_are_counted_per_row():
+    substrate = _refusing("UnknownReceipt")
+    sub = _make_submitter(client=_make_client_mock(substrate))
+
+    for _ in range(MAX_UNKNOWN_RECEIPT_RETRIES):
+        _run(sub.submit_one(_row(181)))
+    _run(sub.submit_one(_row(182)))
+
+    assert sub._failed_rows == {}
+
+
+def test_a_receipt_the_pallet_finds_later_lands_and_its_refusals_are_dropped():
+    substrate = _refusing("UnknownReceipt")
+    sub = _make_submitter(client=_make_client_mock(substrate))
+    _run(sub.submit_one(_row(183)))
+
+    landed = MagicMock(is_success=True, error_message=None,
+                       extrinsic_hash=LANDED_EXTRINSIC_HASH, block_hash="0x" + ("bb" * 32))
+    substrate.submit_extrinsic.return_value = landed
+
+    assert _run(sub.submit_one(_row(183))) == LANDED_EXTRINSIC_HASH
+    assert sub._unknown_receipt_refusals == {}
+
+
+def test_the_reason_is_the_variant_named_not_one_its_docs_mention():
+    """substrate-interface reports a module error with its docs, and docs may
+    name another variant. Matching across them would record whichever name
+    the frozenset yielded first."""
+    for name, other in (("EvidenceTypeFull", "DuplicateEvidence"),
+                        ("DuplicateEvidence", "EvidenceTypeFull")):
+        err = {"type": "Module", "name": name, "docs": [f"Not a {other}."]}
+        assert _chain_error_reason(err) == name
