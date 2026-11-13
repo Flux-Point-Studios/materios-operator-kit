@@ -39,11 +39,11 @@ This prints three values:
 
 ### Step 3: Configure the daemon
 
-> **No registration required.** The daemon automatically joins the attestation committee on startup by submitting a `join_committee` extrinsic. If your account doesn't have enough MATRA to pay the transaction fee, the daemon auto-requests a faucet drip first.
+> **Committee seats are granted by governance.** Since runtime spec 228, `join_committee` is a Root call, so the daemon cannot seat its own key. Send your SS58 address to the FPS team to be seated. If the evidence submitter is enabled and the pallet refuses the key as off the committee, the daemon pauses evidence submission and resumes by itself once the key is seated.
 >
 > **Auto-bond is also handled for you.** The `OrinqReceipts` pallet enforces a `BondRequirement` (currently **1,000 MATRA** on preprod — subject to governance). Before the first `join_committee` call, the daemon reserves the required amount by submitting `bond(delta)` on your behalf. Already-bonded operators are detected and skipped, so restarts never double-bond. See [Auto-bond behaviour](#auto-bond-behaviour) below for the full contract and the single warning case an operator might see.
 >
-> **Optional:** Send your SS58 address and public key hex to the FPS team if you want higher gateway rate limits or a provisioned API key. This is not required to participate.
+> **Optional:** Send your public key hex along with it if you want higher gateway rate limits or a provisioned API key.
 
 Edit `docker-compose.yml` and fill in the required fields:
 
