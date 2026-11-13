@@ -14,12 +14,15 @@ Coverage matrix:
       - skip on generic submit failure (no ack)
 
     Pallet refusals (materios#120/#121):
-      - ContentHashMismatch, EvidenceTypeFull, UnauthorizedSubmitter and
-        DuplicateEvidence are terminal under their own name, never acked
-      - UnauthorizedSubmitter logs an ERROR naming the daemon's key
+      - ContentHashMismatch, EvidenceTypeFull and DuplicateEvidence are
+        terminal under their own name, never acked
+      - UnauthorizedSubmitter pauses submission until the committee holds the
+        daemon's key again; no row is dropped
       - UnknownReceipt is retried on MAX_UNKNOWN_RECEIPT_RETRIES ticks, then
         terminal
-      - a landed row whose ack failed is acked again, not resubmitted
+      - a landed row whose ack failed is acked again, not resubmitted, while
+        the row still names the same receipt and evidence type
+      - the per-row maps keep only rows in the current pending page
 
     Payload assembly:
       - arm_trustzone with valid base64 chain → SCALE-encoded Vec<Vec<u8>>
@@ -871,16 +874,17 @@ def test_chain_error_reason():
 
 def test_terminal_error_reasons_pinned():
     """Sentinel: the terminal-reason map MUST include these pallet errors +
-    the three pre-flight sentinels, and must not hold UnknownReceipt, which
-    later ticks retry. Removing one would silently re-introduce the
+    the three pre-flight sentinels. It must not hold UnknownReceipt, which
+    later ticks retry, nor UnauthorizedSubmitter, which pauses submission
+    until the key is seated. Removing one would silently re-introduce the
     retry-forever bug for that error."""
     assert "VerificationFailed" in TERMINAL_ERROR_REASONS
     assert "TooManyEntries" in TERMINAL_ERROR_REASONS
     assert "ContentHashMismatch" in TERMINAL_ERROR_REASONS
     assert "EvidenceTypeFull" in TERMINAL_ERROR_REASONS
-    assert "UnauthorizedSubmitter" in TERMINAL_ERROR_REASONS
     assert "DuplicateEvidence" in TERMINAL_ERROR_REASONS
     assert "UnknownReceipt" not in TERMINAL_ERROR_REASONS
+    assert "UnauthorizedSubmitter" not in TERMINAL_ERROR_REASONS
     assert "PayloadTooLarge" in TERMINAL_ERROR_REASONS
     assert "PayloadAssemblyError" in TERMINAL_ERROR_REASONS
     assert "UnsupportedEvidenceType" in TERMINAL_ERROR_REASONS
@@ -1136,8 +1140,8 @@ def test_tick_advances_cursor_when_all_rows_are_terminal(tmp_path):
 # ---------------------------------------------------------------------------
 # materios#120/#121: submit_evidence refuses evidence for what its receipt
 # already holds and for who signs, before verifying anything. A refusal
-# charges the call's full weight (about 67 ms of block time), so no refused
-# row may come back every tick.
+# charges the call's full weight (about 67 ms of block time on materios
+# main), so no refused row may come back every tick.
 # ---------------------------------------------------------------------------
 
 PALLET_DOCS = {
@@ -1186,8 +1190,7 @@ def _row(row_id: int) -> dict:
 
 
 @pytest.mark.parametrize(
-    "name",
-    ["ContentHashMismatch", "EvidenceTypeFull", "UnauthorizedSubmitter", "DuplicateEvidence"],
+    "name", ["ContentHashMismatch", "EvidenceTypeFull", "DuplicateEvidence"]
 )
 def test_a_refusal_retrying_cannot_change_is_terminal_under_its_own_name(name):
     """None of these refusals depends on anything a later tick changes, so
@@ -1206,23 +1209,6 @@ def test_a_refusal_retrying_cannot_change_is_terminal_under_its_own_name(name):
     assert sub._failed_rows[140]["reason"] == name
     sub.mark_submitted.assert_not_called()
     assert sub._cursor == 140
-
-
-def test_unauthorized_submitter_tells_the_operator_which_key_to_seat(caplog):
-    """Every row this key signs is refused the same way until the operator
-    seats it on the committee, so the refusal is an ERROR naming the key."""
-    sub = _make_submitter(
-        client=_make_client_mock(_refusing("UnauthorizedSubmitter"))
-    )
-
-    with caplog.at_level(logging.WARNING, logger="daemon.evidence_submitter"):
-        _run(sub.submit_one(_row(170)))
-
-    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1
-    assert ATTESTOR_SS58 in errors[0]
-    assert "CommitteeMembers" in errors[0]
-    assert sub._failed_state_path in errors[0]
 
 
 def test_a_landed_row_whose_ack_failed_is_acked_again_not_resubmitted():
@@ -1301,3 +1287,187 @@ def test_the_reason_is_the_variant_named_not_one_its_docs_mention():
                         ("DuplicateEvidence", "EvidenceTypeFull")):
         err = {"type": "Module", "name": name, "docs": [f"Not a {other}."]}
         assert _chain_error_reason(err) == name
+
+
+class _Gateway:
+    """The gateway's pending query over `rows`: ids above the cursor not yet
+    marked, by id, a page at a time. `acks` scripts mark_submitted's outcomes
+    in order, then True; "lost" marks the row but reports a failure, as an
+    ack whose response never arrived."""
+
+    def __init__(self, ids, receipt_id=RECEIPT_ID_HEX):
+        self.rows = {i: {**_row(i), "receipt_id": receipt_id} for i in ids}
+        self.marked: dict[int, str] = {}
+        self.acks: list = []
+        self.fetches = 0
+
+    def attach(self, sub):
+        async def fetch_pending():
+            self.fetches += 1
+            ids = sorted(i for i in self.rows if i > sub._cursor and i not in self.marked)
+            ids = ids[:sub._page_size]
+            return [dict(self.rows[i]) for i in ids], (ids[-1] if ids else sub._cursor)
+
+        async def mark_submitted(row_id, ext_hash):
+            outcome = self.acks.pop(0) if self.acks else True
+            if outcome in (True, "lost"):
+                self.marked.setdefault(row_id, ext_hash)
+            return outcome is True
+
+        sub.fetch_pending = fetch_pending
+        sub.mark_submitted = AsyncMock(side_effect=mark_submitted)
+        return sub
+
+
+class _Chain:
+    """A substrate mock that includes each submit under its own hash and
+    refuses it with `error`, or accepts it when `error` is None. `script`
+    gives the first submits' verdicts."""
+
+    def __init__(self, error=None, script=()):
+        self.error = error
+        self.script = list(script)
+        self.verdicts: list = []
+        self.substrate = _make_substrate_mock()
+        self.substrate.submit_extrinsic = MagicMock(side_effect=self._submit)
+
+    def _submit(self, extrinsic, wait_for_inclusion=True):
+        error = self.script.pop(0) if self.script else self.error
+        self.verdicts.append(error)
+        return MagicMock(
+            is_success=error is None,
+            error_message=_module_error(error) if error in PALLET_DOCS else error,
+            extrinsic_hash="0x" + f"{len(self.verdicts):064x}",
+            block_hash="0x" + ("bb" * 32),
+        )
+
+
+def _on(chain, gateway, tmp_path, page_size=50):
+    sub = _make_submitter(
+        client=_make_client_mock(chain.substrate),
+        failed_state_path=str(tmp_path / "evidence-failed.json"),
+        page_size=page_size,
+    )
+    return gateway.attach(sub)
+
+
+def test_a_committee_lapse_pauses_submission_and_every_row_lands_once_reseated(tmp_path, caplog):
+    """A slash ejects a member and only a Root `join_committee` seats it
+    again, so a lapse is recoverable. The first refusal pauses submission;
+    paused ticks read the committee and touch neither gateway nor chain; the
+    rows land once the key is back, with no restart and no file edit."""
+    gateway = _Gateway([1, 2, 3])
+    chain = _Chain(script=[None], error="UnauthorizedSubmitter")
+    sub = _on(chain, gateway, tmp_path)
+    committee: set[bytes] = set()
+    sub.client.get_committee_pubkeys = MagicMock(side_effect=lambda: frozenset(committee))
+
+    with caplog.at_level(logging.INFO, logger="daemon.evidence_submitter"):
+        for _ in range(3):
+            _run(sub._tick())
+        assert chain.verdicts == [None, "UnauthorizedSubmitter"]
+        assert sub._failed_rows == {}
+        assert sub._cursor == 1
+        assert gateway.fetches == 1
+
+        committee.add(sub.client.keypair.public_key)
+        chain.error = None
+        _run(sub._tick())
+        _run(sub._tick())
+
+    assert sorted(gateway.marked) == [1, 2, 3]
+    assert chain.verdicts.count("UnauthorizedSubmitter") == 1
+    assert len(chain.verdicts) == 4
+    assert sub.client.get_committee_pubkeys.call_count == 3
+    messages = [(r.levelno, r.getMessage()) for r in caplog.records]
+    paused = [m for level, m in messages if level == logging.ERROR]
+    assert len(paused) == 1
+    assert ATTESTOR_SS58 in paused[0]
+    assert "Root" in paused[0] and "join_committee" in paused[0]
+    assert sub._failed_state_path not in paused[0]
+    assert len([m for _, m in messages if "resuming evidence submission" in m]) == 1
+
+
+def test_a_landing_kept_for_a_row_id_is_not_acked_for_another_receipt(tmp_path):
+    """A gateway whose database was reset reuses row ids. The hash kept for
+    row 3 is the old row's landing, for another receipt, so the new row 3 is
+    submitted and acked with its own landing."""
+    old = _Gateway([1, 2, 3])
+    old.acks = [True, True, False]
+    chain = _Chain()
+    sub = _on(chain, old, tmp_path)
+    _run(sub._tick())
+    assert set(sub._unacked_landings) == {3}
+
+    fresh = _Gateway([1, 2, 3], receipt_id="c3" * 32)
+    fresh.attach(sub)
+    _run(sub._tick())
+
+    assert len(chain.verdicts) == 4
+    assert fresh.marked == {3: "0x" + f"{4:064x}"}
+
+
+def test_reack_uses_each_rows_own_landing_across_interleaved_failures(tmp_path):
+    gateway = _Gateway([10, 11, 12])
+    gateway.acks = [False, True, False, False, False, True, True]
+    chain = _Chain()
+    sub = _on(chain, gateway, tmp_path)
+
+    for _ in range(4):
+        _run(sub._tick())
+
+    assert len(chain.verdicts) == 3
+    acks = [c.args for c in sub.mark_submitted.await_args_list]
+    first = dict(acks[:3])
+    assert len(set(first.values())) == 3
+    assert all(ext_hash == first[row_id] for row_id, ext_hash in acks)
+    assert gateway.marked == first
+
+
+def test_the_unknown_receipt_bound_is_five_retries():
+    assert MAX_UNKNOWN_RECEIPT_RETRIES == 5
+
+
+def test_another_retryable_error_keeps_the_unknown_receipt_count(tmp_path):
+    gateway = _Gateway([7])
+    chain = _Chain(script=["UnknownReceipt", "RuntimeError: rpc down"], error="UnknownReceipt")
+    sub = _on(chain, gateway, tmp_path)
+
+    for _ in range(MAX_UNKNOWN_RECEIPT_RETRIES + 2):
+        _run(sub._tick())
+
+    assert sub._failed_rows[7]["reason"] == "UnknownReceipt"
+    assert len(chain.verdicts) == MAX_UNKNOWN_RECEIPT_RETRIES + 2
+
+
+def test_a_row_that_turns_terminal_drops_its_unknown_receipt_count(tmp_path):
+    gateway = _Gateway([7])
+    chain = _Chain(script=["UnknownReceipt"], error="DuplicateEvidence")
+    sub = _on(chain, gateway, tmp_path)
+
+    _run(sub._tick())
+    _run(sub._tick())
+
+    assert sub._failed_rows[7]["reason"] == "DuplicateEvidence"
+    assert sub._unknown_receipt_refusals == {}
+
+
+def test_rows_that_leave_the_pending_page_leave_the_per_row_maps(tmp_path):
+    """Another daemon lands the UnknownReceipt rows, and the gateway marked
+    the rows whose ack response was lost. Neither comes back, so neither
+    may stay in memory."""
+    gateway = _Gateway([1, 2, 3, 4])
+    gateway.acks = [True, True, "lost", "lost"]
+    chain = _Chain(script=[None, None, None, None], error="UnknownReceipt")
+    sub = _on(chain, gateway, tmp_path)
+    _run(sub._tick())
+    assert set(sub._unacked_landings) == {3, 4}
+
+    gateway.rows.update({i: {**_row(i), "receipt_id": RECEIPT_ID_HEX} for i in (5, 6)})
+    _run(sub._tick())
+    assert set(sub._unknown_receipt_refusals) == {5, 6}
+    assert sub._unacked_landings == {}
+
+    gateway.marked.update({5: LANDED_EXTRINSIC_HASH, 6: LANDED_EXTRINSIC_HASH})
+    _run(sub._tick())
+    assert sub._unknown_receipt_refusals == {}

@@ -79,8 +79,10 @@ MAX_EVIDENCE_PAYLOAD_BYTES = 16 * 1024
 # Maps known pallet-side errors and pre-flight failure reasons into either
 # "terminal" (won't succeed on retry — record locally so the cursor can move
 # past) or "retryable" (transient — let the next tick try again). Every
-# submit that reaches the chain pays `submit_evidence`'s full weight, about
-# 67 ms of block time, whether the pallet accepts it or refuses it.
+# submit that reaches the chain pays `submit_evidence`'s full declared
+# weight, whether the pallet accepts it or refuses it: about 67 ms of block
+# time on materios main since #120/#121 (`weights.rs`), and 1B ref_time
+# (1 ms) on the pallet preprod runs today.
 #
 # Source of truth for the pallet variants is
 # `partnerchain/pallets/tee-attestation/src/lib.rs` (search `pub enum Error`):
@@ -100,7 +102,9 @@ MAX_EVIDENCE_PAYLOAD_BYTES = 16 * 1024
 #     holds only for its own landings, and those it re-acks rather than
 #     resubmits (`_unacked_landings`)                                     (TERMINAL)
 #   - UnauthorizedSubmitter → this daemon's key is neither the receipt's
-#     submitter nor in OrinqReceipts::CommitteeMembers; logged as ERROR   (TERMINAL)
+#     submitter nor in OrinqReceipts::CommitteeMembers. A slash ejects a
+#     member and a Root join_committee seats it again, so submission
+#     pauses until the committee holds the key; no row is recorded       (PAUSE)
 #   - EvidenceTypeFull → the receipt already holds its one entry of this
 #     evidence type, from another key                                     (TERMINAL)
 #
@@ -118,7 +122,6 @@ TERMINAL_ERROR_REASONS: frozenset[str] = frozenset({
     "TooManyEntries",
     "ContentHashMismatch",
     "DuplicateEvidence",
-    "UnauthorizedSubmitter",
     "EvidenceTypeFull",
     "PayloadTooLarge",
     "PayloadAssemblyError",
@@ -131,10 +134,10 @@ MAX_UNKNOWN_RECEIPT_RETRIES = 5
 
 
 def _chain_error_reason(err: Any) -> Optional[str]:
-    """The terminal reason, or `UnknownReceipt`, that a pallet-side
-    `error_message` (or a synthesized client-side reason label) names. None
-    for anything else, including PalletDisabled, which leaves the row
-    retryable.
+    """The terminal reason, `UnknownReceipt` or `UnauthorizedSubmitter` that
+    a pallet-side `error_message` (or a synthesized client-side reason label)
+    names. None for anything else, including PalletDisabled, which leaves the
+    row retryable.
 
     substrate-interface reports a module error as `{"type": "Module",
     "name": <variant>, "docs": [...]}`. Only the name is matched, since the
@@ -148,7 +151,7 @@ def _chain_error_reason(err: Any) -> Optional[str]:
     # kill-switch back off without a chain reset.
     if "PalletDisabled" in s:
         return None
-    for reason in (*TERMINAL_ERROR_REASONS, "UnknownReceipt"):
+    for reason in (*TERMINAL_ERROR_REASONS, "UnknownReceipt", "UnauthorizedSubmitter"):
         if reason in s:
             return reason
     return None
@@ -284,10 +287,11 @@ class EvidenceSubmitter:
         # Without this, the gateway query (`WHERE submitted_to_chain_at IS
         # NULL`) keeps surfacing the row every tick, the daemon resubmits, the
         # pallet rejects again — and each rejection still pays the declared
-        # submit_evidence weight in full (67 ms of ref_time plus 10 reads and
-        # 2 writes, materios `weights.rs`) charged as fees. We persist by row
-        # id + reason to a JSON file alongside the cert-daemon's existing
-        # state files so the skip survives restart.
+        # submit_evidence weight in full (on materios main, 67 ms of ref_time
+        # plus 10 reads and 2 writes, `weights.rs`; 1B ref_time on preprod's
+        # pallet today) charged as fees. We persist by row id + reason to a
+        # JSON file alongside the cert-daemon's existing state files so the
+        # skip survives restart.
         self._failed_state_path: str = (
             failed_state_path
             or os.path.join(
@@ -298,9 +302,14 @@ class EvidenceSubmitter:
         # UnknownReceipt refusals per row, until the row lands or turns
         # terminal at MAX_UNKNOWN_RECEIPT_RETRIES.
         self._unknown_receipt_refusals: dict[int, int] = {}
-        # Rows whose submit landed but whose ack failed, with the landing's
-        # extrinsic hash. The next tick re-acks them instead of resubmitting.
-        self._unacked_landings: dict[int, str] = {}
+        # Rows whose submit landed but whose ack failed: the receipt id and
+        # evidence type the row named, and the landing's extrinsic hash. The
+        # next tick re-acks a row that still names them instead of
+        # resubmitting it. Both maps keep only rows in the latest pending page.
+        self._unacked_landings: dict[int, tuple[tuple[str, str], str]] = {}
+        # Set when the pallet refuses this key as UnauthorizedSubmitter;
+        # submission waits until OrinqReceipts::CommitteeMembers holds it.
+        self._unseated = False
 
     # -- local terminal-failure tracking -------------------------------------
 
@@ -383,13 +392,14 @@ class EvidenceSubmitter:
         error) won't go away on retry — re-submitting the same bytes
         deterministically lands the same rejection. Without skipping locally
         the daemon hot-loops on the row every poll interval, each loop costing
-        the declared `submit_evidence` weight (about 67 ms of block time)
-        charged as fees.
+        the declared `submit_evidence` weight (about 67 ms of block time on
+        materios main, 1 ms on preprod's pallet today) charged as fees.
 
         We log WARN with row_id + reason + first 64 hex chars of the receipt
         id so an operator can reconcile against the gateway DB by-hand. The
         on-disk record is keyed by row_id.
         """
+        self._unknown_receipt_refusals.pop(row_id, None)
         if row_id in self._failed_rows:
             return  # already recorded — do not bump failed_at
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -694,7 +704,18 @@ class EvidenceSubmitter:
                         f"{refusals}/{MAX_UNKNOWN_RECEIPT_RETRIES} on a later tick"
                     )
                     return None
-                self._unknown_receipt_refusals.pop(row_id, None)
+            if reason == "UnauthorizedSubmitter":
+                self._unseated = True
+                logger.error(
+                    f"evidence_submitter: pausing evidence submission: the "
+                    f"pallet refused row {row_id} as UnauthorizedSubmitter, so "
+                    f"this daemon's key {self.client.keypair.ss58_address} is "
+                    f"not in OrinqReceipts::CommitteeMembers. Seating it takes "
+                    f"a Root join_committee call. Each tick re-reads the "
+                    f"committee, and submission resumes once the key is on it, "
+                    f"with no row dropped"
+                )
+                return None
             if reason is None:
                 if _is_pallet_disabled_error(err):
                     logger.warning(
@@ -711,18 +732,7 @@ class EvidenceSubmitter:
                 return None
             # Resubmitting would land the same refusal and burn fees. Record
             # locally so the next tick filters this row out before composing.
-            if reason == "UnauthorizedSubmitter":
-                logger.error(
-                    f"evidence_submitter: row {row_id} refused: this daemon's "
-                    f"key {self.client.keypair.ss58_address} is neither the "
-                    f"receipt's submitter nor in OrinqReceipts::CommitteeMembers, "
-                    f"so the pallet refuses every row it signs. Once the key "
-                    f"is on the committee (the daemon joins by itself when its "
-                    f"bond is met), delete the rows recorded with reason "
-                    f"UnauthorizedSubmitter from {self._failed_state_path} to "
-                    f"submit them again"
-                )
-            elif reason == "DuplicateEvidence":
+            if reason == "DuplicateEvidence":
                 logger.warning(
                     f"evidence_submitter: row {row_id} evidence is already on "
                     f"chain (DuplicateEvidence, receipt_id="
@@ -784,7 +794,8 @@ class EvidenceSubmitter:
     async def _tick(self) -> None:
         """Single poll tick: fetch pending, submit each, ack each. A row
         whose submit landed on an earlier tick but whose ack failed is acked
-        again with that landing's hash, not resubmitted.
+        again with that landing's hash, not resubmitted. While submission is
+        paused on UnauthorizedSubmitter, a tick only re-reads the committee.
 
         Cursor advancement (post-P1-fix). The gateway query is
         `WHERE id > ? AND submitted_to_chain_at IS NULL`. Old logic advanced
@@ -800,9 +811,17 @@ class EvidenceSubmitter:
         purposes — we want the cursor to step over them since the next tick
         would skip them again anyway.
         """
+        if self._unseated:
+            if self.client.keypair.public_key not in self.client.get_committee_pubkeys():
+                return
+            self._unseated = False
+            logger.warning(
+                f"evidence_submitter: resuming evidence submission: key "
+                f"{self.client.keypair.ss58_address} is in "
+                f"OrinqReceipts::CommitteeMembers again"
+            )
+
         rows, next_since = await self.fetch_pending()
-        if not rows:
-            return
 
         # Filter out any rows we've already classified as terminally failed.
         # Their gateway state (`submitted_to_chain_at IS NULL`) means they'll
@@ -819,6 +838,14 @@ class EvidenceSubmitter:
                 skipped_terminal.append(rid)
                 continue
             eligible.append(r)
+        # A row with per-row state holds the cursor below it, so it stays in
+        # every page until it lands, turns terminal or leaves pending (acked
+        # elsewhere, or the gateway's database was reset). State for a row
+        # missing from this page is never read again.
+        page = set(skipped_terminal) | {int(r["id"]) for r in eligible}
+        for state in (self._unknown_receipt_refusals, self._unacked_landings):
+            for rid in state.keys() - page:
+                del state[rid]
         if skipped_terminal:
             logger.info(
                 f"evidence_submitter: skipping {len(skipped_terminal)} "
@@ -849,13 +876,21 @@ class EvidenceSubmitter:
             if not self._running:
                 break
             row_id = int(row["id"])
-            ext_hash = self._unacked_landings.pop(row_id, None)
+            landed_as = (str(row["receipt_id"]), str(row["evidence_type"]))
+            kept = self._unacked_landings.pop(row_id, None)
+            ext_hash = kept[1] if kept is not None and kept[0] == landed_as else None
+            if kept is not None and ext_hash is None:
+                logger.warning(
+                    f"evidence_submitter: row {row_id} now names receipt "
+                    f"{landed_as[0][:16]}… ({landed_as[1]}), not the row whose "
+                    f"landing was kept under its id; submitting it afresh"
+                )
             if ext_hash is None:
                 ext_hash = await self.submit_one(row)
             if ext_hash is not None:
                 acked = await self.mark_submitted(row_id, ext_hash)
                 if not acked:
-                    self._unacked_landings[row_id] = ext_hash
+                    self._unacked_landings[row_id] = (landed_as, ext_hash)
                 outcomes.append((row_id, bool(acked)))
             else:
                 # submit_one returned None. Either it recorded the row as
@@ -866,6 +901,8 @@ class EvidenceSubmitter:
                     outcomes.append((row_id, True))
                 else:
                     outcomes.append((row_id, False))
+                if self._unseated:
+                    break
 
         if not outcomes:
             return
