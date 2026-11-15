@@ -60,3 +60,4 @@ class PendingReceipt:
     retries: int = 0
     last_error: str = ""  # what deferred it; empty while it waits on a locator
     cert_hash: Optional[bytes] = None  # the hash its refused attest claimed, which its recheck holds the chain to
+    not_before: int = 0  # the block a backup signer's attest of it is taken from; 0 when it waits on no block

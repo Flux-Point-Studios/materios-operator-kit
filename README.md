@@ -183,6 +183,34 @@ MOTRA (not MATRA — the two-token split is documented in `docs/`). No extra
 configuration is required: the same signer used for every other extrinsic
 covers the bond too.
 
+## Backup signers
+
+The chain can list committee accounts as backup signers in
+`OrinqReceipts.BackupSigners`. A backup signer is a fallback: the chain
+refuses its attest of a receipt until `BackupSignerDelay` blocks after the
+receipt was submitted, so the other committee members attest first, and it is
+not paid for the attests it does make.
+
+There is nothing to configure. The daemon reads both storage items from the
+chain at startup and again with every committee check, so a change to the
+listing or the delay reaches a running daemon within about a minute. While
+your signer is listed with a non-zero delay, the daemon:
+
+1. Verifies each receipt's content as usual.
+2. Waits, without submitting, until the chain head reaches the receipt's
+   submission block plus the delay. Other receipts are processed meanwhile.
+   Waiting receipts are kept in the daemon's state file, so a restart or a
+   dropped connection loses none of them.
+3. Checks the chain again at that block and attests only if the receipt is
+   still uncertified. A receipt the other members certified in the meantime
+   is skipped.
+
+When the listing takes effect the daemon logs
+`OrinqReceipts.BackupSigners lists this signer: each attest waits N blocks
+after its receipt's submission and earns no fee`. A signer that is not listed
+attests at once. So does every signer on a runtime without `BackupSigners`,
+where the daemon logs one line at startup saying so.
+
 ## Running multiple attestors on one host
 
 You can run more than one independent attestor on the same machine using the

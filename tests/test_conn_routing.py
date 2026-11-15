@@ -6,9 +6,11 @@ there waits behind it. Reads run on the read conn. A listed function runs
 every one of its calls on the write conn: signing and submitting, the
 keepalive that keeps that socket alive, and two reads that must see the node
 a submit goes to. Both of those run under the chain-write lock, so no submit
-holds the socket while they read. No daemon code reaches a SubstrateInterface
-but through ``_call``: not ``client.substrate``, and not a conn's ``si`` or
-``bound`` outside the functions that open, hold or replace it.
+holds the socket while they read. A backup signer's submit first reads, on
+that node, whether the chain takes its attest yet. No daemon code reaches a
+SubstrateInterface but through ``_call``: not ``client.substrate``, and not a
+conn's ``si`` or ``bound`` outside the functions that open, hold or replace
+it.
 
 Every other daemon module reaches the write conn only under the chain-write
 lock (#71), which keeps the signer's nonce monotonic and each write-conn call
@@ -33,7 +35,7 @@ WRITE_CONN_FUNCTIONS = {
     "submit_join_committee": "composes, signs and submits",
     "submit_bond": "composes, signs and submits",
     "_submit_settlement_call": "composes, signs and submits",
-    "submit_availability_cert": "composes, signs and submits",
+    "submit_availability_cert": "composes, signs and submits, a backup signer once that node's best block allows",
     "keepalive": "keeps the write conn's own socket alive",
     "attestation_on_chain": "judges a refused attest at one best block of the node that refused it (#66 F2)",
     "get_settlement_request": "rereads a request under the chain-write lock right before its supersede or slash",

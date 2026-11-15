@@ -9,7 +9,7 @@ import aiohttp
 
 from daemon.config import DaemonConfig
 from daemon.models import AttestationLevel, PendingReceipt
-from daemon.substrate_client import AttestUnsettled, SubstrateClient, should_defer
+from daemon.substrate_client import AttestUnsettled, BackupSignerTooEarly, SubstrateClient, should_defer
 from daemon.locator_registry import LocatorRegistry
 from daemon.blob_verifier import BlobVerifier
 from daemon.cert_builder import scale_cert_encode
@@ -263,6 +263,7 @@ class CertDaemon:
                         retries=entry["retries"],
                         last_error=entry["last_error"],
                         cert_hash=bytes.fromhex(entry["cert_hash"]) if entry["cert_hash"] else None,
+                        not_before=entry.get("not_before", 0),
                     )
                     for receipt_id, entry in state.get("deferred", {}).items()
                 }
@@ -350,6 +351,7 @@ class CertDaemon:
                         "retries": entry.retries,
                         "last_error": entry.last_error,
                         "cert_hash": entry.cert_hash.hex() if entry.cert_hash else None,
+                        "not_before": entry.not_before,
                     }
                     for receipt_id, entry in self.pending.items()
                     if entry.last_error
@@ -390,6 +392,9 @@ class CertDaemon:
             `save_state` persists with the cursor, and `retry_pending` runs it
             again on later ticks, in this process or the next, at most
             `MAX_RECEIPT_RPC_RETRIES` times. The cursor never waits on it.
+          - A receipt a backup signer has verified waits there the same way,
+            for the block the chain takes its attest from, at no cost to
+            those retries.
           - After a clamp, we re-enter the outer loop with the new cursor.
             If the clamped cursor is ALSO past pruning, we clamp again, up
             to `MAX_CLAMPS_PER_TICK` — then bail and let the next tick
@@ -472,12 +477,17 @@ class CertDaemon:
         runs it again on a later tick; `entry` carries the retries it has
         already had. Drops it, by name, once those reach
         MAX_RECEIPT_RPC_RETRIES, a refused attest's drop being a failed cert,
-        or when MAX_DEFERRED_RECEIPTS others already wait."""
+        or when MAX_DEFERRED_RECEIPTS others already wait. A receipt whose
+        attest the chain does not take from this backup signer yet waits for
+        its block instead, which spends no retry."""
         entry = entry or PendingReceipt(receipt_id=receipt_id, receipt=None, first_seen=time.time())
-        entry.retries += 1
+        early = isinstance(error, BackupSignerTooEarly)
+        if not early:
+            entry.retries += 1
         entry.last_error = f"{type(error).__name__}: {error}"
+        entry.not_before = error.not_before if early else 0
         refused = isinstance(error, AttestUnsettled)
-        if refused:
+        if refused or early:
             entry.cert_hash = error.cert_hash
         if entry.retries > MAX_RECEIPT_RPC_RETRIES:
             logger.error(
@@ -495,6 +505,9 @@ class CertDaemon:
                 )
                 return
             self.pending[receipt_id] = entry
+        if early:
+            logger.info(f"receipt {receipt_id[:16]}... verified; {error}")
+            return
         logger.warning(
             f"process_receipt for {receipt_id[:16]}... deferred "
             f"({entry.last_error}); retry {entry.retries}/{MAX_RECEIPT_RPC_RETRIES} "
@@ -579,6 +592,9 @@ class CertDaemon:
         # locks below regardless of which entrypoint called us (parallel
         # batch, push notification, retry_pending). Idempotent.
         self._ensure_concurrency_primitives()
+        parked = self.pending.get(receipt_id)
+        if parked and parked.not_before:
+            return
         receipt = self.client.get_receipt(receipt_id)
         if receipt is None:
             logger.warning(f"Receipt {receipt_id} not found on chain")
@@ -785,7 +801,10 @@ class CertDaemon:
         # all retries behind one HTTP call.
         async with self._pending_lock:
             snapshot = list(self.pending.items())
+        head = self.client.get_best_block_number() if any(entry.not_before for _, entry in snapshot) else 0
         for receipt_id, pending in snapshot:
+            if head < pending.not_before:
+                continue
             if pending.last_error:
                 # Popped first, so a run that misses the locator can park the
                 # receipt back in `pending` as an ordinary locator wait.
@@ -968,6 +987,7 @@ class CertDaemon:
 
             if is_member:
                 logger.info(f"Already in attestation committee as {my_address}")
+                self.client.refresh_backup_delay()
                 return
 
             # Ensure bond meets BondRequirement before attempting join. This
@@ -1136,6 +1156,8 @@ class CertDaemon:
                         logger.info(f"Push notification for {receipt_id[:16]}...")
                         try:
                             await self.process_receipt(receipt_id)
+                        except BackupSignerTooEarly as wait:
+                            await self._defer_receipt(receipt_id, wait)
                         except Exception as e:
                             logger.warning(f"Error processing notified receipt {receipt_id[:16]}...: {e}")
 
