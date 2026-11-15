@@ -36,7 +36,7 @@ WRITE_CONN_FUNCTIONS = {
     "submit_availability_cert": "composes, signs and submits",
     "keepalive": "keeps the write conn's own socket alive",
     "attestation_on_chain": "judges a refused attest at one best block of the node that refused it (#66 F2)",
-    "_backup_attest_not_before": "reads whether the node a backup signer's attest goes to takes it yet",
+    "_early_backup_attest": "reads whether the node a backup signer's attest goes to takes it yet",
     "get_settlement_request": "rereads a request under the chain-write lock right before its supersede or slash",
 }
 # The functions that open, hold or replace a conn's SubstrateInterface, and

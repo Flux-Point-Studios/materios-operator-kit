@@ -194,24 +194,34 @@ not paid for the attests it does make.
 There is nothing to configure. The daemon reads both storage items from the
 chain at startup and again with every committee check, so a change to the
 listing or the delay reaches a running daemon within about a minute. It also
-reads them again whenever the chain refuses an attest, so an attest sent
-inside that minute is parked like any other early one. While your signer is
+reads them again when the chain refuses an attest without saying why, so an
+attest sent inside that minute waits like any other. While your signer is
 listed with a non-zero delay, the daemon:
 
 1. Verifies each receipt's content as usual.
-2. Waits, without submitting, until the chain head reaches the receipt's
-   submission block plus the delay. Other receipts are processed meanwhile.
-   Waiting receipts are kept in the daemon's state file, so a restart or a
-   dropped connection loses none of them.
-3. Checks the chain again at that block and attests only if the receipt is
-   still uncertified. A receipt the other members certified in the meantime
-   is skipped.
+2. Waits, without submitting. Other receipts are processed meanwhile. Waiting
+   receipts are kept in the daemon's state file, so a restart or a dropped
+   connection loses none of them, and no waiting receipt is ever dropped,
+   however many there are.
+3. Stops waiting for a receipt as soon as it sees the other members certify
+   it.
+4. Otherwise attests at the first block the chain accepts it: the block
+   before the receipt's submission block plus the delay, because an attest
+   lands in the block after the one it is sent at. The delay that counts is
+   the one the chain has at that moment, so a shortened or removed delay, or
+   an unlisted signer, frees the waiting receipts at once. The content is
+   fetched and verified again first. If a chunk does not arrive then, the
+   daemon tries again on later ticks; content that arrives and does not match
+   the receipt is rejected.
 
 When the listing takes effect the daemon logs
 `OrinqReceipts.BackupSigners lists this signer: each attest waits N blocks
 after its receipt's submission and earns no fee`. A signer that is not listed
 attests at once. So does every signer on a runtime without `BackupSigners`,
-where the daemon logs one line at startup saying so.
+where the daemon logs one line at startup saying so. If the listing cannot be
+read, the daemon logs `Backup signer listing read failed` and, until one read
+succeeds, treats itself as not listed without counting refused attests
+against a receipt's retries.
 
 ## Running multiple attestors on one host
 

@@ -7,9 +7,11 @@ the committee, each receipt's recorded attesters and certification, and spec
 "Transaction call is not expected", a spent nonce as 1010 "Transaction is
 outdated"). ``number`` is its best block's, ``submitted_at`` the block each
 receipt was submitted in, and ``backup_signers`` the signers whose attest of a
-receipt it refuses the same way before ``backup_delay`` blocks have passed
-since; None is a runtime without backup signers. Its live state is the best
-block's; ``head`` freezes that state under a block hash a read can pin.
+receipt it refuses the same way while the block the pool validates for, the
+one after its best, is before ``submitted_at + backup_delay``; None is a
+runtime without backup signers. A certification is an AvailabilityCertified
+event in the best block it happened at. Its live state is the best block's;
+``head`` freezes that state under a block hash a read can pin.
 ``FakeSI`` is one websocket onto it, whose death the test scripts.
 ``IncludingSI`` is one websocket onto a node that includes every submit,
 returning substrate-interface's own lazy results.
@@ -94,6 +96,7 @@ class FakeChain:
         self.submitted_at: dict[str, int] = {}
         self.backup_signers: set[bytes] | None = None
         self.backup_delay = 0
+        self.certified_in: dict[int, list[str]] = {}
 
     def add_receipt(self, receipt_id: str, block: int) -> None:
         self.attesters[receipt_id] = set()
@@ -103,7 +106,7 @@ class FakeChain:
     def too_early(self, signer: bytes, receipt_id: str) -> bool:
         return (self.backup_signers is not None and signer in self.backup_signers
                 and receipt_id in self.submitted_at
-                and self.number < self.submitted_at[receipt_id] + self.backup_delay)
+                and self.number + 1 < self.submitted_at[receipt_id] + self.backup_delay)
 
     def apply_attest(self, signer: bytes, nonce: int, receipt_id: str, claimed: bytes | None = None) -> None:
         if nonce < self.nonces.get(signer, 0):
@@ -119,6 +122,7 @@ class FakeChain:
         self.included.append((signer, nonce, receipt_id))
         if len(self.attesters[receipt_id]) >= self.threshold:
             self.certified.add(receipt_id)
+            self.certified_in.setdefault(self.number, []).append(receipt_id)
 
     def head(self) -> str:
         """A new best block's hash, with the state as it stands now frozen under it."""
@@ -271,10 +275,14 @@ class FakeSI:
 
     def get_events(self, block_hash):
         self._use("get_events")
+        block = int(block_hash, 16)
         return [SimpleNamespace(value={
             "module_id": "OrinqReceipts", "event_id": "ReceiptSubmitted",
             "attributes": {"receipt_id": rid, "content_hash": RECEIPT_FIELD, "submitter": ""},
-        }) for rid in self.ledger.blocks.get(int(block_hash, 16), [])]
+        }) for rid in self.ledger.blocks.get(block, [])] + [SimpleNamespace(value={
+            "module_id": "OrinqReceipts", "event_id": "AvailabilityCertified",
+            "attributes": {"receipt_id": rid, "cert_hash": "0x" + canonical_cert_hash(rid).hex()},
+        }) for rid in self.ledger.certified_in.get(block, [])]
 
 
 EXTRINSIC_HASH = "0x" + "5e" * 32

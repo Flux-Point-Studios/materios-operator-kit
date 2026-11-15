@@ -262,24 +262,31 @@ def is_transport_dead(error: BaseException) -> bool:
 class AttestUnsettled(Exception):
     """The node refused this signer's attest of a receipt, and the chain, read
     at the refusing node's best block, neither holds the attest nor rules it
-    out yet. ``cert_hash`` is the hash the attest claimed."""
+    out yet. ``cert_hash`` is the hash the attest claimed.
+    ``backup_listing_unknown`` says the chain's backup signer listing has
+    never been read, so the refusal may be of a backup signer's early attest."""
 
-    def __init__(self, receipt_id: str, cert_hash: bytes, refusal: BaseException):
+    def __init__(
+        self, receipt_id: str, cert_hash: bytes, refusal: BaseException, backup_listing_unknown: bool = False
+    ):
         super().__init__(
             f"attest of {receipt_id} refused before the chain settled it: {type(refusal).__name__}: {refusal}"
         )
         self.cert_hash = cert_hash
+        self.backup_listing_unknown = backup_listing_unknown
 
 
 class BackupSignerTooEarly(Exception):
-    """``OrinqReceipts.BackupSigners`` lists this signer, and the chain takes
-    its attest of a receipt only from block ``not_before``. ``cert_hash`` is
-    the hash the attest claims."""
+    """``OrinqReceipts.BackupSigners`` lists this signer, and the chain does
+    not take its attest of a receipt submitted in block ``submitted_at`` yet.
+    ``cert_hash`` is the hash the attest claims."""
 
-    def __init__(self, receipt_id: str, cert_hash: bytes, not_before: int):
-        super().__init__(f"attest of {receipt_id} waits for block {not_before}: this signer is a backup")
+    def __init__(self, receipt_id: str, cert_hash: bytes, submitted_at: int):
+        super().__init__(
+            f"attest of {receipt_id}, submitted in block {submitted_at}, waits out this backup signer's delay"
+        )
         self.cert_hash = cert_hash
-        self.not_before = not_before
+        self.submitted_at = submitted_at
 
 
 def should_defer(error: BaseException) -> bool:
@@ -1264,20 +1271,28 @@ class SubstrateClient:
             )
         self._backup_delay = delay
 
-    def _backup_attest_not_before(self, receipt_id: str) -> Optional[int]:
-        """The block from which the chain takes this backup signer's attest of
-        ``receipt_id``, while the node the attest is submitted to is still
-        before it; None once it is not, and for a signer with no backup
-        delay, which reads nothing. A receipt with no ``ReceiptSubmittedAt``
-        entry has no delay."""
+    def backup_attest_from(self, submitted_at: int) -> int:
+        """The first best block at which the chain takes this signer's attest
+        of a receipt submitted in block ``submitted_at``. The pallet takes a
+        backup signer's attest from block ``submitted_at + BackupSignerDelay``,
+        and the pool validates an attest for the block after its best. A
+        signer with no backup delay is taken at any block."""
+        return submitted_at + (self._backup_delay or 0) - 1
+
+    def _early_backup_attest(self, receipt_id: str) -> Optional[int]:
+        """The block ``receipt_id`` was submitted in, while the node the
+        attest is submitted to does not take this backup signer's attest of
+        it yet; None once it does, and for a signer with no backup delay,
+        which reads nothing. A receipt with no ``ReceiptSubmittedAt`` entry
+        has no delay."""
         if not self._backup_delay:
             return None
         submitted_at = self._call(
             "query", "OrinqReceipts", "ReceiptSubmittedAt", [receipt_id], conn=self._write
         ).value
         best = self._call("get_block_header", conn=self._write)["header"]["number"]
-        if submitted_at is not None and best < submitted_at + self._backup_delay:
-            return submitted_at + self._backup_delay
+        if submitted_at is not None and best < self.backup_attest_from(submitted_at):
+            return submitted_at
         return None
 
     def submit_join_committee(self):
@@ -2379,18 +2394,16 @@ class SubstrateClient:
 
         A backup signer first reads, on the node it submits to, whether the
         chain takes its attest yet, and raises :class:`BackupSignerTooEarly`
-        instead of submitting while it does not. An attest the chain still
-        fails with ``BackupSignerTooEarly`` raises the same, for the next
-        block, once the delay has been read again. So does a refusal the
-        chain has not settled, when the delay, read again, shows the attest
-        was a backup signer's early one; if that read fails, the refusal
-        stays :class:`AttestUnsettled`.
+        instead of submitting while it does not. So does a refusal the chain
+        has not settled, when the delay, read again, shows the attest was a
+        backup signer's early one; if that read fails, the refusal stays
+        :class:`AttestUnsettled`.
         """
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
-            not_before = self._backup_attest_not_before(receipt_id)
-            if not_before is not None:
-                raise BackupSignerTooEarly(receipt_id, cert_hash, not_before)
+            submitted_at = self._early_backup_attest(receipt_id)
+            if submitted_at is not None:
+                raise BackupSignerTooEarly(receipt_id, cert_hash, submitted_at)
             try:
                 call = self._call(
                     "compose_call",
@@ -2413,10 +2426,6 @@ class SubstrateClient:
                 )
                 if not receipt.is_success:
                     last_error = str(receipt.error_message)
-                    if "BackupSignerTooEarly" in last_error:
-                        self.refresh_backup_delay()
-                        best = self._call("get_block_header", conn=self._write)["header"]["number"]
-                        raise BackupSignerTooEarly(receipt_id, cert_hash, best + 1)
                     logger.error(f"Cert tx failed for {receipt_id}: {last_error}")
                     continue
                 # Dispatch landed. Now check whether the runtime accepted our
@@ -2426,23 +2435,21 @@ class SubstrateClient:
                     return strike_info
                 logger.info(f"Cert attested for {receipt_id}, block {receipt.block_hash}")
                 return SubmitCertOutcome(success=True)
-            except BackupSignerTooEarly:
-                raise
             except SubstrateRequestException as e:
                 settled = self.attestation_on_chain(receipt_id, cert_hash)
                 if settled is None:
                     try:
                         self.refresh_backup_delay()
-                        not_before = self._backup_attest_not_before(receipt_id)
+                        submitted_at = self._early_backup_attest(receipt_id)
                     except Exception as read_error:
                         logger.warning(
                             f"Cert tx for {receipt_id} refused, and the backup signer listing could "
                             f"not be read to tell why: {type(read_error).__name__}: {read_error}"
                         )
-                        not_before = None
-                    if not_before is not None:
-                        raise BackupSignerTooEarly(receipt_id, cert_hash, not_before) from e
-                    raise AttestUnsettled(receipt_id, cert_hash, e) from e
+                        submitted_at = None
+                    if submitted_at is not None:
+                        raise BackupSignerTooEarly(receipt_id, cert_hash, submitted_at) from e
+                    raise AttestUnsettled(receipt_id, cert_hash, e, self._backup_delay is None) from e
                 if settled:
                     logger.info(
                         f"Cert tx for {receipt_id} refused ({e}); already on chain: the receipt "
