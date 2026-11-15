@@ -62,7 +62,7 @@
     {
       "id": "evidence-submitter",
       "name": "Evidence submitter",
-      "desc": "Lifts pending attestation evidence from the gateway to the tee-attestation pallet. The payload is SCALE-encoded without a chain call, so only a row's own bytes can drop it; a chain call that fails or times out leaves the row for a later tick, and the outcome is read under the chain-write lock.",
+      "desc": "Lifts pending attestation evidence from the gateway to the tee-attestation pallet. The payload is SCALE-encoded without a chain call, so a chain call that fails or times out leaves the row for a later tick, and the outcome is read under the chain-write lock. A pallet refusal no retry changes (failed verification, content hash mismatch, duplicate evidence, a full evidence type or receipt) drops the row unacked; an unknown receipt is retried on five later ticks first. A refused signer (UnauthorizedSubmitter) pauses submission, logged once as an operator error, until OrinqReceipts::CommitteeMembers holds the key again, and drops no row. While the daemon runs, a landed row whose ack failed is acked again with its landing's extrinsic hash instead of being resubmitted, as long as the row still names the same receipt and evidence type; a restart forgets the hash.",
       "kind": "pipeline",
       "paths": [
         "daemon/evidence_submitter.py"
