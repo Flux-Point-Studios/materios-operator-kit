@@ -5,10 +5,16 @@ dead-socket tests.
 the committee, each receipt's recorded attesters and certification, and spec
 242's pool rule (an attest the runtime would not count is refused as 1010
 "Transaction call is not expected", a spent nonce as 1010 "Transaction is
-outdated"). Its live state is the best block's; ``head`` freezes that state
-under a block hash a read can pin. ``FakeSI`` is one websocket onto it, whose
-death the test scripts. ``IncludingSI`` is one websocket onto a node that
-includes every submit, returning substrate-interface's own lazy results.
+outdated"). ``number`` is its best block's, ``submitted_at`` the block each
+receipt was submitted in, and ``backup_signers`` the signers whose attest of a
+receipt it refuses the same way while the block the pool validates for, the
+one after its best, is before ``submitted_at + backup_delay``; None is a
+runtime without backup signers. A certification is an AvailabilityCertified
+event in the best block it happened at. Its live state is the best block's;
+``head`` freezes that state under a block hash a read can pin.
+``FakeSI`` is one websocket onto it, whose death the test scripts.
+``IncludingSI`` is one websocket onto a node that includes every submit,
+returning substrate-interface's own lazy results.
 """
 import errno
 import hashlib
@@ -18,7 +24,7 @@ from types import SimpleNamespace
 
 import websocket._socket
 from substrateinterface.base import ExtrinsicReceipt, QueryMapResult
-from substrateinterface.exceptions import SubstrateRequestException
+from substrateinterface.exceptions import StorageFunctionNotFound, SubstrateRequestException
 from substrateinterface.utils.ss58 import ss58_encode
 from websocket import WebSocketTimeoutException
 
@@ -67,6 +73,13 @@ def kernel_timeout() -> WebSocketTimeoutException:
     raise AssertionError("websocket-client returned from a timed-out socket")
 
 
+class DecodedList(SimpleNamespace):
+    """A decoded storage list: substrate-interface's result iterates its items."""
+
+    def __iter__(self):
+        return iter(self.value)
+
+
 class FakeChain:
     def __init__(self, threshold: int = 2):
         self.threshold = threshold
@@ -79,10 +92,21 @@ class FakeChain:
         self.clock = 0.0
         self.frozen: dict[str, SimpleNamespace] = {}
         self.finalized: str | None = None
+        self.number = 0
+        self.submitted_at: dict[str, int] = {}
+        self.backup_signers: set[bytes] | None = None
+        self.backup_delay = 0
+        self.certified_in: dict[int, list[str]] = {}
 
     def add_receipt(self, receipt_id: str, block: int) -> None:
         self.attesters[receipt_id] = set()
         self.blocks.setdefault(block, []).append(receipt_id)
+        self.submitted_at[receipt_id] = block
+
+    def too_early(self, signer: bytes, receipt_id: str) -> bool:
+        return (self.backup_signers is not None and signer in self.backup_signers
+                and receipt_id in self.submitted_at
+                and self.number + 1 < self.submitted_at[receipt_id] + self.backup_delay)
 
     def apply_attest(self, signer: bytes, nonce: int, receipt_id: str, claimed: bytes | None = None) -> None:
         if nonce < self.nonces.get(signer, 0):
@@ -90,13 +114,15 @@ class FakeChain:
         if (signer not in self.members or receipt_id not in self.attesters
                 or receipt_id in self.certified
                 or (claimed is not None and claimed != canonical_cert_hash(receipt_id))
-                or signer in self.attesters[receipt_id]):
+                or signer in self.attesters[receipt_id]
+                or self.too_early(signer, receipt_id)):
             raise SubstrateRequestException(CALL_NOT_EXPECTED)
         self.nonces[signer] = nonce + 1
         self.attesters[receipt_id].add(signer)
         self.included.append((signer, nonce, receipt_id))
         if len(self.attesters[receipt_id]) >= self.threshold:
             self.certified.add(receipt_id)
+            self.certified_in.setdefault(self.number, []).append(receipt_id)
 
     def head(self) -> str:
         """A new best block's hash, with the state as it stands now frozen under it."""
@@ -105,6 +131,10 @@ class FakeChain:
             members=frozenset(self.members),
             certified=frozenset(self.certified),
             attesters={receipt: frozenset(signers) for receipt, signers in self.attesters.items()},
+            number=self.number,
+            submitted_at=dict(self.submitted_at),
+            backup_signers=None if self.backup_signers is None else frozenset(self.backup_signers),
+            backup_delay=self.backup_delay,
         )
         return block_hash
 
@@ -192,8 +222,18 @@ class FakeSI:
         self._use("query")
         state = self.ledger.at(block_hash or self.best)
         if storage_function == "CommitteeMembers":
-            return SimpleNamespace(value=[ss58_encode(member, 0) for member in sorted(state.members)])
+            return DecodedList(value=[ss58_encode(member, 0) for member in sorted(state.members)])
+        if storage_function in ("BackupSigners", "BackupSignerDelay"):
+            if state.backup_signers is None:
+                raise StorageFunctionNotFound(f'Storage function "{module}.{storage_function}" not found')
+            if storage_function == "BackupSignerDelay":
+                return SimpleNamespace(value=state.backup_delay)
+            return SimpleNamespace(value=[ss58_encode(signer, 0) for signer in sorted(state.backup_signers)])
         receipt_id = params[0]
+        if storage_function == "ReceiptSubmittedAt":
+            # The runtime removes the entry once the receipt is certified.
+            certified = receipt_id in state.certified
+            return SimpleNamespace(value=None if certified else state.submitted_at.get(receipt_id))
         if storage_function == "Receipts":
             known = receipt_id in state.attesters
             return SimpleNamespace(value=self.ledger.receipt_row(state, receipt_id) if known else None)
@@ -229,12 +269,20 @@ class FakeSI:
         self._use("get_block_hash")
         return f"0x{block_number:064x}"
 
+    def get_block_header(self, block_hash=None):
+        self._use("get_block_header")
+        return {"header": {"number": self.ledger.at(block_hash or self.best).number}}
+
     def get_events(self, block_hash):
         self._use("get_events")
+        block = int(block_hash, 16)
         return [SimpleNamespace(value={
             "module_id": "OrinqReceipts", "event_id": "ReceiptSubmitted",
             "attributes": {"receipt_id": rid, "content_hash": RECEIPT_FIELD, "submitter": ""},
-        }) for rid in self.ledger.blocks.get(int(block_hash, 16), [])]
+        }) for rid in self.ledger.blocks.get(block, [])] + [SimpleNamespace(value={
+            "module_id": "OrinqReceipts", "event_id": "AvailabilityCertified",
+            "attributes": {"receipt_id": rid, "cert_hash": "0x" + canonical_cert_hash(rid).hex()},
+        }) for rid in self.ledger.certified_in.get(block, [])]
 
 
 EXTRINSIC_HASH = "0x" + "5e" * 32

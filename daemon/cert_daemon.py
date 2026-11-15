@@ -9,7 +9,7 @@ import aiohttp
 
 from daemon.config import DaemonConfig
 from daemon.models import AttestationLevel, PendingReceipt
-from daemon.substrate_client import AttestUnsettled, SubstrateClient, should_defer
+from daemon.substrate_client import AttestUnsettled, BackupSignerTooEarly, SubstrateClient, should_defer
 from daemon.locator_registry import LocatorRegistry
 from daemon.blob_verifier import BlobVerifier
 from daemon.cert_builder import scale_cert_encode
@@ -96,9 +96,16 @@ MAX_CLAMPS_PER_TICK: int = 5
 # each retry waits out a reconnect cycle first.
 MAX_RECEIPT_RPC_RETRIES: int = 5
 
-# Deferred receipts kept at once, which bounds the state file written every
-# block; past it a receipt is dropped, by name, instead of deferred.
+# Receipts deferred by a failure kept at once, which bounds the state file
+# written every block; past it a receipt is dropped, by name, instead of
+# deferred. A backup signer's waits are not failures: none counts here and
+# none is dropped. The chain bounds them, to the uncertified receipts of one
+# backup delay.
 MAX_DEFERRED_RECEIPTS: int = 256
+
+
+class ChunksUnfetched(Exception):
+    """A receipt that verified in an earlier run did not fetch whole in this one."""
 
 
 def _is_pruned_state_error(exc) -> bool:
@@ -263,6 +270,7 @@ class CertDaemon:
                         retries=entry["retries"],
                         last_error=entry["last_error"],
                         cert_hash=bytes.fromhex(entry["cert_hash"]) if entry["cert_hash"] else None,
+                        submitted_at=entry.get("submitted_at"),
                     )
                     for receipt_id, entry in state.get("deferred", {}).items()
                 }
@@ -350,6 +358,7 @@ class CertDaemon:
                         "retries": entry.retries,
                         "last_error": entry.last_error,
                         "cert_hash": entry.cert_hash.hex() if entry.cert_hash else None,
+                        "submitted_at": entry.submitted_at,
                     }
                     for receipt_id, entry in self.pending.items()
                     if entry.last_error
@@ -390,6 +399,10 @@ class CertDaemon:
             `save_state` persists with the cursor, and `retry_pending` runs it
             again on later ticks, in this process or the next, at most
             `MAX_RECEIPT_RPC_RETRIES` times. The cursor never waits on it.
+          - A receipt a backup signer has verified waits there the same way,
+            at no cost to those retries and never dropped, until the others
+            certify it, which its AvailabilityCertified event shows here, or
+            the chain takes the backup's attest.
           - After a clamp, we re-enter the outer loop with the new cursor.
             If the clamped cursor is ALSO past pruning, we clamp again, up
             to `MAX_CLAMPS_PER_TICK` — then bail and let the next tick
@@ -431,12 +444,31 @@ class CertDaemon:
                     self.last_processed_block = block_num
                     health_server.increment_metric("blocks_processed_total")
 
-                    # Scan for AvailabilityCertified events for checkpointing
-                    if self.config.checkpoint_enabled:
+                    # Scan for AvailabilityCertified events: each is a leaf to
+                    # checkpoint, and the end of a backup signer's wait.
+                    waits = any(entry.submitted_at is not None for entry in self.pending.values())
+                    if self.config.checkpoint_enabled or waits:
                         certified = self.client.get_block_certified_events(block_num)
                         for cert_event in certified:
                             cert_hash_bytes = bytes.fromhex(cert_event["cert_hash"].removeprefix("0x"))
-                            self.checkpointer.add_cert(cert_event["receipt_id"], cert_hash_bytes, block_num)
+                            if self.config.checkpoint_enabled:
+                                self.checkpointer.add_cert(cert_event["receipt_id"], cert_hash_bytes, block_num)
+                            waited = self.pending.get(cert_event["receipt_id"])
+                            if waited is None or waited.submitted_at is None:
+                                continue
+                            async with self._pending_lock:
+                                self.pending.pop(cert_event["receipt_id"], None)
+                            if waited.cert_hash == cert_hash_bytes:
+                                logger.info(
+                                    f"wait for {cert_event['receipt_id'][:16]}... over: "
+                                    f"the other members certified it in block {block_num}"
+                                )
+                                health_server.increment_metric("certs_already_on_chain_total")
+                            else:
+                                await self._cert_failed(
+                                    cert_event["receipt_id"],
+                                    "the receipt is certified under another hash than this backup signer's",
+                                )
 
                     self.save_state()
                 except Exception as per_block_exc:
@@ -472,12 +504,19 @@ class CertDaemon:
         runs it again on a later tick; `entry` carries the retries it has
         already had. Drops it, by name, once those reach
         MAX_RECEIPT_RPC_RETRIES, a refused attest's drop being a failed cert,
-        or when MAX_DEFERRED_RECEIPTS others already wait."""
+        or when MAX_DEFERRED_RECEIPTS failures already wait. A receipt whose
+        attest the chain does not take from this backup signer yet waits
+        instead, under the block it was submitted in: that spends no retry,
+        counts for no limit and is never dropped. Nor is a retry spent on a
+        refusal while the backup signer listing has never been read."""
         entry = entry or PendingReceipt(receipt_id=receipt_id, receipt=None, first_seen=time.time())
-        entry.retries += 1
-        entry.last_error = f"{type(error).__name__}: {error}"
+        early = isinstance(error, BackupSignerTooEarly)
         refused = isinstance(error, AttestUnsettled)
-        if refused:
+        if not early and not (refused and error.backup_listing_unknown):
+            entry.retries += 1
+        entry.last_error = f"{type(error).__name__}: {error}"
+        entry.submitted_at = error.submitted_at if early else None
+        if refused or early:
             entry.cert_hash = error.cert_hash
         if entry.retries > MAX_RECEIPT_RPC_RETRIES:
             logger.error(
@@ -488,13 +527,17 @@ class CertDaemon:
                 await self._cert_failed(receipt_id, entry.last_error)
             return
         async with self._pending_lock:
-            if sum(1 for waiting in self.pending.values() if waiting.last_error) >= MAX_DEFERRED_RECEIPTS:
+            failures = sum(1 for other in self.pending.values() if other.last_error and other.submitted_at is None)
+            if not early and failures >= MAX_DEFERRED_RECEIPTS:
                 logger.error(
                     f"dropping receipt {receipt_id[:16]}...: DEFERRED_LIMIT of "
                     f"{MAX_DEFERRED_RECEIPTS} deferred receipts reached; its error {entry.last_error}"
                 )
                 return
             self.pending[receipt_id] = entry
+        if early:
+            logger.info(f"receipt {receipt_id[:16]}... verified; {error}")
+            return
         logger.warning(
             f"process_receipt for {receipt_id[:16]}... deferred "
             f"({entry.last_error}); retry {entry.retries}/{MAX_RECEIPT_RPC_RETRIES} "
@@ -574,11 +617,16 @@ class CertDaemon:
             logger.warning(f"Failed to get Cardano epoch from Ogmios: {e}")
             return 0
 
-    async def process_receipt(self, receipt_id: str):
+    async def process_receipt(self, receipt_id: str, deferred: Optional[PendingReceipt] = None):
+        """``deferred`` is the entry `retry_pending` took out of `pending`
+        to run the receipt again."""
         # Concurrency primitives are required for the pending / chain-write
         # locks below regardless of which entrypoint called us (parallel
         # batch, push notification, retry_pending). Idempotent.
         self._ensure_concurrency_primitives()
+        parked = self.pending.get(receipt_id)
+        if parked and parked.submitted_at is not None:
+            return
         receipt = self.client.get_receipt(receipt_id)
         if receipt is None:
             logger.warning(f"Receipt {receipt_id} not found on chain")
@@ -614,6 +662,18 @@ class CertDaemon:
             f"Verification for {receipt_id}: level={verification.attestation_level.name}, "
             f"chunks={verification.chunks_verified}/{verification.chunks_total}"
         )
+
+        if (verification.attestation_level == AttestationLevel.FETCHED
+                and deferred is not None and deferred.cert_hash is not None
+                and deferred.retries < MAX_RECEIPT_RPC_RETRIES):
+            # FETCHED: a chunk did not arrive, or not as the manifest lists
+            # it, so no root was computed and nothing is known of the content.
+            # This receipt reached ROOT_VERIFIED in the run that claimed
+            # `cert_hash`, so its chunks are fetched again on a later tick. A
+            # root that differs (HASH_VERIFIED) is rejected below, as is a
+            # receipt whose chunks stay away for every retry.
+            await self._defer_receipt(receipt_id, ChunksUnfetched("; ".join(verification.errors)), deferred)
+            return
 
         if verification.attestation_level < MIN_ATTESTATION_LEVEL_TO_ATTEST:
             # Hard reject. Includes the Merkle-root mismatch case
@@ -785,7 +845,15 @@ class CertDaemon:
         # all retries behind one HTTP call.
         async with self._pending_lock:
             snapshot = list(self.pending.items())
+        waits = any(entry.submitted_at is not None for _, entry in snapshot)
+        head = self.client.get_best_block_number() if waits else 0
         for receipt_id, pending in snapshot:
+            if pending.submitted_at is not None:
+                # A wait follows the delay the chain has now. A try the node
+                # submitted to finds too early is not made again at this head.
+                if head < max(self.client.backup_attest_from(pending.submitted_at), pending.not_before):
+                    continue
+                pending.not_before = head + 1
             if pending.last_error:
                 # Popped first, so a run that misses the locator can park the
                 # receipt back in `pending` as an ordinary locator wait.
@@ -802,7 +870,7 @@ class CertDaemon:
                             self.client.attestation_on_chain, receipt_id, pending.cert_hash
                         )
                     if settled is None:
-                        await self.process_receipt(receipt_id)
+                        await self.process_receipt(receipt_id, pending)
                     elif settled:
                         logger.info(f"retry of {receipt_id[:16]}... skipped: already on chain")
                         health_server.increment_metric("certs_already_on_chain_total")
@@ -968,6 +1036,10 @@ class CertDaemon:
 
             if is_member:
                 logger.info(f"Already in attestation committee as {my_address}")
+                try:
+                    self.client.refresh_backup_delay()
+                except Exception as e:
+                    logger.warning(f"Backup signer listing read failed: {type(e).__name__}: {e}")
                 return
 
             # Ensure bond meets BondRequirement before attempting join. This
@@ -1136,6 +1208,8 @@ class CertDaemon:
                         logger.info(f"Push notification for {receipt_id[:16]}...")
                         try:
                             await self.process_receipt(receipt_id)
+                        except BackupSignerTooEarly as wait:
+                            await self._defer_receipt(receipt_id, wait)
                         except Exception as e:
                             logger.warning(f"Error processing notified receipt {receipt_id[:16]}...: {e}")
 
