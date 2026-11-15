@@ -27,8 +27,9 @@ from daemon import cert_daemon
 from daemon import substrate_client as sc
 from daemon.substrate_client import RPCTimeoutError
 from tests.fake_chain import (
-    OTHER_MEMBERS, RECEIPT_ID, FakeChain, attest_daemon, canonical_cert_hash, certify_by_others,
-    connected_client, criticals, dialling_client, fake_endpoint, included, metric, receipt_scenario, signatures,
+    CALL_NOT_EXPECTED, OTHER_MEMBERS, RECEIPT_ID, FakeChain, attest_daemon, canonical_cert_hash, certify_by_others,
+    connected_client, criticals, dialling_client, fake_endpoint, included, metric, receipt_scenario, refuse_submits,
+    signatures,
 )
 
 SPEC_242_METADATA = Path(__file__).parent / "fixtures/custody/materios/metadata_spec242.hex.gz"
@@ -37,6 +38,8 @@ DELAY = 10
 SUBMITTED_AT = 100
 NOT_BEFORE = SUBMITTED_AT + DELAY
 ATTEST = ["compose_call", "create_signed_extrinsic", "submit_extrinsic"]
+VERDICT = ["get_chain_head", "query", "query", "query"]
+BLOCK_AND_RECEIPT = ["get_block_hash", "get_events", "query"]
 TOO_EARLY = {"type": "Module", "name": "BackupSignerTooEarly",
              "docs": ["A backup signer attested before its delay had passed."]}
 
@@ -461,6 +464,87 @@ def test_a_too_early_dispatch_error_is_a_wait_not_a_failure(tmp_path, caplog):
     ledger.number = NOT_BEFORE
     asyncio.run(daemon.retry_pending())
     assert included(ledger) == [RECEIPT_ID] and daemon.pending == {} and noise(caplog) == []
+
+
+def test_a_refusal_that_a_fresh_read_shows_is_a_backups_early_attest_is_a_wait(tmp_path, caplog):
+    """The chain listed the daemon as a backup after its last committee check,
+    and its pool refuses the early attest as it refuses any other: 1010, with
+    no error name."""
+    ledger, endpoint, daemon = receipt_scenario(tmp_path)
+    daemon.client.refresh_backup_delay()
+    list_as_backup(ledger, daemon.client.keypair.public_key)
+    failures = metric("verification_failures_total")
+
+    asyncio.run(daemon._process_block_range(SUBMITTED_AT))
+
+    waiting = daemon.pending[RECEIPT_ID]
+    assert (waiting.not_before, waiting.retries) == (NOT_BEFORE, 0)
+    assert waiting.cert_hash == canonical_cert_hash(RECEIPT_ID)
+    assert signatures(endpoint) == 1 and included(ledger) == []
+    assert daemon.discord == [] and noise(caplog) == []
+    assert metric("verification_failures_total") == failures
+    assert not daemon.cert_store.exists(RECEIPT_ID)
+
+    ledger.number = NOT_BEFORE
+    asyncio.run(daemon.retry_pending())
+    assert included(ledger) == [RECEIPT_ID] and daemon.pending == {} and noise(caplog) == []
+
+
+@pytest.mark.parametrize("backup_signers", [None, set(OTHER_MEMBERS)], ids=["no-backup-signers", "unlisted"])
+def test_an_unsettled_refusal_of_a_signer_that_is_no_backup_costs_one_more_read(tmp_path, caplog, backup_signers):
+    ledger, endpoint, daemon = receipt_scenario(tmp_path)
+    ledger.backup_signers, ledger.backup_delay, ledger.number = backup_signers, DELAY, SUBMITTED_AT
+    write, read = endpoint.opened
+    refuse_submits(endpoint, CALL_NOT_EXPECTED)
+
+    asyncio.run(daemon._process_block_range(SUBMITTED_AT))
+
+    assert write.calls == ATTEST + VERDICT
+    assert read.calls == BLOCK_AND_RECEIPT + ["query"]
+    deferred = daemon.pending[RECEIPT_ID]
+    assert (deferred.retries, deferred.not_before) == (1, 0)
+    assert deferred.last_error.startswith("AttestUnsettled") and deferred.cert_hash == canonical_cert_hash(RECEIPT_ID)
+    assert [message for message in noise(caplog) if "retry 1/" in message] == noise(caplog) != []
+    assert daemon.discord == []
+
+
+def test_an_unsettled_refusal_stays_one_when_the_backup_read_fails(tmp_path, caplog):
+    ledger, endpoint, daemon = receipt_scenario(tmp_path)
+    daemon.client.refresh_backup_delay()
+    list_as_backup(ledger, daemon.client.keypair.public_key)
+    read = endpoint.opened[1]
+    query = read.query
+
+    def backup_read_times_out(module, storage_function, params=None, block_hash=None):
+        if storage_function == "BackupSigners":
+            raise RPCTimeoutError("no answer")
+        return query(module, storage_function, params, block_hash)
+
+    read.query = backup_read_times_out
+
+    asyncio.run(daemon._process_block_range(SUBMITTED_AT))
+
+    deferred = daemon.pending[RECEIPT_ID]
+    assert (deferred.retries, deferred.not_before) == (1, 0)
+    assert deferred.last_error.startswith("AttestUnsettled") and deferred.cert_hash == canonical_cert_hash(RECEIPT_ID)
+    assert len(noise(caplog)) == 2 and "RPCTimeoutError: no answer" in noise(caplog)[0]
+    assert "retry 1/" in noise(caplog)[1]
+    assert signatures(endpoint) == 1 and daemon.discord == []
+
+
+def test_a_backups_refusal_at_its_block_is_still_unsettled(tmp_path, caplog):
+    """The delay has passed, and the pool refuses the attest for its hash:
+    the daemon built its cert against another genesis."""
+    ledger, endpoint, daemon = backup_scenario(tmp_path)
+    daemon._live_chain_genesis = "0x" + "99" * 32
+    ledger.number = NOT_BEFORE
+
+    asyncio.run(daemon._process_block_range(SUBMITTED_AT))
+
+    deferred = daemon.pending[RECEIPT_ID]
+    assert (deferred.retries, deferred.not_before) == (1, 0)
+    assert deferred.last_error.startswith("AttestUnsettled")
+    assert signatures(endpoint) == 1 and len(noise(caplog)) == 1
 
 
 def test_a_pushed_receipt_waits_without_a_warning_and_its_block_does_not_verify_it_again(

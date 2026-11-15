@@ -193,8 +193,10 @@ not paid for the attests it does make.
 
 There is nothing to configure. The daemon reads both storage items from the
 chain at startup and again with every committee check, so a change to the
-listing or the delay reaches a running daemon within about a minute. While
-your signer is listed with a non-zero delay, the daemon:
+listing or the delay reaches a running daemon within about a minute. It also
+reads them again whenever the chain refuses an attest, so an attest sent
+inside that minute is parked like any other early one. While your signer is
+listed with a non-zero delay, the daemon:
 
 1. Verifies each receipt's content as usual.
 2. Waits, without submitting, until the chain head reaches the receipt's

@@ -148,7 +148,7 @@ TRANSPORT_MUTANTS = [
     ('submit-swallows-dead-socket', 'daemon/substrate_client.py', '                if is_transport_dead(e):\n                    raise\n', ''),
     ('refusal-never-done', 'daemon/substrate_client.py', '                if settled:\n                    logger.info(', '                if False:\n                    logger.info('),
     ('refusal-always-done', 'daemon/substrate_client.py', '                settled = self.attestation_on_chain(receipt_id, cert_hash)\n', '                settled = True\n'),
-    ('unsettled-refusal-fails', 'daemon/substrate_client.py', '                if settled is None:\n                    raise AttestUnsettled', '                if False:\n                    raise AttestUnsettled'),
+    ('unsettled-refusal-fails', 'daemon/substrate_client.py', '                if settled is None:\n                    try:', '                if False:\n                    try:'),
     ('refusal-for-good-resubmitted', 'daemon/substrate_client.py', '                return SubmitCertOutcome(success=False, error_message=f"{type(e).__name__}: {e}")\n', '                last_error = f"{type(e).__name__}: {e}"\n'),
     ('verdict-reads-finalized', 'daemon/substrate_client.py', 'head = self._call("get_chain_head", conn=self._write)', 'head = self._call("get_chain_finalised_head", conn=self._write)'),
     ('verdict-at-the-poll-loops-head', 'daemon/substrate_client.py', 'head = self._call("get_chain_head", conn=self._write)', 'head = self._call("get_chain_head", conn=self._read)'),
@@ -162,7 +162,18 @@ TRANSPORT_MUTANTS = [
     ('timeouts-not-deferred', 'daemon/substrate_client.py', 'isinstance(e, (RPCTimeoutError, AttestUnsettled, BackupSignerTooEarly)) for e in _error_chain(error)', 'isinstance(e, (AttestUnsettled, BackupSignerTooEarly)) for e in _error_chain(error)'),
     ('unsettled-refusal-dropped', 'daemon/substrate_client.py', 'isinstance(e, (RPCTimeoutError, AttestUnsettled, BackupSignerTooEarly)) for e in _error_chain(error)', 'isinstance(e, (RPCTimeoutError, BackupSignerTooEarly)) for e in _error_chain(error)'),
     ('backup-wait-dropped', 'daemon/substrate_client.py', 'isinstance(e, (RPCTimeoutError, AttestUnsettled, BackupSignerTooEarly)) for e in _error_chain(error)', 'isinstance(e, (RPCTimeoutError, AttestUnsettled)) for e in _error_chain(error)'),
-    ('backup-attests-at-once', 'daemon/substrate_client.py', '            if self._backup_delay:\n', '            if False:\n'),
+    ('backup-attests-at-once', 'daemon/substrate_client.py', '        if not self._backup_delay:\n            return None\n', '        return None\n'),
+    ('non-backup-reads-before-attesting', 'daemon/substrate_client.py', '        if not self._backup_delay:\n            return None\n', '        if self._backup_delay is None:\n            return None\n'),
+    ('early-backup-attest-submitted', 'daemon/substrate_client.py', '            if not_before is not None:\n                raise BackupSignerTooEarly(receipt_id, cert_hash, not_before)\n', ''),
+    ('refused-backup-listing-not-reread', 'daemon/substrate_client.py', '                        self.refresh_backup_delay()\n                        not_before = self._backup_attest_not_before(receipt_id)\n', '                        not_before = self._backup_attest_not_before(receipt_id)\n'),
+    ('refused-early-backup-attest-unsettled', 'daemon/substrate_client.py', '                    if not_before is not None:\n                        raise BackupSignerTooEarly(receipt_id, cert_hash, not_before) from e\n', ''),
+    ('refused-backup-waits-past-its-block', 'daemon/substrate_client.py', '                    if not_before is not None:\n                        raise BackupSignerTooEarly(receipt_id, cert_hash, not_before) from e\n', '                    if self._backup_delay:\n                        raise BackupSignerTooEarly(receipt_id, cert_hash, not_before) from e\n'),
+    ('failed-backup-read-loses-the-refusal', 'daemon/substrate_client.py', '                    except Exception as read_error:\n', '                    except StorageFunctionNotFound as read_error:\n'),
+    ('failed-backup-read-silent', 'daemon/substrate_client.py', '''                        logger.warning(
+                            f"Cert tx for {receipt_id} refused, and the backup signer listing could "
+                            f"not be read to tell why: {type(read_error).__name__}: {read_error}"
+                        )
+''', ''),
     ('backup-attests-a-block-early', 'daemon/substrate_client.py', 'best < submitted_at + self._backup_delay:', 'best + 1 < submitted_at + self._backup_delay:'),
     ('backup-waits-a-block-too-long', 'daemon/substrate_client.py', 'best < submitted_at + self._backup_delay:', 'best <= submitted_at + self._backup_delay:'),
     ('backup-check-on-the-read-conn', 'daemon/substrate_client.py', '"ReceiptSubmittedAt", [receipt_id], conn=self._write', '"ReceiptSubmittedAt", [receipt_id], conn=self._read'),
@@ -170,7 +181,7 @@ TRANSPORT_MUTANTS = [
     ('missing-backup-storage-noted-every-check', 'daemon/substrate_client.py', '            if self._backup_delay is None:\n', '            if True:\n'),
     ('unlisted-signer-waits', 'daemon/substrate_client.py', '            ) if listed else 0\n', '            )\n'),
     ('too-early-dispatch-fails', 'daemon/substrate_client.py', 'if "BackupSignerTooEarly" in last_error:', 'if False:'),
-    ('too-early-dispatch-keeps-a-stale-delay', 'daemon/substrate_client.py', '                        self.refresh_backup_delay()\n', ''),
+    ('too-early-dispatch-keeps-a-stale-delay', 'daemon/substrate_client.py', '                        self.refresh_backup_delay()\n                        best = ', '                        best = '),
     ('too-early-dispatch-not-held-a-block', 'daemon/substrate_client.py', 'raise BackupSignerTooEarly(receipt_id, cert_hash, best + 1)', 'raise BackupSignerTooEarly(receipt_id, cert_hash, 0)'),
     ('waiting-spends-retries', 'daemon/cert_daemon.py', '        if not early:\n            entry.retries += 1\n', '        entry.retries += 1\n'),
     ('wait-block-not-kept', 'daemon/cert_daemon.py', 'entry.not_before = error.not_before if early else 0', 'entry.not_before = 0'),

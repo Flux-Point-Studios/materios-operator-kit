@@ -1264,6 +1264,22 @@ class SubstrateClient:
             )
         self._backup_delay = delay
 
+    def _backup_attest_not_before(self, receipt_id: str) -> Optional[int]:
+        """The block from which the chain takes this backup signer's attest of
+        ``receipt_id``, while the node the attest is submitted to is still
+        before it; None once it is not, and for a signer with no backup
+        delay, which reads nothing. A receipt with no ``ReceiptSubmittedAt``
+        entry has no delay."""
+        if not self._backup_delay:
+            return None
+        submitted_at = self._call(
+            "query", "OrinqReceipts", "ReceiptSubmittedAt", [receipt_id], conn=self._write
+        ).value
+        best = self._call("get_block_header", conn=self._write)["header"]["number"]
+        if submitted_at is not None and best < submitted_at + self._backup_delay:
+            return submitted_at + self._backup_delay
+        return None
+
     def submit_join_committee(self):
         """Submit ``OrinqReceipts.join_committee()`` and return the included
         extrinsic receipt. Returns the receipt unchanged so the caller can
@@ -2363,20 +2379,18 @@ class SubstrateClient:
 
         A backup signer first reads, on the node it submits to, whether the
         chain takes its attest yet, and raises :class:`BackupSignerTooEarly`
-        instead of submitting while it does not. A receipt with no
-        ``ReceiptSubmittedAt`` entry has no delay. An attest the chain still
+        instead of submitting while it does not. An attest the chain still
         fails with ``BackupSignerTooEarly`` raises the same, for the next
-        block, once the delay has been read again.
+        block, once the delay has been read again. So does a refusal the
+        chain has not settled, when the delay, read again, shows the attest
+        was a backup signer's early one; if that read fails, the refusal
+        stays :class:`AttestUnsettled`.
         """
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
-            if self._backup_delay:
-                submitted_at = self._call(
-                    "query", "OrinqReceipts", "ReceiptSubmittedAt", [receipt_id], conn=self._write
-                ).value
-                best = self._call("get_block_header", conn=self._write)["header"]["number"]
-                if submitted_at is not None and best < submitted_at + self._backup_delay:
-                    raise BackupSignerTooEarly(receipt_id, cert_hash, submitted_at + self._backup_delay)
+            not_before = self._backup_attest_not_before(receipt_id)
+            if not_before is not None:
+                raise BackupSignerTooEarly(receipt_id, cert_hash, not_before)
             try:
                 call = self._call(
                     "compose_call",
@@ -2417,6 +2431,17 @@ class SubstrateClient:
             except SubstrateRequestException as e:
                 settled = self.attestation_on_chain(receipt_id, cert_hash)
                 if settled is None:
+                    try:
+                        self.refresh_backup_delay()
+                        not_before = self._backup_attest_not_before(receipt_id)
+                    except Exception as read_error:
+                        logger.warning(
+                            f"Cert tx for {receipt_id} refused, and the backup signer listing could "
+                            f"not be read to tell why: {type(read_error).__name__}: {read_error}"
+                        )
+                        not_before = None
+                    if not_before is not None:
+                        raise BackupSignerTooEarly(receipt_id, cert_hash, not_before) from e
                     raise AttestUnsettled(receipt_id, cert_hash, e) from e
                 if settled:
                     logger.info(
