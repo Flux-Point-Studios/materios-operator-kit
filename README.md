@@ -201,8 +201,10 @@ listed with a non-zero delay, the daemon:
 1. Verifies each receipt's content as usual.
 2. Waits, without submitting. Other receipts are processed meanwhile. Waiting
    receipts are kept in the daemon's state file, so a restart or a dropped
-   connection loses none of them, and no waiting receipt is ever dropped,
-   however many there are.
+   connection loses none of them, and waiting does not count against the
+   limit of 256 deferred receipts. Once a receipt's block arrives it is an
+   ordinary attempt: a failure at that point is retried and counted like any
+   other, and that limit applies.
 3. Stops waiting for a receipt as soon as it sees the other members certify
    it.
 4. Otherwise attests at the first block the chain accepts it: the block
