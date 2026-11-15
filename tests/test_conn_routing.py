@@ -4,8 +4,8 @@ calls listed here (#69).
 A submit waiting for inclusion holds the write conn's websocket, so a read
 there waits behind it. Reads run on the read conn. A listed function runs
 every one of its calls on the write conn: signing and submitting, the
-keepalive that keeps that socket alive, and two reads that must see the node
-a submit goes to. Both of those run under the chain-write lock, so no submit
+keepalive that keeps that socket alive, and three reads that must see the node
+a submit goes to. Each of those runs under the chain-write lock, so no submit
 holds the socket while they read. No daemon code reaches a SubstrateInterface
 but through ``_call``: not ``client.substrate``, and not a conn's ``si`` or
 ``bound`` outside the functions that open, hold or replace it.
@@ -36,6 +36,7 @@ WRITE_CONN_FUNCTIONS = {
     "submit_availability_cert": "composes, signs and submits",
     "keepalive": "keeps the write conn's own socket alive",
     "attestation_on_chain": "judges a refused attest at one best block of the node that refused it (#66 F2)",
+    "_early_backup_attest": "reads whether the node a backup signer's attest goes to takes it yet",
     "get_settlement_request": "rereads a request under the chain-write lock right before its supersede or slash",
 }
 # The functions that open, hold or replace a conn's SubstrateInterface, and

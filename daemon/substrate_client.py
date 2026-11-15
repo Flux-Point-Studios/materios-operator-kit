@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 from substrateinterface import SubstrateInterface, Keypair
 from substrateinterface.base import ExtrinsicReceipt, QueryMapResult
-from substrateinterface.exceptions import SubstrateRequestException
+from substrateinterface.exceptions import StorageFunctionNotFound, SubstrateRequestException
 from substrateinterface.utils.ss58 import ss58_decode
 from websocket import WebSocketConnectionClosedException, WebSocketTimeoutException
 
@@ -262,22 +262,41 @@ def is_transport_dead(error: BaseException) -> bool:
 class AttestUnsettled(Exception):
     """The node refused this signer's attest of a receipt, and the chain, read
     at the refusing node's best block, neither holds the attest nor rules it
-    out yet. ``cert_hash`` is the hash the attest claimed."""
+    out yet. ``cert_hash`` is the hash the attest claimed.
+    ``backup_listing_unknown`` says the chain's backup signer listing has
+    never been read, so the refusal may be of a backup signer's early attest."""
 
-    def __init__(self, receipt_id: str, cert_hash: bytes, refusal: BaseException):
+    def __init__(
+        self, receipt_id: str, cert_hash: bytes, refusal: BaseException, backup_listing_unknown: bool = False
+    ):
         super().__init__(
             f"attest of {receipt_id} refused before the chain settled it: {type(refusal).__name__}: {refusal}"
         )
         self.cert_hash = cert_hash
+        self.backup_listing_unknown = backup_listing_unknown
+
+
+class BackupSignerTooEarly(Exception):
+    """``OrinqReceipts.BackupSigners`` lists this signer, and the chain does
+    not take its attest of a receipt submitted in block ``submitted_at`` yet.
+    ``cert_hash`` is the hash the attest claims."""
+
+    def __init__(self, receipt_id: str, cert_hash: bytes, submitted_at: int):
+        super().__init__(
+            f"attest of {receipt_id}, submitted in block {submitted_at}, waits out this backup signer's delay"
+        )
+        self.cert_hash = cert_hash
+        self.submitted_at = submitted_at
 
 
 def should_defer(error: BaseException) -> bool:
     """Whether a receipt whose processing raised ``error`` is retried on a
     later tick: the RPC did not serve a call at all (a dead socket, or no
-    answer within the timeout budget), or the node refused its attest for a
-    state the chain does not show yet."""
+    answer within the timeout budget), the node refused its attest for a
+    state the chain does not show yet, or the chain does not take this backup
+    signer's attest yet."""
     return is_transport_dead(error) or any(
-        isinstance(e, (RPCTimeoutError, AttestUnsettled)) for e in _error_chain(error)
+        isinstance(e, (RPCTimeoutError, AttestUnsettled, BackupSignerTooEarly)) for e in _error_chain(error)
     )
 
 
@@ -610,6 +629,9 @@ class SubstrateClient:
         self._dialled = False
         # The background reopen of a read conn left without an SI, once started.
         self._read_reopen: Optional[threading.Thread] = None
+        # Blocks this signer's attest must trail a receipt's submission while
+        # the chain lists it as a backup signer; None until read from the chain.
+        self._backup_delay: Optional[int] = None
 
     @functools.cached_property
     def keypair(self) -> Keypair:
@@ -706,6 +728,8 @@ class SubstrateClient:
             self._dialled = False
         if not hasattr(self, "_read_reopen"):
             self._read_reopen = None
+        if not hasattr(self, "_backup_delay"):
+            self._backup_delay = None
 
     def _call(self, method_name: str, *args, conn: "_WsConn", **kwargs) -> Any:
         """Invoke ``<conn>.si.<method_name>(*args, **kwargs)`` under a bounded
@@ -1222,6 +1246,54 @@ class SubstrateClient:
         runtime's committee adapter uses as the pubkey."""
         members = self.get_committee_members()
         return _account_ids(members.value if hasattr(members, "value") else members)
+
+    def refresh_backup_delay(self) -> None:
+        """Read whether ``OrinqReceipts.BackupSigners`` lists this signer and,
+        if so, ``BackupSignerDelay``: the blocks its attest of a receipt must
+        trail the receipt's submission. A runtime without backup signers gives
+        no delay. A failed read raises, and the last delay read stands."""
+        try:
+            listed = self.keypair.public_key in _account_ids(
+                self._call("query", "OrinqReceipts", "BackupSigners", conn=self._read).value or []
+            )
+            delay = int(
+                self._call("query", "OrinqReceipts", "BackupSignerDelay", conn=self._read).value or 0
+            ) if listed else 0
+        except StorageFunctionNotFound:
+            if self._backup_delay is None:
+                logger.info("This runtime has no OrinqReceipts.BackupSigners: attests wait out no backup delay")
+            delay = 0
+        if delay != (self._backup_delay or 0):
+            logger.info(
+                f"OrinqReceipts.BackupSigners lists this signer: each attest waits {delay} blocks "
+                f"after its receipt's submission and earns no fee" if delay
+                else "This signer's attests wait out no backup delay any more"
+            )
+        self._backup_delay = delay
+
+    def backup_attest_from(self, submitted_at: int) -> int:
+        """The first best block at which the chain takes this signer's attest
+        of a receipt submitted in block ``submitted_at``. The pallet takes a
+        backup signer's attest from block ``submitted_at + BackupSignerDelay``,
+        and the pool validates an attest for the block after its best. A
+        signer with no backup delay is taken at any block."""
+        return submitted_at + (self._backup_delay or 0) - 1
+
+    def _early_backup_attest(self, receipt_id: str) -> Optional[int]:
+        """The block ``receipt_id`` was submitted in, while the node the
+        attest is submitted to does not take this backup signer's attest of
+        it yet; None once it does, and for a signer with no backup delay,
+        which reads nothing. A receipt with no ``ReceiptSubmittedAt`` entry
+        has no delay."""
+        if not self._backup_delay:
+            return None
+        submitted_at = self._call(
+            "query", "OrinqReceipts", "ReceiptSubmittedAt", [receipt_id], conn=self._write
+        ).value
+        best = self._call("get_block_header", conn=self._write)["header"]["number"]
+        if submitted_at is not None and best < self.backup_attest_from(submitted_at):
+            return submitted_at
+        return None
 
     def submit_join_committee(self):
         """Submit ``OrinqReceipts.join_committee()`` and return the included
@@ -2319,9 +2391,19 @@ class SubstrateClient:
         chain can never count it; otherwise :class:`AttestUnsettled`
         propagates, as does a dead socket that ``_call``'s retry did not get
         past, and the caller retries the receipt later.
+
+        A backup signer first reads, on the node it submits to, whether the
+        chain takes its attest yet, and raises :class:`BackupSignerTooEarly`
+        instead of submitting while it does not. So does a refusal the chain
+        has not settled, when the delay, read again, shows the attest was a
+        backup signer's early one; if that read fails, the refusal stays
+        :class:`AttestUnsettled`.
         """
         last_error: Optional[str] = None
         for attempt in range(self.config.tx_max_retries):
+            submitted_at = self._early_backup_attest(receipt_id)
+            if submitted_at is not None:
+                raise BackupSignerTooEarly(receipt_id, cert_hash, submitted_at)
             try:
                 call = self._call(
                     "compose_call",
@@ -2356,7 +2438,18 @@ class SubstrateClient:
             except SubstrateRequestException as e:
                 settled = self.attestation_on_chain(receipt_id, cert_hash)
                 if settled is None:
-                    raise AttestUnsettled(receipt_id, cert_hash, e) from e
+                    try:
+                        self.refresh_backup_delay()
+                        submitted_at = self._early_backup_attest(receipt_id)
+                    except Exception as read_error:
+                        logger.warning(
+                            f"Cert tx for {receipt_id} refused, and the backup signer listing could "
+                            f"not be read to tell why: {type(read_error).__name__}: {read_error}"
+                        )
+                        submitted_at = None
+                    if submitted_at is not None:
+                        raise BackupSignerTooEarly(receipt_id, cert_hash, submitted_at) from e
+                    raise AttestUnsettled(receipt_id, cert_hash, e, self._backup_delay is None) from e
                 if settled:
                     logger.info(
                         f"Cert tx for {receipt_id} refused ({e}); already on chain: the receipt "
