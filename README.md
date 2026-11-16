@@ -41,7 +41,7 @@ This prints three values:
 
 > **Committee seats are granted by governance.** Since runtime spec 228, `join_committee` is a Root call, so the daemon cannot seat its own key. Send your SS58 address to the FPS team to be seated. If the evidence submitter is enabled and the pallet refuses the key as off the committee, the daemon pauses evidence submission and resumes by itself once the key is seated.
 >
-> **Auto-bond is also handled for you.** The `OrinqReceipts` pallet enforces a `BondRequirement` (currently **1,000 MATRA** on preprod — subject to governance). Before the first `join_committee` call, the daemon reserves the required amount by submitting `bond(delta)` on your behalf. Already-bonded operators are detected and skipped, so restarts never double-bond. See [Auto-bond behaviour](#auto-bond-behaviour) below for the full contract and the single warning case an operator might see.
+> **Auto-bond is also handled for you on preprod.** The `OrinqReceipts` pallet enforces a `BondRequirement` (currently **1,000 MATRA** on preprod — subject to governance) that Root's `join_committee` checks. While your key waits to be seated, the daemon reserves the required amount by submitting `bond(delta)` on your behalf; on mainnet it never bonds. Already-bonded operators are detected and skipped, so restarts never double-bond. See [Auto-bond behaviour](#auto-bond-behaviour) below for the full contract and the single warning case an operator might see.
 >
 > **Optional:** Send your public key hex along with it if you want higher gateway rate limits or a provisioned API key.
 
@@ -129,28 +129,45 @@ Your Machine                          FPS Infrastructure
 - **Heartbeat signatures** are publicly verifiable. Anyone can confirm your daemon is alive by checking the signature against your on-chain public key. FPS cannot forge heartbeats for you.
 - **Attestation transactions** are on-chain. Anyone can verify committee activity independently.
 
+## Networks
+
+`MATERIOS_NETWORK` names the network the daemon serves: `preprod` (the default)
+or `mainnet`. Any other value stops the daemon at startup.
+
+| | preprod | mainnet |
+|---|---|---|
+| Bond toward `BondRequirement` while outside the committee | yes | no: attestors are admitted with no bond, and accounts hold no MATRA |
+| Signed extrinsics | immortal | mortal for 64 blocks |
+
+A mainnet extrinsic's era starts at the finalized head, or at the best block's
+parent once that is more than 5 blocks past it, as polkadot.js signs, so a
+finality stall cannot leave every signature born too old to be valid.
+
+## Committee admission
+
+Only Root adds a member to the attestation committee
+(`OrinqReceipts.join_committee(member)`, Root-only since spec 228). The daemon
+checks its membership at startup and every 60 seconds. Outside the committee it
+logs, and posts to Discord once, that it waits for Root; once Root admits it,
+it posts that once too.
+
 ## Auto-bond behaviour
 
-Committee members are required to reserve a bond under the `OrinqReceipts`
-pallet before they can be admitted. The chain stores this floor in the
-`BondRequirement` storage item (currently **1,000 MATRA = 1,000,000,000 base
-units** at 6 decimals on preprod; mainnet value will be set by governance).
-Without a sufficient bond, `join_committee` fails with `InsufficientBond` and
-the daemon would loop retry forever, burning MOTRA on each attempt.
-
-**The daemon handles this automatically.** On every startup (and once more as
-a defensive fallback if a later `join_committee` still returns
-`InsufficientBond`, e.g. because governance raised the floor), the daemon:
+On preprod, Root's `join_committee(member)` refuses a member whose bond under
+the `OrinqReceipts` pallet is below `BondRequirement` (currently **1,000 MATRA
+= 1,000,000,000 base units** at 6 decimals). While its signer is outside the
+committee, every committee check:
 
 1. Queries `OrinqReceipts.BondRequirement` → `required`.
 2. Queries `OrinqReceipts.AttestorBonds(<your-address>)` → `current`.
 3. If `current >= required`, logs `already bonded {current} / {required}
-   MATRA base units, skipping auto-bond` and continues to `join_committee`.
+   MATRA base units, skipping auto-bond`.
 4. Otherwise, queries `System.Account(<your-address>).data.free` and submits
    `OrinqReceipts.bond(required - current)`, waiting for inclusion and
    logging the tx hash.
 
-This is idempotent: restarting the daemon after a successful bond is a no-op.
+This is idempotent: a check after a successful bond submits nothing. On
+mainnet the daemon never bonds.
 
 ### What you'll see if your MATRA is short
 
@@ -160,21 +177,15 @@ logs a WARNING like:
 ```
 WARNING Insufficient free MATRA to auto-bond: need 1000000000 more base
 units (have 250000000). Request more MATRA from the faucet at
-https://materios.fluxpointstudios.com/blobs/faucet/drip and restart the
-daemon, or wait for an automatic faucet drip. Continuing anyway so the
-operator can see the join_committee error in the logs.
+https://materios.fluxpointstudios.com/preprod-blobs/faucet/drip; the next
+committee check bonds it.
 ```
 
-It **does not crash** — the daemon still attempts `join_committee` so the
-upstream failure is visible, and a Discord warning (if configured) is posted.
-You should either:
-
-- Hit the faucet at `https://materios.fluxpointstudios.com/blobs/faucet/drip`
-  with `{"address": "<your-ss58>"}` and restart the daemon, or
-- Ask the FPS team in Discord; the standard operator drip is 1,000 MATRA.
-
-Once your balance is topped up, the next startup (or next retry of
-`_ensure_committee_membership` on the 60s loop) will post the bond cleanly.
+It **does not crash**, and a Discord warning (if configured) is posted. Either
+hit the faucet at `https://materios.fluxpointstudios.com/preprod-blobs/faucet/drip`
+with `{"address": "<your-ss58>"}`, or ask the FPS team in Discord; the
+standard operator drip is 1,000 MATRA. The next committee check, within a
+minute, posts the bond.
 
 ### Fees
 
@@ -373,14 +384,13 @@ Monitor the health of every committee member, yours included. Reads the **public
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `docker compose pull` fails with 401 | GHCR image not accessible | Make sure you can reach `ghcr.io`. If using a firewall, allow outbound HTTPS to `ghcr.io` |
-| Heartbeat not appearing on explorer | Daemon hasn't joined committee yet | Check logs for `join_committee` success; if faucet drip failed, retry or ask FPS team |
-| `join_committee` fails with `InsufficientBond` | Free MATRA below `BondRequirement` gap | Daemon auto-bonds on startup. If the warning says `Insufficient free MATRA to auto-bond`, request a faucet drip and restart. See [Auto-bond behaviour](#auto-bond-behaviour). |
+| Heartbeat not appearing on explorer | Signer not yet in the committee | The log says the signer waits for Root's `join_committee`; ask the FPS team to admit it. See [Committee admission](#committee-admission) |
+| Root's `join_committee` fails with `InsufficientBond` (preprod) | Free MATRA below `BondRequirement` gap | The daemon bonds while it waits. If the warning says `Insufficient free MATRA to auto-bond`, request a faucet drip; the next check bonds. See [Auto-bond behaviour](#auto-bond-behaviour). |
 | `substrate_connected: false` in status | Can't reach RPC endpoint | Check that `wss://materios.fluxpointstudios.com/rpc` is reachable from your network |
 | `the read conn is down: reads run on the write conn` in logs | The daemon's second RPC connection, which carries reads, dropped and could not reconnect | The daemon keeps working on one connection and reopens the read connection in the background, logging each attempt. If the error repeats for more than a few minutes, check that the RPC endpoint accepts new connections |
 | High finality gap (>10) | Chain-wide issue, not your daemon | Check the explorer dashboard — if all validators show high gap, it's a chain stall |
 | `No locator found` in logs | Blob not yet uploaded for a receipt | Normal during brief windows — daemon retries automatically |
 | Attestation tx fails with "Priority too low" | Nonce collision (rare) | Daemon auto-recovers on next poll cycle |
-| Account balance too low | MATRA depleted from transaction fees | Daemon auto-requests a faucet drip; if faucet is dry, ask FPS team |
 
 ## FAQ
 

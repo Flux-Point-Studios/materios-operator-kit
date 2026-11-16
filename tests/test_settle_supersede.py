@@ -18,6 +18,7 @@ import pytest
 from substrateinterface import Keypair
 
 from daemon import settle_claim_attestor as sca
+from daemon.config import NETWORKS
 from daemon.settle_claim_attestor import SettlementEvidence, SettleClaimAttestor
 from tests.test_multisig_aggregator import _with_gateway
 from tests.test_settle_claim_attestor import (
@@ -355,7 +356,7 @@ class Receipt(SimpleNamespace):
 def rpc(results):
     """A SubstrateClient whose RPC layer answers from ``results`` by method."""
     client = object.__new__(SubstrateClient)
-    client.config = SimpleNamespace(signer_uri="//Alice", tx_max_retries=3)
+    client.config = SimpleNamespace(signer_uri="//Alice", tx_max_retries=3, profile=NETWORKS["preprod"])
     client._read, client._write = object(), object()
 
     def call(method, *args, **kwargs):

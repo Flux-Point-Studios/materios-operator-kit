@@ -28,7 +28,6 @@ SUBMIT_PATHS = {
     "settlement": lambda client: client.submit_attest_settle_envelope(
         bytes(32), [(bytes(32), bytes(64))]) == EXTRINSIC_HASH,
     "bond": lambda client: client.submit_bond(1) == (True, EXTRINSIC_HASH),
-    "join": lambda client: read_outcome(client.submit_join_committee()),
     "evidence": lambda client: read_outcome(client.submit_extrinsic(object())),
 }
 

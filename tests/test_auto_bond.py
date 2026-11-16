@@ -1,10 +1,9 @@
 """Tests for the auto-bond flow in cert-daemon.
 
-The cert-daemon must auto-post `OrinqReceipts.bond(amount)` on startup so that
-`join_committee` does not fail with `InsufficientBond`. Without this, every
-freshly-onboarded operator hits an infinite retry loop on join_committee,
-burning MOTRA on each failed attempt. See README auto-bond section for the
-operator-facing contract.
+Root's `OrinqReceipts.join_committee(member)` refuses a member bonded below
+`BondRequirement`, so on a network whose profile bonds, the cert-daemon posts
+`OrinqReceipts.bond(amount)` while its signer waits outside the committee. See
+README auto-bond section for the operator-facing contract.
 
 These tests mock the SubstrateClient at the seam so no live chain is required.
 """
@@ -16,32 +15,8 @@ import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
-
 from daemon.cert_daemon import CertDaemon
 from daemon.config import DaemonConfig
-
-
-# --- regression: class-body integrity --------------------------------------
-# A prior revision of this PR accidentally de-classed `run` and
-# `_request_faucet_drip` by placing `_is_insufficient_bond_error` mid-class
-# at column 0 — Python kept parsing subsequent `    async def` blocks as
-# nested defs inside the helper, silently turning two class methods into
-# unreachable closures. Mocked unit tests didn't catch it because they
-# never exercise `run` or `_request_faucet_drip`. This assertion does.
-
-
-def test_class_methods_intact():
-    """Guard against indentation drift that would nest class methods inside
-    an unrelated module-level helper."""
-    for name in ("run", "_request_faucet_drip", "_ensure_bond",
-                 "_ensure_committee_membership", "process_receipt",
-                 "_process_block_range", "_clamp_cursor_past_pruned"):
-        assert callable(getattr(CertDaemon, name, None)), (
-            f"CertDaemon.{name} missing — likely an indentation bug "
-            f"nested it inside a module-level function. Check that "
-            f"`_is_insufficient_bond_error` lives AFTER the class body."
-        )
 
 
 # --- helpers ---------------------------------------------------------------
@@ -228,15 +203,9 @@ def test_bond_submit_exception_is_swallowed():
     _run(daemon._ensure_bond())  # must not raise
 
 
-def test_bond_is_one_shot_on_insufficient_bond():
-    """The fallback path: if join_committee returns InsufficientBond AFTER
-    auto-bond ran once, the daemon re-runs the bond flow exactly once for
-    that attempt — it does NOT loop forever retrying the bond when the
-    requirement has already been met on-chain.
-    """
-    # Simulate: first ensure_bond call bonds successfully. Second call
-    # (triggered by the InsufficientBond fallback) sees current==required
-    # and is a no-op, guarding against infinite loops.
+def test_bond_is_one_shot_across_committee_checks():
+    """Every committee check outside the committee runs the bond flow; once
+    the bond meets the requirement on chain, later checks submit nothing."""
     daemon = _make_daemon(
         bond_requirement=REQUIRED_BOND_BASE,
         current_bond=0,
@@ -250,99 +219,3 @@ def test_bond_is_one_shot_on_insufficient_bond():
     _run(daemon._ensure_bond())
     # No additional submit_bond calls.
     assert daemon.client.submit_bond.call_count == 1
-
-
-def test_ensure_committee_membership_retries_bond_on_insufficient_bond_error():
-    """Integration at the dispatcher seam: if the join_committee submit reports
-    an `InsufficientBond` error, `_ensure_committee_membership` must call the
-    bond-ensuring path exactly once, then attempt join again — and must NOT
-    infinite-loop on persistent InsufficientBond (bounded retries)."""
-    daemon = _make_daemon(
-        bond_requirement=REQUIRED_BOND_BASE,
-        current_bond=REQUIRED_BOND_BASE,  # already bonded per state
-        free_balance=0,
-    )
-    # Mock the substrate interface surface used by _ensure_committee_membership
-    substrate = MagicMock()
-    substrate.query.return_value = []  # CommitteeMembers empty -> not a member
-    call_stub = MagicMock()
-    substrate.compose_call.return_value = call_stub
-    substrate.create_signed_extrinsic.return_value = MagicMock()
-
-    # First submit_extrinsic returns InsufficientBond, second returns success.
-    fail_receipt = MagicMock(is_success=False, error_message={"name": "InsufficientBond"})
-    ok_receipt = MagicMock(is_success=True, error_message=None)
-    substrate.submit_extrinsic.side_effect = [fail_receipt, ok_receipt]
-    daemon.client.substrate = substrate
-    # After task #288, cert_daemon calls the SubstrateClient's typed
-    # wrappers (`get_committee_members`, `submit_join_committee`) instead
-    # of `self.client.substrate.X` directly. Wire those wrappers to the
-    # underlying substrate mock so existing assertions still see the
-    # same call counts.
-    daemon.client.get_committee_members = MagicMock(
-        side_effect=lambda: substrate.query("OrinqReceipts", "CommitteeMembers")
-    )
-    daemon.client.submit_join_committee = MagicMock(
-        side_effect=lambda: substrate.submit_extrinsic(
-            substrate.create_signed_extrinsic(
-                call=substrate.compose_call(
-                    call_module="OrinqReceipts",
-                    call_function="join_committee",
-                    call_params={},
-                ),
-                keypair=daemon.client.keypair,
-            ),
-            wait_for_inclusion=True,
-        )
-    )
-
-    _run(daemon._ensure_committee_membership())
-
-    # Two join attempts (one fail, one success after bond re-check), AND
-    # _ensure_bond was invoked — but since bond was already adequate, no
-    # submit_bond tx was needed.
-    assert substrate.submit_extrinsic.call_count == 2
-    daemon.client.submit_bond.assert_not_called()
-
-
-def test_ensure_committee_membership_bounded_on_persistent_insufficient_bond():
-    """If the chain keeps returning InsufficientBond (e.g. governance raised
-    the requirement and the operator is broke), the handler must give up
-    after a bounded number of attempts rather than spinning forever."""
-    daemon = _make_daemon(
-        bond_requirement=REQUIRED_BOND_BASE * 100,  # huge new requirement
-        current_bond=REQUIRED_BOND_BASE,
-        free_balance=0,  # can't pay the delta
-    )
-    substrate = MagicMock()
-    substrate.query.return_value = []
-    substrate.compose_call.return_value = MagicMock()
-    substrate.create_signed_extrinsic.return_value = MagicMock()
-    fail_receipt = MagicMock(is_success=False, error_message={"name": "InsufficientBond"})
-    # Always returns InsufficientBond.
-    substrate.submit_extrinsic.return_value = fail_receipt
-    daemon.client.substrate = substrate
-    # See sibling test for the rationale on these mock seams.
-    daemon.client.get_committee_members = MagicMock(
-        side_effect=lambda: substrate.query("OrinqReceipts", "CommitteeMembers")
-    )
-    daemon.client.submit_join_committee = MagicMock(
-        side_effect=lambda: substrate.submit_extrinsic(
-            substrate.create_signed_extrinsic(
-                call=substrate.compose_call(
-                    call_module="OrinqReceipts",
-                    call_function="join_committee",
-                    call_params={},
-                ),
-                keypair=daemon.client.keypair,
-            ),
-            wait_for_inclusion=True,
-        )
-    )
-
-    _run(daemon._ensure_committee_membership())
-
-    # Must be bounded: at most 2 join attempts (original + one fallback).
-    assert substrate.submit_extrinsic.call_count <= 2
-    # And no bond tx submitted because free balance is zero.
-    daemon.client.submit_bond.assert_not_called()

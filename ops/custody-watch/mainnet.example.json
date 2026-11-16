@@ -1,0 +1,40 @@
+{
+  "state_db": "/var/lib/custody-watch/state.db",
+  "digest_hour_utc": 13,
+  "source_stale_seconds": 900,
+  "discord_webhook_file": "discord-webhook",
+  "deadman_ping_file": "deadman-ping",
+  "materios": {
+    "name": "materios-mainnet",
+    "network": "mainnet",
+    "rpc_url": "ws://<archive node>:9944",
+    "poll_seconds": 6,
+    "state_pruning_blocks": 256,
+    "total_issuance": "<TotalIssuance the mainnet genesis declares, in base units>",
+    "authority_accounts": [
+      "<each sudo multisig signatory>",
+      "<each guardian multisig signatory>",
+      "<each other role account the genesis endows>"
+    ]
+  },
+  "cardano": [
+    {
+      "name": "cardano-mainnet-partner-chain",
+      "insight_url": "https://mainnet.insight.iagon.com",
+      "insight_key_file": "insight.key",
+      "poll_seconds": 60,
+      "reorg_depth_blocks": 30,
+      "addresses": [
+        {"label": "VersionOracleValidator", "address": "<address holding the governance UTxO>", "role": "custody"},
+        {"label": "DParameterValidator", "address": "<D-parameter validator address>", "role": "custody"},
+        {"label": "PermissionedCandidatesValidator", "address": "<permissioned candidates validator address>", "role": "custody"},
+        {"label": "CommitteeCandidateValidator", "address": "<committee candidate validator address>", "role": "contract", "severity": "ALERT"}
+      ],
+      "policies": [
+        {"label": "VersionOracle", "policy_id": "<version oracle policy id>", "severity": "CRITICAL"},
+        {"label": "DParameter", "policy_id": "<D-parameter policy id>", "severity": "CRITICAL"},
+        {"label": "PermissionedCandidates", "policy_id": "<permissioned candidates policy id>", "severity": "CRITICAL"}
+      ]
+    }
+  ]
+}

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from daemon.config import NETWORKS
 from daemon.substrate_client import SubstrateClient, SubmitCertOutcome
 
 
@@ -57,7 +58,7 @@ def client():
     """SubstrateClient wired up enough to call `_scan_for_bad_attest` /
     `submit_availability_cert` without a real WS connection."""
     c = SubstrateClient.__new__(SubstrateClient)
-    c.config = SimpleNamespace(tx_max_retries=3, signer_uri="//Alice", rpc_url="ws://x")
+    c.config = SimpleNamespace(tx_max_retries=3, signer_uri="//Alice", rpc_url="ws://x", profile=NETWORKS["preprod"])
     c.substrate = MagicMock()
     c.keypair = SimpleNamespace(ss58_address=OUR_SS58)
     return c

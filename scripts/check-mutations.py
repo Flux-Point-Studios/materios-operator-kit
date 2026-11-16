@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Run targeted safety mutants in isolated copies of the test suite: slash
 signing, the attest path's recovery from dead RPC sockets, the checkpoint
-flush schedule, and the evidence submitter's handling of pallet refusals. Each suite runs only its own tests, and first proves they pass
-unmutated in that same layout."""
+flush schedule, the evidence submitter's handling of pallet refusals, and what
+the mainnet profile changes in the daemon and the custody watcher. Each suite
+runs only its own tests, and first proves they pass unmutated in that same
+layout."""
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -125,7 +127,7 @@ TRANSPORT_TESTS = ['tests/test_dead_write_conn.py', 'tests/test_receipt_rpc_retr
                    'tests/test_deferred_receipt_restart.py', 'tests/test_reads_off_the_write_conn.py',
                    'tests/test_conn_routing.py', 'tests/test_lazy_results_read_inside_the_call.py',
                    'tests/test_evidence_rows_outlive_rpc_timeouts.py', 'tests/test_one_call_per_interface.py',
-                   'tests/test_read_conn_reopens.py', 'tests/test_join_and_bond_take_the_chain_write_lock.py',
+                   'tests/test_read_conn_reopens.py', 'tests/test_bond_takes_the_chain_write_lock.py',
                    'tests/test_backup_signer_delay.py']
 TRANSPORT_MUTANTS = [
     ('transport-branch-deleted', 'daemon/substrate_client.py', '                if not is_transport_dead(error):\n                    raise\n                self._replace_dead_conn', '                raise\n                self._replace_dead_conn'),
@@ -255,7 +257,6 @@ TRANSPORT_MUTANTS = [
     ('reopen-sleeps-under-the-lock', 'daemon/substrate_client.py', '                    return\n            self._backoff_sleep(delay)\n', '                    return\n                self._backoff_sleep(delay)\n'),
     ('reopen-dials-unlocked', 'daemon/substrate_client.py', 'args=(conn, conn.replace_lock),', 'args=(conn, contextlib.nullcontext()),'),
     ('reconnect-overwrites-a-live-conn', 'daemon/substrate_client.py', '                if conn.si is not None:\n                    return\n', ''),
-    ('join-without-the-lock', 'daemon/cert_daemon.py', '                async with self._chain_write_lock:\n                    receipt = await asyncio.to_thread(self.client.submit_join_committee)\n', '                if True:\n                    receipt = await asyncio.to_thread(self.client.submit_join_committee)\n'),
     ('bond-without-the-lock', 'daemon/cert_daemon.py', '                async with self._chain_write_lock:\n                    success, tx_hash = await asyncio.to_thread(self.client.submit_bond, delta)\n', '                if True:\n                    success, tx_hash = await asyncio.to_thread(self.client.submit_bond, delta)\n'),
     ('guard-blind-to-unlocked-writes', 'tests/test_conn_routing.py', '(name := reached_write(node, writes)) and not under_lock(function, locked)]', '(name := reached_write(node, writes)) and False]'),
     ('guard-lock-not-inherited', 'tests/test_conn_routing.py', '        held |= more\n', '        break\n'),
@@ -340,16 +341,39 @@ EVIDENCE_MUTANTS = [
     ('landing-kept-by-receipt', 'daemon/evidence_submitter.py', 'kept = self._unacked_landings.pop(row_id, None)\n            ext_hash = kept[1] if kept is not None and kept[0] == landed_as else None\n            if kept is not None and ext_hash is None:\n                logger.warning(\n                    f"evidence_submitter: row {row_id} now names receipt "\n                    f"{landed_as[0][:16]}… ({landed_as[1]}), not the row whose "\n                    f"landing was kept under its id; submitting it afresh"\n                )\n            if ext_hash is None:\n                ext_hash = await self.submit_one(row)\n            if ext_hash is not None:\n                acked = await self.mark_submitted(row_id, ext_hash)\n                if not acked:\n                    self._unacked_landings[row_id] = (landed_as, ext_hash)', 'kept = self._unacked_landings.pop(landed_as, None)\n            ext_hash = kept[1] if kept is not None and kept[0] == landed_as else None\n            if kept is not None and ext_hash is None:\n                logger.warning(\n                    f"evidence_submitter: row {row_id} now names receipt "\n                    f"{landed_as[0][:16]}… ({landed_as[1]}), not the row whose "\n                    f"landing was kept under its id; submitting it afresh"\n                )\n            if ext_hash is None:\n                ext_hash = await self.submit_one(row)\n            if ext_hash is not None:\n                acked = await self.mark_submitted(row_id, ext_hash)\n                if not acked:\n                    self._unacked_landings[landed_as] = (landed_as, ext_hash)'),
     ('landing-popped-for-any-row', 'daemon/evidence_submitter.py', 'kept = self._unacked_landings.pop(row_id, None)', 'kept = self._unacked_landings.pop(next(iter(self._unacked_landings), row_id), None)'),
 ]
+MAINNET_TESTS = ['tests/test_network_profile.py', 'tests/test_custody_mainnet.py']
+MAINNET_MUTANTS = [
+    ('mainnet-bonds', 'daemon/cert_daemon.py', 'if self.config.profile.bonds:', 'if True:'),
+    ('waiting-announced-every-check', 'daemon/cert_daemon.py', '            if not awaiting:\n', '            if True:\n'),
+    ('mainnet-signs-immortal', 'daemon/substrate_client.py', '        if not period:\n', '        if True:\n'),
+    ('era-always-from-finalized', 'daemon/substrate_client.py', 'born = finalized if current - finalized <= MAX_FINALITY_LAG else current', 'born = finalized'),
+    ('era-always-from-best', 'daemon/substrate_client.py', 'born = finalized if current - finalized <= MAX_FINALITY_LAG else current', 'born = current'),
+    ('mainnet-config-unchecked', 'daemon/custody_rules.py', '    if network == "mainnet":\n        _check_mainnet(doc)\n', ''),
+    ('mainnet-calls-not-escalated', 'daemon/custody_rules.py', 'if tree.mainnet and (escalated', 'if False and (escalated'),
+    ('mainnet-committee-change-an-alert', 'daemon/custody_rules.py', 'CRITICAL if mainnet else ALERT, key', 'ALERT, key'),
+    ('issuance-unchecked', 'daemon/custody_rules.py', 'if issuance == (declared if last is None else last):', 'if True:'),
+    ('issuance-only-against-declaration', 'daemon/custody_rules.py', 'if issuance == (declared if last is None else last):', 'if issuance == declared:'),
+    ('balance-events-ignored', 'daemon/custody_rules.py', 'if record.get("module_id") != "Balances" or record.get("event_id") in _STILL_BALANCES:', 'if True:'),
+    ('guardian-not-an-authority', 'daemon/custody_watch.py', 'authorities |= {bytes.fromhex(guardian[2:])} if guardian else frozenset()', 'authorities |= frozenset()'),
+    ('mainnet-recovery-start-grouped', 'daemon/custody_watch.py', 'started = not self._config.mainnet and not changed', 'started = not changed'),
+    ('unread-balances-unpaged', 'daemon/custody_watch.py', '        if unread:\n            findings.append', '        if False:\n            findings.append'),
+    ('deadman-pinged-while-stale', 'daemon/custody_watch.py', 'if self._ping is None or stale or', 'if self._ping is None or'),
+    ('deadman-pinged-every-cycle', 'daemon/custody_watch.py', ' or now - self._pinged < DEADMAN_INTERVAL:', ':'),
+    ('deadman-pinged-while-pages-wait', 'daemon/custody_watch.py', 'waiting = [f.found_at for f in self._store.unsent_pages(held_since=now - GROUP_WINDOW)]', 'waiting = []'),
+    ('deadman-counts-held-group-pages', 'daemon/custody_watch.py', 'self._store.unsent_pages(held_since=now - GROUP_WINDOW)]', 'self._store.unsent_pages()]'),
+    ('deadman-pinged-while-digest-waits', 'daemon/custody_watch.py', '        if self._digest_due(now):\n            due = ', '        if False:\n            due = '),
+    ('digest-wait-counted-before-start', 'daemon/custody_watch.py', 'waiting.append(max(due.timestamp(), self._started))', 'waiting.append(due.timestamp())'),
+]
 SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS), (CHECKPOINT_TESTS, CHECKPOINT_MUTANTS),
-          (EVIDENCE_TESTS, EVIDENCE_MUTANTS)]
+          (EVIDENCE_TESTS, EVIDENCE_MUTANTS), (MAINNET_TESTS, MAINNET_MUTANTS)]
 
 
 def in_copy(tests, filename=None, before=None, after=None):
-    """``tests`` run in an isolated copy of daemon/ and tests/, with one
+    """``tests`` run in an isolated copy of daemon/, tests/ and ops/, with one
     mutation applied when ``filename`` is given."""
     with tempfile.TemporaryDirectory(prefix='operator-kit-mutant-') as scratch:
         scratch = Path(scratch)
-        for directory in ('daemon', 'tests'):
+        for directory in ('daemon', 'tests', 'ops'):
             shutil.copytree(ROOT / directory, scratch / directory, ignore=shutil.ignore_patterns('__pycache__'))
         if filename:
             source = scratch / filename

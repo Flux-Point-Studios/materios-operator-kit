@@ -217,7 +217,6 @@ def test_class_methods_intact_after_parallelization_refactor():
     class (not at module level)."""
     for name in (
         "run",
-        "_request_faucet_drip",
         "_ensure_bond",
         "_ensure_committee_membership",
         "process_receipt",

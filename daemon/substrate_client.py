@@ -29,6 +29,10 @@ from daemon.voucher_canonicalize import (
 
 logger = logging.getLogger(__name__)
 
+# polkadot.js signs a mortal extrinsic from the finalized head unless the best
+# block's parent is more than this many blocks past it (api-derive tx/constants).
+MAX_FINALITY_LAG = 5
+
 
 # Slash signing contract fingerprint -> committee digest protocol. Derivation
 # and provenance: docs/slash-watcher-frv2.md. Never add a fallback protocol.
@@ -1120,8 +1124,8 @@ class SubstrateClient:
 
     # --- Bond helpers (OrinqReceipts pallet) --------------------------------
     # These are used by CertDaemon._ensure_bond() to keep the attestor's
-    # reserved MATRA at or above `BondRequirement` so `join_committee` doesn't
-    # fail with `InsufficientBond`. See README → "Auto-bond on startup".
+    # reserved MATRA at or above `BondRequirement`, which Root's
+    # `join_committee(member)` requires. See README → "Auto-bond behaviour".
 
     def get_bond_requirement(self) -> int:
         """Return `OrinqReceipts.BondRequirement` in MATRA base units (u128).
@@ -1220,9 +1224,26 @@ class SubstrateClient:
         """
         return self._call("compose_call", **kwargs, conn=self._write)
 
-    def create_signed_extrinsic(self, **kwargs):
-        """Sister wrapper to :meth:`compose_call`; bounded-timeout-wrap."""
-        return self._call("create_signed_extrinsic", **kwargs, conn=self._write)
+    def create_signed_extrinsic(self, call):
+        """``call`` signed by this daemon's key, the one path every submit signs by.
+
+        Immortal where the network profile's ``mortal_period`` is 0. Otherwise
+        mortal for that many blocks from the block polkadot.js signs from: the
+        finalized head while the best block's parent is at most
+        MAX_FINALITY_LAG blocks past it, else that parent, so a finality stall
+        longer than the period cannot leave every signature born too old. The
+        era's first block is read on the node the submit goes to, which
+        substrate-interface asks for its hash."""
+        period = self.config.profile.mortal_period
+        if not period:
+            return self._call("create_signed_extrinsic", call=call, keypair=self.keypair, conn=self._write)
+        best = self._call("get_block_header", conn=self._write)["header"]["number"]
+        finalized_hash = self._call("get_chain_finalised_head", conn=self._write)
+        finalized = self._call("get_block_header", finalized_hash, conn=self._write)["header"]["number"]
+        current = max(best - 1, 0)
+        born = finalized if current - finalized <= MAX_FINALITY_LAG else current
+        return self._call("create_signed_extrinsic", call=call, keypair=self.keypair,
+                          era={"period": period, "current": born}, conn=self._write)
 
     def submit_extrinsic(self, extrinsic, wait_for_inclusion: bool = True):
         """Sister wrapper to :meth:`compose_call`; bounded-timeout-wrap."""
@@ -1295,32 +1316,6 @@ class SubstrateClient:
             return submitted_at
         return None
 
-    def submit_join_committee(self):
-        """Submit ``OrinqReceipts.join_committee()`` and return the included
-        extrinsic receipt. Returns the receipt unchanged so the caller can
-        inspect ``is_success`` + ``error_message`` (the join path needs
-        per-error branching that's specific to cert_daemon).
-
-        Routes through the wrapper for the same reason as
-        :meth:`get_committee_members` — task #288.
-        """
-        call = self._call(
-            "compose_call",
-            call_module="OrinqReceipts",
-            call_function="join_committee",
-            call_params={},
-            conn=self._write,
-        )
-        extrinsic = self._call(
-            "create_signed_extrinsic",
-            call=call,
-            keypair=self.keypair,
-            conn=self._write,
-        )
-        return self._call(
-            "submit_extrinsic", extrinsic, wait_for_inclusion=True, conn=self._write
-        )
-
     def submit_bond(self, amount: int) -> tuple[bool, Optional[str]]:
         """Submit `OrinqReceipts.bond(amount)` as a signed extrinsic.
 
@@ -1335,12 +1330,7 @@ class SubstrateClient:
             call_params={"amount": amount},
             conn=self._write,
         )
-        extrinsic = self._call(
-            "create_signed_extrinsic",
-            call=call,
-            keypair=self.keypair,
-            conn=self._write,
-        )
+        extrinsic = self.create_signed_extrinsic(call)
         receipt = self._call("submit_extrinsic", extrinsic, wait_for_inclusion=True, conn=self._write)
         if receipt.is_success:
             logger.info(
@@ -1848,10 +1838,7 @@ class SubstrateClient:
                     call_params=params,
                     conn=self._write,
                 )
-                extrinsic = self._call(
-                    "create_signed_extrinsic",
-                    call=call, keypair=self.keypair, conn=self._write,
-                )
+                extrinsic = self.create_signed_extrinsic(call)
                 receipt = self._call(
                     "submit_extrinsic",
                     extrinsic, wait_for_inclusion=True, conn=self._write,
@@ -2415,12 +2402,7 @@ class SubstrateClient:
                     },
                     conn=self._write,
                 )
-                extrinsic = self._call(
-                    "create_signed_extrinsic",
-                    call=call,
-                    keypair=self.keypair,
-                    conn=self._write,
-                )
+                extrinsic = self.create_signed_extrinsic(call)
                 receipt = self._call(
                     "submit_extrinsic", extrinsic, wait_for_inclusion=True, conn=self._write
                 )
@@ -2576,7 +2558,7 @@ class SubstrateClient:
                 f"strikes={strikes} amount={slashed_amount} "
                 f"claimed={claimed.hex() if claimed else '?'} "
                 f"canonical={canonical.hex() if canonical else '?'} "
-                f"— signer ejected from committee, re-bond required."
+                f"— signer ejected from committee until Root re-admits it."
             )
         else:
             logger.error(

@@ -158,6 +158,15 @@ class MateriosConfig:
     # Accounts besides Sudo.Key whose moves are authority moves: the sudo multisig's
     # signatories, committee operators.
     authority_accounts: tuple[str, ...] = ()
+    # "mainnet": only role accounts hold MATRA, signed transfers are refused and
+    # Balances.TotalIssuance must stay at ``total_issuance``, so every balance and
+    # recovery move is an authority move (see MAINNET_CALL_SEVERITY).
+    network: str = "preprod"
+    total_issuance: int | None = None
+
+    @property
+    def mainnet(self) -> bool:
+        return self.network == "mainnet"
 
 
 @dataclass(frozen=True)
@@ -170,9 +179,19 @@ class WatchConfig:
     # A file holding the webhook of the watcher's own channel; without one it pages
     # through DISCORD_WEBHOOK_URL.
     discord_webhook_file: str | None = None
+    # A file holding the dead-man check's ping URL, pinged after each cycle in which
+    # no source is stale, so a watcher that stops pages from somewhere else.
+    deadman_ping_file: str | None = None
 
 
 ADDRESS_ROLES = ("custody", "contract")
+NETWORKS = ("preprod", "mainnet")
+# What a mainnet config must watch on Cardano: the partner chain's governance UTxO,
+# D-parameter and permissioned candidates, which decide who sits on the committee
+# and change only by the governance keys. Each address as custody, so any spend
+# pages CRITICAL alone, and each policy's mint CRITICAL.
+MAINNET_CARDANO_ADDRESSES = ("VersionOracleValidator", "DParameterValidator", "PermissionedCandidatesValidator")
+MAINNET_CARDANO_POLICIES = ("VersionOracle", "DParameter", "PermissionedCandidates")
 
 
 def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
@@ -180,6 +199,12 @@ def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
     ``LoadCredential`` can name its sibling key files."""
     materios = doc.get("materios")
     webhook_file = doc.get("discord_webhook_file")
+    deadman_file = doc.get("deadman_ping_file")
+    network = materios.get("network", "preprod") if materios else "preprod"
+    if network not in NETWORKS:
+        raise ValueError(f"materios.network {network!r} is not one of {', '.join(NETWORKS)}")
+    if network == "mainnet":
+        _check_mainnet(doc)
     return WatchConfig(
         state_db=doc["state_db"],
         digest_hour_utc=int(doc.get("digest_hour_utc", 13)),
@@ -191,10 +216,54 @@ def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
             state_pruning_blocks=int(materios.get("state_pruning_blocks", 256)),
             start_block=materios.get("start_block"),
             authority_accounts=tuple(materios.get("authority_accounts", ())),
+            network=network,
+            total_issuance=int(materios["total_issuance"]) if network == "mainnet" else None,
         ) if materios else None,
         cardano=tuple(_parse_network(n, base_dir) for n in doc.get("cardano", [])),
         discord_webhook_file=_relative(webhook_file, base_dir) if webhook_file else None,
+        deadman_ping_file=_relative(deadman_file, base_dir) if deadman_file else None,
     )
+
+
+def _check_mainnet(doc: dict) -> None:
+    """Refuse a mainnet config, naming everything it lacks or leaves a placeholder: the
+    issuance it pins, the webhook and dead-man it pages through, authority accounts
+    that are accounts, Cardano mainnet addresses and policy ids, and the partner
+    chain's governance watches."""
+    problems = []
+    materios = doc["materios"]
+    total = materios.get("total_issuance")
+    if not (isinstance(total, int) or (isinstance(total, str) and total.isdigit())):
+        problems.append(f"materios.total_issuance {total!r} is not the issuance in base units")
+    for field in ("discord_webhook_file", "deadman_ping_file"):
+        if not doc.get(field):
+            problems.append(f"{field} is missing")
+    for account in materios.get("authority_accounts", ()):
+        try:
+            if len(account_bytes(account)) != 32:
+                raise ValueError(account)
+        except ValueError:
+            problems.append(f"authority_accounts entry {account!r} is not an account")
+    custody, critical = set(), set()
+    for network in doc.get("cardano", []):
+        for watched in network.get("addresses", []):
+            try:
+                hrp, _ = decode_cardano_address(watched["address"])
+            except ValueError:
+                hrp = None
+            if hrp != "addr":
+                problems.append(f"{watched['label']} address {watched['address']!r} is not a Cardano mainnet address")
+            elif watched["role"] == "custody":
+                custody.add(watched["label"])
+        for policy in network.get("policies", []):
+            if not re.fullmatch(r"[0-9a-f]{56}", policy["policy_id"]):
+                problems.append(f"{policy['label']} policy_id {policy['policy_id']!r} is not a policy id")
+            elif policy.get("severity", "CRITICAL") == "CRITICAL":
+                critical.add(policy["label"])
+    problems += [f"no custody address labelled {label}" for label in MAINNET_CARDANO_ADDRESSES if label not in custody]
+    problems += [f"no CRITICAL policy labelled {label}" for label in MAINNET_CARDANO_POLICIES if label not in critical]
+    if problems:
+        raise ValueError("mainnet config: " + "; ".join(problems))
 
 
 def _relative(path: str, base_dir: Path | None) -> str:
@@ -418,12 +487,13 @@ class RuntimeDecoder:
         function = self._metadata.get_metadata_pallet(pallet).get_storage_function(item)
         return self._decode(function.get_value_type_string(), value_hex, DECODE_BUDGET)
 
+    def event_records(self, events_hex: str) -> list[dict]:
+        """``System.Events`` decoded within DECODE_BUDGET, every phase's records."""
+        return self._decode(self._events_type, events_hex, DECODE_BUDGET)
+
     def events(self, events_hex: str) -> dict[int, list[str]]:
-        grouped: dict[int, list[str]] = defaultdict(list)
-        for record in self._decode(self._events_type, events_hex, DECODE_BUDGET):
-            if record.get("phase") == "ApplyExtrinsic":
-                grouped[record["extrinsic_idx"]].append(_event_text(record))
-        return dict(grouped)
+        return by_extrinsic(self.event_records(events_hex))
+
 
     def _decode(self, type_string: str, data_hex: str, budget: int):
         """``data_hex`` decoded as ``type_string``, building at most ``budget`` values."""
@@ -442,6 +512,15 @@ class RuntimeDecoder:
         if config.stopped:
             raise DecodeBudgetExceeded()
         return value
+
+
+def by_extrinsic(records: list[dict]) -> dict[int, list[str]]:
+    """Each extrinsic's events, as text, by its index in the block."""
+    grouped: dict[int, list[str]] = defaultdict(list)
+    for record in records:
+        if record.get("phase") == "ApplyExtrinsic":
+            grouped[record["extrinsic_idx"]].append(_event_text(record))
+    return dict(grouped)
 
 
 def _event_text(record: dict) -> str:
@@ -513,6 +592,13 @@ _CALL_SEVERITY: dict[tuple[str, str], Severity] = {
     ("PalletSession", "set_keys"): ALERT,
     ("PalletSession", "purge_keys"): ALERT,
     ("RootTimelock", _ANY): CRITICAL,
+}
+# On mainnet only role accounts hold MATRA and issuance is pinned, so whatever moves a
+# balance or acts in a recovery is a role key at work: these page CRITICAL there.
+MAINNET_CALL_SEVERITY: dict[tuple[str, str], Severity] = {
+    ("Balances", _ANY): CRITICAL,
+    ("Vesting", "vested_transfer"): CRITICAL,
+    ("Recovery", _ANY): CRITICAL,
 }
 # Calls of the spec-238 and spec-242 runtimes that move no custody or authority. A call
 # in neither table pages as an ALERT, so one a runtime upgrade adds is reviewed, not
@@ -715,6 +801,7 @@ class _Tree:
     hidden: int = 0
     sites: list[_Site] = field(default_factory=list)
     involved: bool = False
+    mainnet: bool = False
 
     def line(self, text: str) -> None:
         """Add a line of the call tree, or count it once MAX_TREE_LINES are held, so a
@@ -772,10 +859,16 @@ def _inner_origin(module: str, function: str, args: dict, origin, tree: _Tree, d
     return None
 
 
+def _listed(table: dict[tuple[str, str], Severity], module: str, function: str) -> Severity | None:
+    return table.get((module, function), table.get((module, _ANY)))
+
+
 def _severity(module: str, function: str, args: dict, origin, inner, tree: _Tree) -> Severity | None:
     if module == "Multisig" and inner is not None and inner == tree.sudo_key:
         return CRITICAL
-    severity = _CALL_SEVERITY.get((module, function), _CALL_SEVERITY.get((module, _ANY)))
+    if tree.mainnet and (escalated := _listed(MAINNET_CALL_SEVERITY, module, function)) is not None:
+        return escalated
+    severity = _listed(_CALL_SEVERITY, module, function)
     if module == "Recovery" and severity == ALERT:
         target = _account(args.get(_RECOVERY_TARGET.get(function, "")))
         if any(isinstance(a, bytes) and a in tree.authority for a in (origin, target)):
@@ -853,6 +946,52 @@ def _walk(call: dict, origin, tree: _Tree, depth: int, parents: tuple[str, ...],
                 _walk(child, inner, tree, depth + 1, path, conditions, inner_proven)
 
 
+# Balances events that move no balance between accounts and leave issuance alone:
+# deposits held for a multisig or a recovery, locks, and an account's storage upgrade.
+_STILL_BALANCES = frozenset({"Reserved", "Unreserved", "Locked", "Unlocked", "Frozen", "Thawed", "Upgraded"})
+
+
+def balance_moves(chain: str, number: int, records: list[dict]) -> Finding | None:
+    """The CRITICAL for a mainnet block whose events, in any phase, move a balance or
+    change issuance: a transfer, a mint or burn, a slash, a forced balance or a dust
+    loss. A hook can mint in the block's initialization or finalization, where no
+    extrinsic shows it."""
+    moved = []
+    for record in records:
+        if record.get("module_id") != "Balances" or record.get("event_id") in _STILL_BALANCES:
+            continue
+        phase = record.get("phase")
+        where = f"extrinsic {record['extrinsic_idx']}" if phase == "ApplyExtrinsic" else str(phase)
+        attributes = record.get("attributes")
+        moved.append(f"{where}: Balances.{record['event_id']} {_render_value(attributes)}")
+    if not moved:
+        return None
+    return Finding(CRITICAL, f"{chain}:{number}:balances",
+                   f"{chain} #{number}: MATRA moved ({plural(len(moved), 'Balances event')}); "
+                   f"mainnet issuance and balances must not move",
+                   details=tuple(moved[:MAX_SITE_LINES]), authority=True)
+
+
+def issuance_change(chain: str, number: int, issuance: int, last: int | None, declared: int) -> Finding | None:
+    """The CRITICAL for Balances.TotalIssuance at block ``number``: when first read off
+    the ``declared`` genesis issuance, and on any change after, back to it included."""
+    if issuance == (declared if last is None else last):
+        return None
+    moved = (f"first read at {issuance:,}, off the declared {declared:,}" if last is None
+             else f"changed from {last:,} to {issuance:,} (declared {declared:,})")
+    return Finding(CRITICAL, f"{chain}:{number}:issuance", f"{chain} #{number}: TotalIssuance {moved}",
+                   details=("mainnet issuance must stay at its genesis declaration",), authority=True)
+
+
+def balances_unverified(chain: str, number: int, unread: list[str]) -> Finding:
+    """An ALERT, grouped per source, for a mainnet block whose state no longer shows
+    whether MATRA moved in it."""
+    return Finding(ALERT, f"{chain}:{number}:unverified",
+                   f"{chain} #{number}: whether MATRA moved is unverified",
+                   details=(f"unread: {', '.join(unread)} (state pruned or undecodable)",),
+                   group=f"{chain} unverified")
+
+
 RUNTIME_ENVIRONMENT_UPDATED = "0x08"
 
 
@@ -895,7 +1034,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
                             read_events: Callable[[], dict[int, list[str]] | None], sudo_key: bytes | None,
                             authorities: frozenset[bytes] = frozenset(),
                             read_state: Callable[[frozenset], dict | None] = lambda wanted: None,
-                            empowered: frozenset[bytes] = frozenset()) -> list[Finding]:
+                            empowered: frozenset[bytes] = frozenset(), mainnet: bool = False) -> list[Finding]:
     """Findings for a block's extrinsics, each call tree walked once. ``read_events``
     returns the block's events by extrinsic, or None when they could not be read, and is
     called once, only when an extrinsic has something to report. An ordinary account's
@@ -905,7 +1044,8 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
     parent and at the block decides, or None when that state is gone. Without events,
     what the state cannot rule out counts as though it took effect. ``empowered`` are the
     accounts besides Sudo.Key and the authorities that can act in the recovery of one: its
-    friends, its proxies and the rescuers its friends have vouched for up to its threshold."""
+    friends, its proxies and the rescuers its friends have vouched for up to its threshold.
+    ``mainnet`` adds MAINNET_CALL_SEVERITY."""
     findings = []
     accounts = accountable(sudo_key, authorities)
     powerful = accounts | empowered
@@ -951,7 +1091,7 @@ def classify_materios_block(chain: str, number: int, extrinsics: list[dict],
             continue
         key = f"{chain}:{number}:{index}"
         signer = _account(ext.get("address"))
-        tree = _Tree(sudo_key, accounts, empowered)
+        tree = _Tree(sudo_key, accounts, empowered, mainnet=mainnet)
         try:
             _walk(ext["call"], signer, tree, 0, (), frozenset(), True)
         except Exception as e:  # argument values are the signer's choice; none may stall the block
@@ -1092,16 +1232,18 @@ def committee_of(extrinsics: list[dict]) -> tuple[tuple[str, ...], ...] | None:
     return None
 
 
-def committee_change(chain: str, number: int, previous: tuple, current: tuple) -> Finding:
+def committee_change(chain: str, number: int, previous: tuple, current: tuple, mainnet: bool = False) -> Finding:
+    """INFO for a rotation that seats the same members; a change is an ALERT, and on
+    mainnet, where only the governance keys decide who sits, CRITICAL and alone."""
     key = f"{chain}:{number}:committee"
     if previous == current:
         return Finding(INFO, key, f"{chain} #{number}: committee rotation, membership unchanged", kind="committee")
     added = sorted(set(current) - set(previous))
     removed = sorted(set(previous) - set(current))
     return Finding(
-        ALERT, key, f"{chain} #{number}: validator committee membership changed",
+        CRITICAL if mainnet else ALERT, key, f"{chain} #{number}: validator committee membership changed",
         details=tuple([f"+ {' '.join(m)}" for m in added] + [f"- {' '.join(m)}" for m in removed]),
-        kind="committee",
+        kind="committee", authority=mainnet,
     )
 
 

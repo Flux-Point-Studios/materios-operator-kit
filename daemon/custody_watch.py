@@ -270,6 +270,13 @@ GROUP_WINDOW = 600.0
 GROUPED_INTERVAL = 5 * PAGE_INTERVAL
 # Past this many groups ready at once, they all go out in one summary message.
 MAX_GROUP_MESSAGES = 3
+# The dead-man check is pinged at most this often; its grace period must be longer.
+DEADMAN_INTERVAL = 60.0
+# A page, or a due digest, that Discord has not taken for this long stops the dead-man
+# pings: a deleted or revoked webhook leaves the watcher reading but unable to page.
+# It outlasts the pager's doubling hold after a failure (MAX_HOLD) and a burst's queue
+# at the page rate; a rate limit that asks for longer counts as not delivering.
+DELIVERY_GRACE = 300.0
 
 
 def _doubling(n: int) -> float:
@@ -391,7 +398,8 @@ def _utc(ts: float) -> str:
 
 class Watch:
     def __init__(self, config: rules.WatchConfig, store: Store, sources: list, post: Callable[[dict], None],
-                 clock: Callable[[], float] = time.time, notify: Callable[[str], None] = lambda message: None):
+                 clock: Callable[[], float] = time.time, notify: Callable[[str], None] = lambda message: None,
+                 ping: Callable[[], None] | None = None):
         self._config = config
         self._store = store
         self._sources = sources
@@ -401,6 +409,8 @@ class Watch:
         self._started = clock()
         self._due = {s.name: 0.0 for s in sources}
         self._decimals = {n.name: n.pool.cmatra_decimals for n in config.cardano if n.pool}
+        self._ping = ping
+        self._pinged = -math.inf
 
     def cycle(self) -> None:
         """Poll each source that is due, paging what it found and pinging the systemd
@@ -414,9 +424,31 @@ class Watch:
             self._flush(self._clock())
             self._notify("WATCHDOG=1")
         now = self._clock()
-        self._check_stale(now)
+        stale = self._check_stale(now)
         self._digest(now)
         self._flush(now)
+        self._deadman(now, stale)
+
+    def _deadman(self, now: float, stale: bool) -> None:
+        """Ping the dead-man check after a cycle in which no source is stale and nothing
+        has waited DELIVERY_GRACE for Discord, so it pages from elsewhere once the watcher
+        stops, hangs, goes blind or cannot page. A failed ping is retried next cycle; the
+        check's own grace period covers the gap."""
+        if self._ping is None or stale or now - self._pinged < DEADMAN_INTERVAL:
+            return
+        waiting = [f.found_at for f in self._store.unsent_pages(held_since=now - GROUP_WINDOW)]
+        if self._digest_due(now):
+            due = datetime.fromtimestamp(now, timezone.utc).replace(
+                hour=self._config.digest_hour_utc, minute=0, second=0, microsecond=0)
+            waiting.append(max(due.timestamp(), self._started))
+        if any(now - since >= DELIVERY_GRACE for since in waiting):
+            return
+        try:
+            self._ping()
+        except OSError as e:
+            logger.warning("dead-man ping failed: %s: %s", type(e).__name__, e)
+            return
+        self._pinged = now
 
     def _flush(self, now: float) -> None:
         """Page what waits, keeping a token back for a digest that is due."""
@@ -459,16 +491,18 @@ class Watch:
                     details=(f"unreadable since {_utc(float(since))}",), kind="watcher"), now)
                 store.delete(f"health:{name}:stale-since")
 
-    def _check_stale(self, now: float) -> None:
+    def _check_stale(self, now: float) -> bool:
         """Page a source that has not been read up to its head for ``source_stale_seconds``,
-        and page it again every hour it stays that way."""
+        and page it again every hour it stays that way; True when any is stale."""
         store = self._store
+        stale = False
         for source in self._sources:
             name = source.name
             last_ok = max(float(store.get(f"health:{name}:ok") or 0), self._started)
             overdue = now - last_ok - self._config.source_stale_seconds
             if overdue <= 0:
                 continue
+            stale = True
             error = store.get(f"health:{name}:error") or "no poll has completed"
             with store.transaction():
                 store.add(rules.Finding(
@@ -477,6 +511,7 @@ class Watch:
                     f"moves on it are not being watched",
                     details=(f"last caught up {_utc(last_ok)}", f"last error: {error}"), kind="watcher"), now)
                 store.put(f"health:{name}:stale-since", str(int(last_ok)))
+        return stale
 
     def _digest(self, now: float) -> None:
         if not self._digest_due(now) or not self._pager.ready("digest", now):
@@ -577,6 +612,9 @@ KEYS_PAGE = 1000
 
 PROXY_PREFIX = "0x" + (RECOVERY + xxh128(b"Proxy")).hex()
 AUTHORIZED_UPGRADE_STORAGE = "0x" + (xxh128(b"System") + xxh128(b"AuthorizedUpgrade")).hex()
+GUARDIAN_STORAGE = "0x" + (xxh128(b"RootTimelock") + xxh128(b"Guardian")).hex()
+ATTESTATION_COMMITTEE_STORAGE = "0x" + (xxh128(b"OrinqReceipts") + xxh128(b"CommitteeMembers")).hex()
+TOTAL_ISSUANCE_STORAGE = "0x" + (xxh128(b"Balances") + xxh128(b"TotalIssuance")).hex()
 
 
 def recovery_proxy_key(rescuer: bytes) -> str:
@@ -713,7 +751,14 @@ class MateriosSource:
             return True
         sudo_key = self._sudo_key(head_hash, head, now)
         code = self._code(head_hash, head, now)
-        recovering = self._recovery(head_hash, head, sudo_key, code, now)
+        authorities = self._authorities
+        if self._config.mainnet:
+            guardian = self._watched("guardian", "RootTimelock.Guardian", GUARDIAN_STORAGE, head_hash, head, now,
+                                     _account)
+            authorities |= {bytes.fromhex(guardian[2:])} if guardian else frozenset()
+            self._watched("attestation-committee", "attestation committee", ATTESTATION_COMMITTEE_STORAGE, head_hash,
+                          head, now, lambda raw: self._members(raw, code, head_hash))
+        recovering = self._recovery(head_hash, head, sudo_key, authorities, code, now)
 
         cursor = self._store.get(self._cursor_key)
         if cursor is None:
@@ -729,7 +774,7 @@ class MateriosSource:
         hashes = self._rpc("chain_getBlockHash", [list(range(first, last + 1))])
         decoded = 0
         for number, block_hash in zip(range(first, last + 1), hashes):
-            decoded += self._block(number, block_hash, sudo_key, recovering, now)
+            decoded += self._block(number, block_hash, sudo_key, authorities, recovering, now)
             if decoded >= rules.DECODE_BUDGET:
                 return number == head
         return last == head
@@ -752,7 +797,7 @@ class MateriosSource:
                 f"{self.name} genesis changed: the chain was reset",
                 details=(f"from {stored}", f"to   {genesis}", f"watching again from finalized #{head}"),
                 authority=True), now)
-            for kept in ("sudo-key", "committee", "code", "recovery"):
+            for kept in ("sudo-key", "committee", "code", "recovery", "guardian", "attestation-committee", "issuance"):
                 self._store.delete(f"{kept}:{self.name}")
             self.start_at(head)
         self._decoder = None
@@ -761,17 +806,35 @@ class MateriosSource:
         return True
 
     def _sudo_key(self, head_hash: str, head: int, now: float) -> bytes | None:
-        raw = self._rpc("state_getStorage", [SUDO_KEY_STORAGE, head_hash]) or ""
-        name = f"sudo-key:{self.name}"
+        raw = self._watched("sudo-key", "Sudo.Key", SUDO_KEY_STORAGE, head_hash, head, now, _account)
+        return bytes.fromhex(raw[2:]) if raw else None
+
+    def _watched(self, slug: str, label: str, key: str, head_hash: str, head: int, now: float,
+                 describe: Callable[[str], str]) -> str:
+        """The storage at ``key`` at the finalized head; a change from what the last
+        poll read pages CRITICAL, from and to as ``describe`` renders them."""
+        raw = self._rpc("state_getStorage", [key, head_hash]) or ""
+        name = f"{slug}:{self.name}"
         stored = self._store.get(name)
         with self._store.transaction():
             if stored is not None and stored != raw:
                 self._store.add(rules.Finding(
-                    rules.CRITICAL, f"{self.name}:sudo-key:{head}",
-                    f"{self.name} Sudo.Key changed (seen at finalized #{head})",
-                    details=(f"from {_account(stored)}", f"to   {_account(raw)}"), authority=True), now)
+                    rules.CRITICAL, f"{self.name}:{slug}:{head}",
+                    f"{self.name} {label} changed (seen at finalized #{head})",
+                    details=(f"from {describe(stored)}", f"to   {describe(raw)}"), authority=True), now)
             self._store.put(name, raw)
-        return bytes.fromhex(raw[2:]) if raw else None
+        return raw
+
+    def _members(self, raw: str, code: str, head_hash: str) -> str:
+        """``OrinqReceipts.CommitteeMembers`` as its accounts, or its hash when this
+        runtime's layout does not decode it."""
+        if not raw:
+            return "none"
+        try:
+            members = self._decoder_for(code, [head_hash]).storage("OrinqReceipts", "CommitteeMembers", raw)
+        except Exception as e:  # a runtime may change the layout; the change still pages, as its hash
+            return f"{rules.hex_digest(raw)}, not decodable: {type(e).__name__}"
+        return ", ".join(members) or "none"
 
     def _code(self, head_hash: str, head: int, now: float) -> str:
         """The hash of the runtime code at the finalized head. A change pages, and the
@@ -792,7 +855,7 @@ class MateriosSource:
             self._store.put(name, code)
         return code
 
-    def _recovery(self, head_hash: str, head: int, sudo_key: bytes | None, code: str,
+    def _recovery(self, head_hash: str, head: int, sudo_key: bytes | None, authorities: frozenset[bytes], code: str,
                   now: float) -> tuple[frozenset[bytes], frozenset[bytes], frozenset[bytes]]:
         """Read at the finalized head who can recover Sudo.Key or a configured authority,
         who is recovering one, and who may already act as one or as whom one may act, and
@@ -802,14 +865,14 @@ class MateriosSource:
         act in such a recovery: the friends, each proxy acting as a watched account, and
         each rescuer its friends have vouched for up to its threshold. Each entry is
         decoded once, when it is first read with its value."""
-        watched = rules.accountable(sudo_key, self._authorities)
+        watched = rules.accountable(sudo_key, authorities)
         entries = self._recovery_entries(watched, head_hash)
         if self._recovering is not None and self._recovering[0] == entries:
             return self._recovering[1]
         decoded: dict[tuple[str, str, str], tuple[object, Exception | None]] = {}
 
         def who(account: bytes) -> str:
-            role = ", Sudo.Key" if account == sudo_key else ", authority" if account in self._authorities else ""
+            role = ", Sudo.Key" if account == sudo_key else ", authority" if account in authorities else ""
             return rules.render_account(account) + role
 
         def read(entry: list) -> tuple[str, object]:
@@ -891,8 +954,8 @@ class MateriosSource:
                      + [f"- {read(previous[k])[0]}" for k in removed])
             # Any funded account can start a recovery of Sudo.Key, once a poll; until a
             # friend vouches it can do nothing, so such starts page as an ALERT, grouped
-            # behind what pages alone.
-            started = not changed and not removed and all(
+            # behind what pages alone. On mainnet only role accounts can sign at all.
+            started = not self._config.mainnet and not changed and not removed and all(
                 entries[k][0] == "ActiveRecoveries" and current[k][1] is not None and not current[k][1]["friends"]
                 for k in added)
             self._store.add(rules.Finding(
@@ -936,8 +999,8 @@ class MateriosSource:
             self._decoders[cache] = rules.RuntimeDecoder(metadata)
         return self._decoders[cache]
 
-    def _events(self, block_hash: str, decoder: rules.RuntimeDecoder) -> dict[int, list[str]] | None:
-        """The block's events by extrinsic, or None when the node has pruned them, serves
+    def _events(self, block_hash: str, decoder: rules.RuntimeDecoder) -> list[dict] | None:
+        """The block's event records, or None when the node has pruned them, serves
         none, or they do not decode; the finding then says its dispatch result is
         unverified. Every block has events, so an empty read is never taken to mean
         that nothing happened."""
@@ -948,7 +1011,7 @@ class MateriosSource:
         if not raw:
             return None
         try:
-            return decoder.events(raw)
+            return decoder.event_records(raw)
         except Exception as e:  # scalecodec raises any type on bytes it cannot place
             logger.warning("%s: events at %s do not decode: %s: %s", self.name, block_hash, type(e).__name__, e)
             return None
@@ -988,12 +1051,14 @@ class MateriosSource:
                 logger.warning("%s: %s undecided at %s: %s: %s", self.name, fact[0], block_hash, type(e).__name__, e)
         return facts
 
-    def _block(self, number: int, block_hash: str, sudo_key: bytes | None,
+    def _block(self, number: int, block_hash: str, sudo_key: bytes | None, authorities: frozenset[bytes],
                recovering: tuple[frozenset[bytes], frozenset[bytes], frozenset[bytes]], now: float) -> int:
         """Classify one block and commit its findings with the cursor; returns the values
         its extrinsics and events decoded into. What the friends and rescuers in
         ``recovering`` sign decodes ahead of other accounts' extrinsics, from the budget
-        they share; the empowered among them page what cannot be decoded CRITICAL."""
+        they share; the empowered among them page what cannot be decoded CRITICAL. On
+        mainnet every block's events and TotalIssuance are read too, and the issuance
+        is committed with the cursor."""
         block = self._rpc("chain_getBlock", [block_hash])["block"]
         header = block["header"]
         if self._decoder is None:
@@ -1001,11 +1066,19 @@ class MateriosSource:
         decoder = self._decoder
         before = decoder.values
         friends, rescuers, empowered = recovering
-        extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, self._authorities),
+        extrinsics = decoder.extrinsics(block["extrinsics"], rules.accountable(sudo_key, authorities),
                                         (friends, rescuers))
+        records = functools.cache(lambda: self._events(block_hash, decoder))
+        mainnet = self._config.mainnet
         findings = rules.classify_materios_block(
-            self.name, number, extrinsics, lambda: self._events(block_hash, decoder), sudo_key, self._authorities,
-            lambda wanted: self._dispatch_facts(decoder, header["parentHash"], block_hash, wanted), empowered)
+            self.name, number, extrinsics, lambda: None if records() is None else rules.by_extrinsic(records()),
+            sudo_key, authorities,
+            lambda wanted: self._dispatch_facts(decoder, header["parentHash"], block_hash, wanted), empowered,
+            mainnet=mainnet)
+        issuance = None
+        if mainnet:
+            issuance, found = self._balances(number, block_hash, records())
+            findings += found
         if rules.runtime_upgraded(header):
             findings.append(rules.runtime_changed(self.name, number))
         try:
@@ -1020,14 +1093,41 @@ class MateriosSource:
                 previous = self._store.get(name)
                 if previous is not None:
                     seated = tuple(tuple(m) for m in json.loads(previous))
-                    findings.append(rules.committee_change(self.name, number, seated, committee))
+                    findings.append(rules.committee_change(self.name, number, seated, committee, mainnet))
                 self._store.put(name, json.dumps(committee))
             for finding in findings:
                 self._store.add(finding, now)
+            if issuance is not None:
+                self._store.put(f"issuance:{self.name}", str(issuance))
             self._store.put(self._cursor_key, str(number))
         if rules.runtime_upgraded(header):
             self._decoder = None
         return decoder.values - before
+
+    def _balances(self, number: int, block_hash: str, records: list[dict] | None
+                  ) -> tuple[int | None, list[rules.Finding]]:
+        """A mainnet block's TotalIssuance, or None when its state is gone, and what it
+        and the block's Balances events page: any move, any issuance off the last read
+        or, first, off the declaration, and a grouped ALERT for what is unread."""
+        findings, unread = [], []
+        if records is None:
+            unread.append("Balances events")
+        else:
+            findings.append(rules.balance_moves(self.name, number, records))
+        try:
+            raw = self._rpc("state_getStorage", [TOTAL_ISSUANCE_STORAGE, block_hash])
+        except SubstrateRequestException:
+            raw, issuance = None, None
+            unread.append("TotalIssuance")
+        else:
+            # ValueQuery: an absent TotalIssuance is zero.
+            issuance = int.from_bytes(bytes.fromhex(raw[2:]), "little") if raw else 0
+            last = self._store.get(f"issuance:{self.name}")
+            findings.append(rules.issuance_change(self.name, number, issuance, None if last is None else int(last),
+                                                  self._config.total_issuance))
+        if unread:
+            findings.append(rules.balances_unverified(self.name, number, unread))
+        return issuance, [f for f in findings if f is not None]
 
 
 # --- Cardano ------------------------------------------------------------------------------
@@ -1412,10 +1512,27 @@ def build_sources(config: rules.WatchConfig, store: Store, materios_rpc: str | N
     return sources
 
 
+def deadman_url(config: rules.WatchConfig) -> str | None:
+    """The dead-man check's ping URL, from the file the config names; None without one."""
+    if not config.deadman_ping_file:
+        return None
+    url = Path(config.deadman_ping_file).read_text().strip()
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise ValueError("deadman_ping_file does not hold an http(s) ping URL")
+    return url
+
+
+def _ping(url: str) -> None:
+    with urllib.request.urlopen(url, timeout=10) as answer:
+        answer.read()
+
+
 def _run(config: rules.WatchConfig, webhook: str) -> int:
     store = Store(config.state_db)
+    url = deadman_url(config)
     watch = Watch(config, store, build_sources(config, store),
-                  functools.partial(discord.post_json, webhook), notify=sd_notify)
+                  functools.partial(discord.post_json, webhook), notify=sd_notify,
+                  ping=functools.partial(_ping, url) if url else None)
     sd_notify("READY=1")
     logger.info("watching %d sources", len(config.cardano) + (1 if config.materios else 0))
     while True:
