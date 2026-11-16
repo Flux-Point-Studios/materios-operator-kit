@@ -671,9 +671,7 @@ class EvidenceSubmitter:
                 call = self._compose_submit_evidence_call(
                     receipt_id_hex, content_hash, evidence_type, payload_bytes
                 )
-                extrinsic = self.client.create_signed_extrinsic(
-                    call=call, keypair=self.client.keypair
-                )
+                extrinsic = self.client.create_signed_extrinsic(call=call)
                 receipt = await asyncio.to_thread(
                     self.client.submit_extrinsic,
                     extrinsic,

@@ -135,6 +135,57 @@ one's own recovery config, give no power over `Sudo.Key` and page as an ALERT. A
 acting as the rescuer of some other account
 is paged from its own extrinsics, and from its `Recovery.Proxy` once it claims.
 
+## Mainnet
+
+`materios.network` is `preprod` unless the config says `mainnet`. A mainnet chain
+holds no MATRA beyond the dust its genesis gives FPS role accounts: signed
+transfers are refused and `Balances.TotalIssuance` must stay at its genesis
+declaration. Nothing anyone outside those role accounts does can move custody or
+authority there, so on mainnet, besides everything above:
+
+| What | Pages |
+|---|---|
+| any `Balances` call, `Vesting.vested_transfer`, any `Recovery` call | CRITICAL |
+| a recovery of `Sudo.Key` or an authority started, vouched or not | CRITICAL, alone |
+| a validator committee membership change | CRITICAL, alone |
+| `RootTimelock.Guardian` or `OrinqReceipts.CommitteeMembers` changing at the finalized head | CRITICAL, alone |
+| `Balances.TotalIssuance` first read off `total_issuance`, and any change of it after | CRITICAL, alone |
+| a block whose events, in any phase, carry a `Balances` event other than a reserve, lock, freeze or account upgrade | CRITICAL, alone |
+| a block whose state no longer shows its events or its issuance | ALERT, grouped per source |
+
+The guardian counts as an authority account, read from the chain each poll, so
+what it signs decodes first and pages whatever its outcome, and its recovery is
+watched like `Sudo.Key`'s. Every `RootTimelock` call (schedule, enact, cancel, the
+guardian's veto and approval) and every root-gated call pages CRITICAL on any
+network. Each mainnet block's events and `TotalIssuance` are read whether or not
+an extrinsic in it reports anything, so the watcher needs a node that keeps the
+state it has not yet read: an archive node, or one it never falls
+`state_pruning_blocks` behind.
+
+`ops/custody-watch/mainnet.example.json` is the mainnet config with placeholders.
+A mainnet config refuses to load, naming everything still missing, until it has:
+
+- `materios.total_issuance`, the issuance the genesis declares, in base units (a
+  string, since it may pass JSON's safe integers);
+- `materios.authority_accounts`, every sudo and guardian multisig signatory and
+  every other role account the genesis endows, each an SS58 account;
+- `discord_webhook_file` and `deadman_ping_file` (below), each a file name;
+- Cardano mainnet addresses and 56-hex policy ids throughout, among them the
+  partner chain's governance UTxO address (`VersionOracleValidator`), its
+  `DParameterValidator` and its `PermissionedCandidatesValidator` watched as
+  `custody`, so any spend pages CRITICAL alone, and its `VersionOracle`,
+  `DParameter` and `PermissionedCandidates` policies watched `CRITICAL`.
+
+### The dead-man check
+
+`deadman_ping_file` names a file holding the ping URL of a dead-man check
+(Healthchecks or anything that takes a GET on a URL). After every cycle in which
+no source is stale the watcher pings it, at most once a minute, so the check pages
+on its own rail when the watcher stops, hangs, loses its host or goes blind. Give
+the check a period of one minute and a grace of a few minutes.
+A failed ping is logged and tried again the next cycle. Like the webhook, the URL
+is a credential: it lives on the host, never in the config or this repository.
+
 ## Surrender-pool coverage
 
 With `surrender_pool.coverage` configured, the daily digest says whether the pool can pay
@@ -306,6 +357,7 @@ EnvironmentFile=/etc/custody-watch/discord.env
 LoadCredential=config.json:/etc/custody-watch/config.json
 LoadCredential=insight.key:/etc/custody-watch/insight.key
 LoadCredential=discord-webhook:/etc/custody-watch/discord-webhook
+LoadCredential=deadman-ping:/etc/custody-watch/deadman-ping
 LoadCredential=redemption_pin.json:/etc/custody-watch/redemption_pin.json
 LoadCredential=rate_table_cmatra.json:/etc/custody-watch/rate_table_cmatra.json
 Environment=PYTHONDONTWRITEBYTECODE=1
@@ -373,7 +425,9 @@ message through the webhook to prove delivery end to end.
   most the 200 lines a page can show, and long arguments are rendered from a hash or
   their first characters, so rendering never copies a block-sized value.
 - **Its own death is visible.** The daily digest is also the liveness signal, and it
-  names every stale source instead of reporting the watcher alive. A source that has
+  names every stale source instead of reporting the watcher alive. With a
+  `deadman_ping_file` the watcher also pings a dead-man check after every cycle in
+  which no source is stale, which pages from elsewhere when the pings stop. A source that has
   not been read up to its head for `source_stale_seconds` is paged CRITICAL, again
   every hour it stays that way, and once more (ALERT) when it recovers. That covers a
   source whose reads fail and one read without error that stays behind, as when its

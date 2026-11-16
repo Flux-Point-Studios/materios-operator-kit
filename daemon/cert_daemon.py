@@ -5,7 +5,6 @@ import logging
 import os
 import time
 from typing import Optional
-import aiohttp
 
 from daemon.config import DaemonConfig
 from daemon.models import AttestationLevel, PendingReceipt
@@ -796,8 +795,8 @@ class CertDaemon:
                     f"AUTO-SLASHED for bad attest on `{receipt_id[:16]}...` — "
                     f"strikes={outcome.strikes}, "
                     f"amount={outcome.slashed_amount}. "
-                    f"Signer ejected from committee; re-bond required after "
-                    f"fixing cert-builder input drift.",
+                    f"Signer ejected from committee; fix the cert-builder "
+                    f"input drift, then it waits for Root to re-admit it.",
                     "critical",
                 )
             else:
@@ -921,16 +920,16 @@ class CertDaemon:
     async def _ensure_bond(self):
         """Ensure the daemon's signer has `AttestorBonds[addr] >= BondRequirement`.
 
-        Called on startup (before the first `join_committee` attempt) and as a
-        defensive fallback if a later `join_committee` dispatch still reports
-        `InsufficientBond` (e.g. governance raised the requirement after we
-        last bonded).
+        Called by every committee check while the signer is outside the
+        committee on a network whose profile bonds, since Root's
+        `join_committee(member)` refuses a member bonded below the requirement
+        (and so picks up a requirement governance raised).
 
         Idempotent:
           - `current_bond >= required` → skip (logs "already bonded ...")
           - `required == 0` → skip (preprod bootstrap / upgrade grace window)
           - `free_matra < delta` → warn (with faucet URL hint) and return;
-            does NOT submit a tx, does NOT crash. Daemon still tries to join.
+            does NOT submit a tx, does NOT crash.
           - Otherwise → submit `bond(required - current)` and log the tx hash.
 
         The bond submits under the chain-write lock, as every submit does.
@@ -954,16 +953,11 @@ class CertDaemon:
             delta = required - current
             free = self.client.get_free_balance(my_address)
             if free < delta:
-                # Not enough free MATRA to cover the bond delta. Warn clearly
-                # and continue — the join_committee attempt that follows will
-                # fail with InsufficientBond, but that's expected and loud.
                 logger.warning(
                     f"Insufficient free MATRA to auto-bond: need {delta} more "
                     f"base units (have {free}). Request more MATRA from the "
                     f"faucet at {self.config.blob_base_url or '<blob-gateway>'}"
-                    f"/faucet/drip and restart the daemon, or wait for an "
-                    f"automatic faucet drip. Continuing anyway so the operator "
-                    f"can see the join_committee error in the logs."
+                    f"/faucet/drip; the next committee check bonds it."
                 )
                 await self.send_discord(
                     f"Auto-bond skipped for `{my_address[:16]}...`: need "
@@ -992,24 +986,19 @@ class CertDaemon:
                     "info",
                 )
             else:
-                logger.warning(
-                    "Auto-bond submit returned failure; continuing to "
-                    "join_committee anyway so the error surfaces."
-                )
+                logger.warning("Auto-bond submit returned failure; the next committee check retries it.")
         except Exception as e:
             # Top-level safety net — never crash daemon startup on bond errors.
             logger.warning(f"_ensure_bond failed with {type(e).__name__}: {e}")
 
     async def _ensure_committee_membership(self):
-        """Check if this daemon's signer is in the attestation committee. If not, join.
+        """Check whether this daemon's signer is in the attestation committee.
 
-        Before the first join attempt we call `_ensure_bond()` to satisfy the
-        `BondRequirement` (introduced when Component 8 of the v5.1 tokenomics
-        landed). If the chain still reports `InsufficientBond` after the
-        initial bond (e.g. governance raised the floor mid-flight), we re-run
-        `_ensure_bond()` and retry the join exactly ONCE more — never an
-        infinite loop on the same failure mode. The join submits under the
-        chain-write lock, as every submit does.
+        Only Root admits a member (``OrinqReceipts.join_committee(member)``,
+        Root-only since spec 228), so an outsider waits: on a network whose
+        profile bonds it first bonds toward ``BondRequirement``, which Root's
+        admission checks. It says once that it waits, and once that it was
+        admitted.
         """
         self._ensure_concurrency_primitives()
         try:
@@ -1034,78 +1023,29 @@ class CertDaemon:
                         is_member = True
                         break
 
+            awaiting = getattr(self, "_awaiting_admission", False)
             if is_member:
                 logger.info(f"Already in attestation committee as {my_address}")
+                if awaiting:
+                    self._awaiting_admission = False
+                    await self.send_discord(f"Root admitted `{my_address}` to the attestation committee", "info")
                 try:
                     self.client.refresh_backup_delay()
                 except Exception as e:
                     logger.warning(f"Backup signer listing read failed: {type(e).__name__}: {e}")
                 return
 
-            # Ensure bond meets BondRequirement before attempting join. This
-            # handles the first-time onboarding case where the attestor has
-            # MATRA but has never called bond().
-            await self._ensure_bond()
-
-            logger.info(f"Not in committee — calling join_committee as {my_address}")
-
-            bond_retry_used = False
-            for attempt in range(2):  # at most: original attempt + 1 bond-fallback
-                async with self._chain_write_lock:
-                    receipt = await asyncio.to_thread(self.client.submit_join_committee)
-
-                if receipt.is_success:
-                    logger.info(f"Successfully joined attestation committee!")
-                    await self.send_discord(
-                        f"Joined attestation committee as `{my_address[:16]}...`", "info"
-                    )
-                    return
-
-                error = receipt.error_message or "unknown error"
-                logger.warning(f"join_committee failed: {error}")
-
-                # Defensive re-bond path: if the chain says InsufficientBond
-                # after we already ran _ensure_bond, governance likely raised
-                # the floor. Re-run once and retry. Never loop beyond this.
-                if _is_insufficient_bond_error(error) and not bond_retry_used:
-                    bond_retry_used = True
-                    logger.info(
-                        "join_committee returned InsufficientBond — re-running "
-                        "auto-bond once and retrying."
-                    )
-                    await self._ensure_bond()
-                    continue
-
-                # Common non-bond failure: can't pay fees (no MOTRA).
-                if "pay" in str(error).lower() or "fee" in str(error).lower():
-                    await self._request_faucet_drip(my_address)
-                return  # any other failure: bail, poll loop will retry later
+            if self.config.profile.bonds:
+                await self._ensure_bond()
+            waiting = (f"`{my_address}` is not in the attestation committee; Root admits it with "
+                       f"OrinqReceipts.join_committee(member). Checking again every 60 s.")
+            logger.warning(waiting)
+            if not awaiting:
+                self._awaiting_admission = True
+                await self.send_discord(waiting, "warning")
 
         except Exception as e:
             logger.warning(f"Committee membership check failed: {e}")
-
-    async def _request_faucet_drip(self, address: str):
-        """Request a MATRA airdrop from the gateway faucet to pay for join_committee."""
-        gateway_url = self.config.blob_base_url
-        if not gateway_url:
-            return
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{gateway_url}/faucet/drip",
-                    json={"address": address},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    data = await resp.json()
-                    if resp.status == 200:
-                        logger.info(f"Faucet drip received: {data.get('amount')} MATRA")
-                        # Wait for MOTRA to generate, then retry join
-                        await asyncio.sleep(30)
-                        await self._ensure_committee_membership()
-                    else:
-                        logger.warning(f"Faucet request failed: {data.get('error', resp.status)}")
-        except Exception as e:
-            logger.warning(f"Faucet request error: {e}")
 
     async def run(self):
         await self.send_discord("Daemon starting up", "info")
@@ -1122,7 +1062,7 @@ class CertDaemon:
 
         health_server.update_metrics(substrate_connected=True)
 
-        # Auto-join the attestation committee if not already a member
+        # Report whether the signer is in the attestation committee
         await self._ensure_committee_membership()
         self._last_committee_check = time.time()
 
@@ -1178,7 +1118,7 @@ class CertDaemon:
         while self._running:
             notifications = []  # defined outside try so adaptive sleep can see it
             try:
-                # Retry committee join every 60s if initial attempt failed
+                # Re-check committee membership every 60s
                 if time.time() - self._last_committee_check > 60:
                     self._last_committee_check = time.time()
                     await self._ensure_committee_membership()
@@ -1285,26 +1225,3 @@ class CertDaemon:
 
         keepalive.cancel()
         await self.send_discord("Daemon shutting down", "info")
-
-
-def _is_insufficient_bond_error(error) -> bool:
-    """Detect the InsufficientBond dispatch error in whatever form
-    substrate-interface hands us (dict, str, SCALE-decoded enum).
-
-    Module-level helper deliberately placed after the class so the class body
-    stays intact — the prior placement nested `_request_faucet_drip` and `run`
-    inside this helper (indentation pitfall), which would crash the daemon at
-    runtime even though pytest mocks didn't catch it. See the
-    `test_class_methods_intact` regression test.
-    """
-    if error is None:
-        return False
-    if isinstance(error, dict):
-        if error.get("name") == "InsufficientBond":
-            return True
-        # Nested {"Module": {"error": "InsufficientBond", ...}} form.
-        for v in error.values():
-            if _is_insufficient_bond_error(v):
-                return True
-        return False
-    return "InsufficientBond" in str(error)

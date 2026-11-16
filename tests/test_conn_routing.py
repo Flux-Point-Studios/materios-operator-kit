@@ -28,9 +28,8 @@ from tests.fake_chain import connected_client
 DAEMON = Path(__file__).resolve().parents[1] / "daemon"
 WRITE_CONN_FUNCTIONS = {
     "compose_call": "composes the call a submit signs, under the runtime it is submitted to",
-    "create_signed_extrinsic": "reads the signer's nonce at the best block of the node the submit goes to",
+    "create_signed_extrinsic": "reads the signer's nonce and a mortal era's first block on the node the submit goes to",
     "submit_extrinsic": "submits",
-    "submit_join_committee": "composes, signs and submits",
     "submit_bond": "composes, signs and submits",
     "_submit_settlement_call": "composes, signs and submits",
     "submit_availability_cert": "composes, signs and submits",
@@ -211,7 +210,7 @@ def test_the_write_conn_methods_include_every_submit_wrapper():
     writes = write_conn_methods(daemon_sources()["substrate_client.py"])
     assert {"submit_attest_settle", "submit_attest_settle_envelope", "submit_attest_expire_policy",
             "submit_attest_expire_policy_envelope", "submit_slash_bad_settlement_evidence",
-            "submit_supersede_settlement_request", "submit_join_committee", "submit_bond"} <= writes
+            "submit_supersede_settlement_request", "submit_bond", "create_signed_extrinsic"} <= writes
     assert {"get_committee_members", "get_receipt", "rpc"}.isdisjoint(writes)
 
 
@@ -278,7 +277,7 @@ class Daemon:
 
     async def locked(self):
         async with self._chain_write_lock:
-            await asyncio.to_thread(self.client.submit_join_committee)
+            await asyncio.to_thread(self.client.submit_availability_cert)
 
     async def reads(self):
         return self.client.get_committee_members()
@@ -320,7 +319,7 @@ class Daemon:
         chain.keepalive()
 
     async def by_name(self):
-        getattr(self.client, "submit_join_committee")()
+        getattr(self.client, "submit_availability_cert")()
 
     async def by_method_caller(self):
         operator.methodcaller("submit_extrinsic", None)(self.client)
@@ -336,7 +335,7 @@ class Daemon:
     async def other_getattrs(self, request, field):
         return getattr(request, field.name), getattr(self.client, "get_receipt")
 '''
-    writes = {"submit_bond", "submit_join_committee", "get_settlement_request", "keepalive",
+    writes = {"submit_bond", "submit_availability_cert", "get_settlement_request", "keepalive",
               "attestation_on_chain", "submit_extrinsic", "create_signed_extrinsic"}
     assert [(function, name) for function, name, _ in unlocked_writes(source, writes)] == [
         ("unlocked", "submit_bond"),
@@ -346,7 +345,7 @@ class Daemon:
         ("other_lock", "create_signed_extrinsic"),
         ("aliased", "submit_bond"),
         ("handed", "keepalive"),
-        ("by_name", "submit_join_committee"),
+        ("by_name", "submit_availability_cert"),
         ("by_method_caller", "submit_extrinsic"),
         ("by_computed_name", "f'submit_{kind}'"),
     ]

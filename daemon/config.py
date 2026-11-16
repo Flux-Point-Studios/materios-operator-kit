@@ -2,8 +2,26 @@ import os
 from dataclasses import dataclass
 
 
+@dataclass(frozen=True)
+class NetworkProfile:
+    """What differs between the networks a daemon can serve."""
+    # Bond toward OrinqReceipts.BondRequirement so Root may admit the signer. Mainnet
+    # admits attestors without a bond, and its accounts hold no MATRA to bond with.
+    bonds: bool
+    # Blocks a signed extrinsic stays valid for, the era substrate encodes for about
+    # five minutes of 6 s blocks plus a finality lag; 0 signs it immortal.
+    mortal_period: int
+
+
+NETWORKS = {
+    "preprod": NetworkProfile(bonds=True, mortal_period=0),
+    "mainnet": NetworkProfile(bonds=False, mortal_period=64),
+}
+
+
 @dataclass
 class DaemonConfig:
+    network: str = "preprod"  # MATERIOS_NETWORK, a key of NETWORKS
     rpc_url: str = "ws://materios-rpc.materios.svc.cluster.local:9944"
     ogmios_url: str = "http://materios-ogmios.materios.svc.cluster.local:1337"
     # Task #266 — Kupo (Cardano tx indexer) URL. Used by the
@@ -66,9 +84,17 @@ class DaemonConfig:
     # one block. Tune via MAX_CONCURRENT_RECEIPTS env var.
     max_concurrent_receipts: int = 8
 
+    @property
+    def profile(self) -> NetworkProfile:
+        return NETWORKS[self.network]
+
     @classmethod
     def from_env(cls) -> "DaemonConfig":
+        network = os.environ.get("MATERIOS_NETWORK", cls.network)
+        if network not in NETWORKS:
+            raise ValueError(f"MATERIOS_NETWORK={network!r} names no network; use one of {', '.join(NETWORKS)}")
         return cls(
+            network=network,
             rpc_url=os.environ.get("MATERIOS_RPC_URL", cls.rpc_url),
             ogmios_url=os.environ.get("OGMIOS_URL", cls.ogmios_url),
             kupo_url=os.environ.get("KUPO_URL", cls.kupo_url),

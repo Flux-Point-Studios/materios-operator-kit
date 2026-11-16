@@ -245,7 +245,7 @@ class FakeSI:
         self._use("compose_call")
         return SimpleNamespace(function=call_function, params=call_params)
 
-    def create_signed_extrinsic(self, call, keypair):
+    def create_signed_extrinsic(self, call, keypair, era=None):
         self._use("create_signed_extrinsic")
         # substrate-interface 1.8 signs with AccountNonceApi at the best block:
         # the chain's nonce, blind to the pool.
@@ -298,8 +298,10 @@ class IncludingSI:
     asked for. ``query_map`` returns its ``QueryMapResult`` over ``map_rows``,
     two rows a page, which reads each further page through this interface as
     iteration reaches it. ``calls`` records every call as (name, thread name,
-    whether ``lock`` is held). A call named in ``stalls`` first waits for that
-    event, once."""
+    whether ``lock`` is held), ``composed`` every call composed and ``eras``
+    the era each signature was asked for. ``best`` and ``finalized`` are its
+    best and finalized block numbers. A call named in ``stalls`` first waits
+    for that event, once."""
 
     chain = "Materios Fake"
     metadata = None
@@ -309,6 +311,10 @@ class IncludingSI:
         self.calls: list[tuple[str, str, bool]] = []
         self.stalls: dict[str, threading.Event] = {}
         self.map_rows = [[f"0x{index:02x}", index] for index in range(3)]
+        self.composed: list[SimpleNamespace] = []
+        self.eras: list[dict | None] = []
+        self.best = 0
+        self.finalized = 0
 
     def _use(self, name: str) -> None:
         self.calls.append((name, threading.current_thread().name, self.lock is not None and self.lock.locked()))
@@ -338,11 +344,21 @@ class IncludingSI:
 
     def compose_call(self, call_module, call_function, call_params):
         self._use("compose_call")
-        return SimpleNamespace(module=call_module, function=call_function, params=call_params)
+        self.composed.append(SimpleNamespace(module=call_module, function=call_function, params=call_params))
+        return self.composed[-1]
 
-    def create_signed_extrinsic(self, call, keypair):
+    def create_signed_extrinsic(self, call, keypair, era=None):
         self._use("create_signed_extrinsic")
+        self.eras.append(era)
         return SimpleNamespace(call=call, signer=keypair.public_key)
+
+    def get_chain_finalised_head(self):
+        self._use("get_chain_finalised_head")
+        return f"0x{self.finalized:064x}"
+
+    def get_block_header(self, block_hash=None):
+        self._use("get_block_header")
+        return {"header": {"number": self.best if block_hash is None else int(block_hash, 16)}}
 
     def submit_extrinsic(self, extrinsic, wait_for_inclusion=False):
         self._use("submit_extrinsic")

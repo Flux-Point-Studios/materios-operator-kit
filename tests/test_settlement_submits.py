@@ -9,6 +9,7 @@ from substrateinterface import Keypair
 from substrateinterface.exceptions import SubstrateRequestException
 
 from daemon.slash_watcher import TxNotFound, WrongAmount, WrongBeneficiary
+from daemon.config import NETWORKS
 from daemon.substrate_client import SubstrateClient
 
 ID = b"\x11" * 32
@@ -38,7 +39,7 @@ SUBMITS = [
 
 def client(*receipts):
     c = object.__new__(SubstrateClient)
-    c.config = SimpleNamespace(signer_uri="//Alice", tx_max_retries=3)
+    c.config = SimpleNamespace(signer_uri="//Alice", tx_max_retries=3, profile=NETWORKS["preprod"])
     c._ensure_wrapper_state()
     answers = iter(receipts)
 
