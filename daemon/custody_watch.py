@@ -272,6 +272,11 @@ GROUPED_INTERVAL = 5 * PAGE_INTERVAL
 MAX_GROUP_MESSAGES = 3
 # The dead-man check is pinged at most this often; its grace period must be longer.
 DEADMAN_INTERVAL = 60.0
+# A page, or a due digest, that Discord has not taken for this long stops the dead-man
+# pings: a deleted or revoked webhook leaves the watcher reading but unable to page.
+# It outlasts the pager's doubling hold after a failure (MAX_HOLD) and a burst's queue
+# at the page rate; a rate limit that asks for longer counts as not delivering.
+DELIVERY_GRACE = 300.0
 
 
 def _doubling(n: int) -> float:
@@ -425,10 +430,18 @@ class Watch:
         self._deadman(now, stale)
 
     def _deadman(self, now: float, stale: bool) -> None:
-        """Ping the dead-man check after a cycle in which no source is stale, so it pages
-        from elsewhere once the watcher stops, hangs or goes blind. A failed ping is
-        retried next cycle; the check's own grace period covers the gap."""
+        """Ping the dead-man check after a cycle in which no source is stale and nothing
+        has waited DELIVERY_GRACE for Discord, so it pages from elsewhere once the watcher
+        stops, hangs, goes blind or cannot page. A failed ping is retried next cycle; the
+        check's own grace period covers the gap."""
         if self._ping is None or stale or now - self._pinged < DEADMAN_INTERVAL:
+            return
+        waiting = [f.found_at for f in self._store.unsent_pages(held_since=now - GROUP_WINDOW)]
+        if self._digest_due(now):
+            due = datetime.fromtimestamp(now, timezone.utc).replace(
+                hour=self._config.digest_hour_utc, minute=0, second=0, microsecond=0)
+            waiting.append(max(due.timestamp(), self._started))
+        if any(now - since >= DELIVERY_GRACE for since in waiting):
             return
         try:
             self._ping()

@@ -7,7 +7,7 @@ or of the attestation committee, any movement in the Balances events and any cha
 of TotalIssuance page CRITICAL. The config must say what issuance it pins, name its
 own webhook channel and a dead-man ping by file, and watch the partner chain's
 governance on Cardano; the watcher pings the dead-man after every cycle in which no
-source is stale. Preprod is untouched: none of this is read or paged there.
+source is stale and no page or due digest has waited DELIVERY_GRACE for Discord. Preprod is untouched: none of this is read or paged there.
 """
 
 import http.server
@@ -20,6 +20,7 @@ from substrateinterface.utils.hasher import xxh128
 
 from daemon import custody_rules as rules
 from daemon import custody_watch as cw
+from daemon import discord
 from tests.test_custody_rules import _call, _signed, _signed_hex, decoder_242  # noqa: F401 (fixture)
 from tests.test_custody_watch import ALICE, SUDO_KEY, FakeChain, Posts, StubSource, _read, _recovering
 
@@ -487,6 +488,75 @@ def test_a_failed_ping_is_retried_on_the_next_cycle(tmp_path):
     watch.cycle()
     watch.cycle()
     assert len(calls) == 2 and pings == [1]
+
+
+class Webhook:
+    """Answers every post with ``status`` (None: unreachable) until healed."""
+
+    def __init__(self, status):
+        self.status = status
+        self.healed = False
+        self.sent = []
+
+    def __call__(self, payload):
+        if not self.healed:
+            raise discord.DiscordError("webhook refused", self.status)
+        self.sent.append(payload)
+
+
+def _mute(tmp_path, status):
+    pings = []
+    webhook = Webhook(status)
+    clock = Clock()
+    store = cw.Store(str(tmp_path / "state.db"))
+    watch = cw.Watch(_mainnet(), store, [StubSource("a")], webhook, clock=clock,
+                     ping=lambda: pings.append(clock.now))
+    return watch, store, webhook, clock, pings
+
+
+def _minutes(watch, clock, n):
+    for _ in range(n):
+        watch.cycle()
+        clock.now += 60
+
+
+@pytest.mark.parametrize("status", [404, 401, 500, 400, None])
+def test_a_page_the_webhook_cannot_deliver_stops_the_pings_until_it_goes_out(tmp_path, status):
+    watch, store, webhook, clock, pings = _mute(tmp_path, status)
+    store.put("digest:last-day", "1970-01-12")
+    found = clock.now
+    store.add(rules.Finding(rules.CRITICAL, "materios:9:balances", "Balances moved", authority=True), found)
+    _minutes(watch, clock, 30)
+    assert pings and max(pings) < found + cw.DELIVERY_GRACE
+    assert [f.key for f in store.unsent_pages()] == ["materios:9:balances"]
+    webhook.healed = True
+    healed = clock.now
+    _minutes(watch, clock, 3)
+    assert store.unsent_pages() == [] and "Balances moved" in webhook.sent[0]["content"]
+    assert [p for p in pings if p >= healed]
+
+
+def test_a_digest_the_webhook_cannot_deliver_stops_the_pings_until_it_goes_out(tmp_path):
+    watch, store, webhook, clock, pings = _mute(tmp_path, 404)
+    started = clock.now
+    _minutes(watch, clock, 30)
+    assert pings and max(pings) < started + cw.DELIVERY_GRACE
+    webhook.healed = True
+    healed = clock.now
+    _minutes(watch, clock, 3)
+    assert store.get("digest:last-day") == "1970-01-12" and [p for p in pings if p >= healed]
+
+
+def test_a_page_held_back_by_its_group_does_not_stop_the_pings(tmp_path):
+    watch, store, webhook, clock, pings = _mute(tmp_path, None)
+    webhook.healed = True
+    store.put("digest:last-day", "1970-01-12")
+    store.add(rules.Finding(rules.ALERT, "materios:1:transfer", "first", group="transfers"), clock.now)
+    watch.cycle()
+    clock.now += 60
+    store.add(rules.Finding(rules.ALERT, "materios:2:transfer", "second", group="transfers"), clock.now)
+    _minutes(watch, clock, 8)
+    assert len(webhook.sent) == 1 and len(pings) == 9
 
 
 def test_the_dead_man_ping_url_is_read_from_its_file_and_must_be_http(tmp_path):

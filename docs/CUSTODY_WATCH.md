@@ -181,8 +181,12 @@ A mainnet config refuses to load, naming everything still missing, until it has:
 `deadman_ping_file` names a file holding the ping URL of a dead-man check
 (Healthchecks or anything that takes a GET on a URL). After every cycle in which
 no source is stale the watcher pings it, at most once a minute, so the check pages
-on its own rail when the watcher stops, hangs, loses its host or goes blind. Give
-the check a period of one minute and a grace of a few minutes.
+on its own rail when the watcher stops, hangs, loses its host or goes blind. A page,
+or a due digest, that Discord has not taken for five minutes also stops the pings
+until it goes out, so a webhook someone deleted or revoked, which leaves the watcher
+reading but unable to page, pages through the check too. A group's findings held for
+its next summary do not count. Give the check a period of one minute and a grace of
+a few minutes.
 A failed ping is logged and tried again the next cycle. Like the webhook, the URL
 is a credential: it lives on the host, never in the config or this repository.
 
@@ -427,7 +431,8 @@ message through the webhook to prove delivery end to end.
 - **Its own death is visible.** The daily digest is also the liveness signal, and it
   names every stale source instead of reporting the watcher alive. With a
   `deadman_ping_file` the watcher also pings a dead-man check after every cycle in
-  which no source is stale, which pages from elsewhere when the pings stop. A source that has
+  which no source is stale and nothing has waited five minutes for Discord, which
+  pages from elsewhere when the pings stop. A source that has
   not been read up to its head for `source_stale_seconds` is paged CRITICAL, again
   every hour it stays that way, and once more (ALERT) when it recovers. That covers a
   source whose reads fail and one read without error that stays behind, as when its

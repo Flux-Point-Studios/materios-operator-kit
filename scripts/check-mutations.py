@@ -359,6 +359,10 @@ MAINNET_MUTANTS = [
     ('unread-balances-unpaged', 'daemon/custody_watch.py', '        if unread:\n            findings.append', '        if False:\n            findings.append'),
     ('deadman-pinged-while-stale', 'daemon/custody_watch.py', 'if self._ping is None or stale or', 'if self._ping is None or'),
     ('deadman-pinged-every-cycle', 'daemon/custody_watch.py', ' or now - self._pinged < DEADMAN_INTERVAL:', ':'),
+    ('deadman-pinged-while-pages-wait', 'daemon/custody_watch.py', 'waiting = [f.found_at for f in self._store.unsent_pages(held_since=now - GROUP_WINDOW)]', 'waiting = []'),
+    ('deadman-counts-held-group-pages', 'daemon/custody_watch.py', 'self._store.unsent_pages(held_since=now - GROUP_WINDOW)]', 'self._store.unsent_pages()]'),
+    ('deadman-pinged-while-digest-waits', 'daemon/custody_watch.py', '        if self._digest_due(now):\n            due = ', '        if False:\n            due = '),
+    ('digest-wait-counted-before-start', 'daemon/custody_watch.py', 'waiting.append(max(due.timestamp(), self._started))', 'waiting.append(due.timestamp())'),
 ]
 SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS), (CHECKPOINT_TESTS, CHECKPOINT_MUTANTS),
           (EVIDENCE_TESTS, EVIDENCE_MUTANTS), (MAINNET_TESTS, MAINNET_MUTANTS)]
