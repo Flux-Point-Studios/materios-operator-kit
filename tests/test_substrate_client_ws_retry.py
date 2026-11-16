@@ -311,6 +311,17 @@ def test_reconnect_failures_use_exponential_backoff_with_30s_cap():
     assert client._write.consecutive_reconnect_failures == 0
 
 
+def test_a_reconnect_cycle_sleeps_between_its_attempts_and_never_after_the_last():
+    """A sleep after the last failed dial delays only the caller, who gets no SI
+    either way."""
+    client = _make_client()
+    client._reconnect_max_attempts = 3
+    with patch.object(client, "_create_substrate_interface", side_effect=OSError("down")):
+        client._reconnect(client._write, sc_module.contextlib.nullcontext())
+    assert [c.args[0] for c in client._backoff_sleep.call_args_list] == [1, 2]
+    assert client._write.si is None
+
+
 def test_reconnect_failure_gauge_surfaces_streak():
     """During an ongoing reconnect-failure streak, the gauge should reflect
     the current streak length so /ready / /metrics can show the operator

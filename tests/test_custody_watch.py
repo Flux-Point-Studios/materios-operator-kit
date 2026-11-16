@@ -674,7 +674,7 @@ def test_a_digest_that_fails_to_post_is_retried(config, tmp_path):
     assert "daily digest" in posts.text()
 
 
-def test_a_failing_source_raises_one_stale_alert_then_one_recovery(config, tmp_path):
+def test_a_failing_source_raises_one_blind_and_one_stale_page_then_one_recovery(config, tmp_path):
     store = cw.Store(str(tmp_path / "state.db"))
     posts = Posts()
     clock = [_at("2026-09-27T01:00:00")]
@@ -683,20 +683,21 @@ def test_a_failing_source_raises_one_stale_alert_then_one_recovery(config, tmp_p
     watch.cycle()
     clock[0] += config.source_stale_seconds - 60
     watch.cycle()
-    assert posts.payloads == []
+    [blind] = posts.payloads
+    assert "custody-watch blind on cardano-mainnet" in blind["content"]
 
     for _ in range(3):
         clock[0] += 120
         watch.cycle()
-    assert len(posts.payloads) == 1
-    assert "cardano-mainnet" in posts.text() and "stale" in posts.text()
-    assert "unreachable" in posts.text()
+    assert len(posts.payloads) == 2
+    assert "cardano-mainnet stale" in posts.payloads[1]["content"]
+    assert "unreachable" in posts.payloads[1]["content"]
 
     source.fail = False
     clock[0] += 120
     watch.cycle()
-    assert len(posts.payloads) == 2
-    assert "recovered" in posts.payloads[1]["content"]
+    assert len(posts.payloads) == 3
+    assert "recovered" in posts.payloads[2]["content"]
 
 
 def test_a_source_that_stays_stale_is_paged_critical_every_hour(config, tmp_path):
@@ -710,12 +711,15 @@ def test_a_source_that_stays_stale_is_paged_critical_every_hour(config, tmp_path
     for _ in range(5):
         clock[0] += 600
         watch.cycle()
-    assert len(posts.payloads) == 1
+
+    def stale():
+        return [p for p in posts.payloads if "stale for" in p["content"]]
+    assert len(stale()) == 1
     clock[0] += 3600
     watch.cycle()
-    assert len(posts.payloads) == 2
+    assert len(stale()) == 2
     assert all(p["content"].startswith("\U0001f6a8 **CRITICAL** @here") for p in posts.payloads)
-    assert "materios-preprod stale for 12" in posts.payloads[1]["content"]
+    assert "materios-preprod stale for 12" in stale()[1]["content"]
 
 
 def test_a_source_read_without_error_that_never_reaches_its_head_is_paged_stale_then_recovered(config, tmp_path):

@@ -463,13 +463,30 @@ def test_the_dead_man_is_pinged_after_a_cycle_at_most_once_a_minute(tmp_path):
 
 def test_the_dead_man_is_not_pinged_while_a_source_is_stale(tmp_path):
     pings = []
-    watch, clock = _watch(tmp_path, [StubSource("a", fail=True)], pings)
+    watch, clock = _watch(tmp_path, [StubSource("a", behind=True)], pings)
     watch.cycle()
     clock.now += 2 * 900
     watch.cycle()
     clock.now += 120
     watch.cycle()
     assert pings == [1_000_000.0]
+
+
+def test_the_dead_man_is_not_pinged_while_a_source_is_failing(tmp_path):
+    pings = []
+    source = StubSource("a")
+    watch, clock = _watch(tmp_path, [source], pings)
+    watch.cycle()
+    source.fail = True
+    for _ in range(10):
+        clock.now += 60
+        watch.cycle()
+    assert pings == [1_000_000.0]
+
+    source.fail = False
+    clock.now += 60
+    watch.cycle()
+    assert pings == [1_000_000.0, clock.now]
 
 
 def test_a_failed_ping_is_retried_on_the_next_cycle(tmp_path):

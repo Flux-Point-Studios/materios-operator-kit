@@ -571,7 +571,10 @@ class _WsConn:
 
 
 class SubstrateClient:
-    def __init__(self, config: DaemonConfig):
+    def __init__(self, config: DaemonConfig, reconnect_attempts: Optional[int] = None):
+        """``reconnect_attempts`` overrides MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS: a
+        caller that must not wait out a backoff inside a call passes 1, one dial
+        per call and no sleep."""
         self.config = config
         # Two independent websocket connections (task #500): `write` signs and
         # submits, `read` carries reads. `self.substrate` aliases the write
@@ -602,7 +605,7 @@ class SubstrateClient:
         # backoff loop forever. After the cap is hit the wrapper bails
         # with the latest constructor error; the next user-call kicks
         # off a fresh cycle.
-        self._reconnect_max_attempts: int = _read_int_env(
+        self._reconnect_max_attempts: int = reconnect_attempts or _read_int_env(
             "MATERIOS_RPC_RECONNECT_MAX_ATTEMPTS", 8
         )
         # Seconds between keepalive RPCs on the write conn, which idles between
@@ -979,7 +982,8 @@ class SubstrateClient:
         ``attempt_lock`` and each backoff sleep outside it.
 
         Exponential backoff between failed reconnects: 1, 2, 4, 8, 16, 30
-        (capped), with the streak carried across cycles. An attempt that finds
+        (capped), with the streak carried across cycles, and no sleep after
+        the last. An attempt that finds
         the conn already holding an SI ends the cycle. After
         ``self._reconnect_max_attempts`` failures we return without a working
         SI on that conn: the next call on the write conn starts a fresh cycle
@@ -1003,11 +1007,12 @@ class SubstrateClient:
                     # Backoff: 1, 2, 4, 8, 16, then 30s cap.
                     # ``2 ** (n-1)`` for n=1..5 = 1, 2, 4, 8, 16; clamped at 30.
                     delay = min(30, 1 << (conn.consecutive_reconnect_failures - 1))
+                    last = attempt + 1 >= self._reconnect_max_attempts
                     logger.warning(
                         f"force-replace[{conn.name}]: SubstrateInterface ctor failed "
                         f"(attempt {attempt + 1}/{self._reconnect_max_attempts}, "
                         f"streak={conn.consecutive_reconnect_failures}): "
-                        f"{type(e).__name__}: {e}; sleeping {delay}s"
+                        f"{type(e).__name__}: {e}" + ("" if last else f"; sleeping {delay}s")
                     )
                 else:
                     conn.si = new_si
@@ -1025,6 +1030,8 @@ class SubstrateClient:
                         f"(chain={getattr(new_si, 'chain', '?')})"
                     )
                     return
+            if last:
+                break
             self._backoff_sleep(delay)
             attempt += 1
         # Bailed without a working SI. The next user-call enters _call and

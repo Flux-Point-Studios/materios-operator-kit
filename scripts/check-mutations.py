@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run targeted safety mutants in isolated copies of the test suite: slash
 signing, the attest path's recovery from dead RPC sockets, the checkpoint
-flush schedule, the evidence submitter's handling of pallet refusals, and what
-the mainnet profile changes in the daemon and the custody watcher. Each suite
+flush schedule, the evidence submitter's handling of pallet refusals, what
+the mainnet profile changes in the daemon and the custody watcher, and the
+watcher's reconnects, blind pages and dead-man while a source fails. Each suite
 runs only its own tests, and first proves they pass unmutated in that same
 layout."""
 from concurrent.futures import ThreadPoolExecutor
@@ -254,7 +255,7 @@ TRANSPORT_MUTANTS = [
     ('reopen-dials-a-client-never-connected', 'daemon/substrate_client.py', 'if self._dialled and (', 'if ('),
     ('reopen-blocks-the-read', 'daemon/substrate_client.py', 'self._read_reopen.start()', 'self._read_reopen.run()'),
     ('give-up-promises-a-retry', 'daemon/substrate_client.py', '"reads run on the write conn until a background reopen succeeds"', '"Next user-call will retry."'),
-    ('reopen-sleeps-under-the-lock', 'daemon/substrate_client.py', '                    return\n            self._backoff_sleep(delay)\n', '                    return\n                self._backoff_sleep(delay)\n'),
+    ('reopen-sleeps-under-the-lock', 'daemon/substrate_client.py', '                    return\n            if last:\n                break\n            self._backoff_sleep(delay)\n', '                    return\n                if not last:\n                    self._backoff_sleep(delay)\n            if last:\n                break\n'),
     ('reopen-dials-unlocked', 'daemon/substrate_client.py', 'args=(conn, conn.replace_lock),', 'args=(conn, contextlib.nullcontext()),'),
     ('reconnect-overwrites-a-live-conn', 'daemon/substrate_client.py', '                if conn.si is not None:\n                    return\n', ''),
     ('bond-without-the-lock', 'daemon/cert_daemon.py', '                async with self._chain_write_lock:\n                    success, tx_hash = await asyncio.to_thread(self.client.submit_bond, delta)\n', '                if True:\n                    success, tx_hash = await asyncio.to_thread(self.client.submit_bond, delta)\n'),
@@ -364,8 +365,24 @@ MAINNET_MUTANTS = [
     ('deadman-pinged-while-digest-waits', 'daemon/custody_watch.py', '        if self._digest_due(now):\n            due = ', '        if False:\n            due = '),
     ('digest-wait-counted-before-start', 'daemon/custody_watch.py', 'waiting.append(max(due.timestamp(), self._started))', 'waiting.append(due.timestamp())'),
 ]
+BLIND_TESTS = ['tests/test_custody_watch_reconnect.py', 'tests/test_custody_mainnet.py',
+               'tests/test_substrate_client_ws_retry.py']
+BLIND_MUTANTS = [
+    ('reconnect-sleeps-after-last-attempt', 'daemon/substrate_client.py', '            if last:\n                break\n            self._backoff_sleep(delay)', '            self._backoff_sleep(delay)\n            if last:\n                break'),
+    ('custody-client-backs-off-in-poll', 'daemon/custody_watch.py', ', reconnect_attempts=1)', ')'),
+    ('blind-never-paged', 'daemon/custody_watch.py', 'if now - since < self._config.source_blind_seconds:', 'if True:'),
+    ('blind-at-the-stale-threshold', 'daemon/custody_watch.py', 'if now - since < self._config.source_blind_seconds:', 'if now - since < self._config.source_stale_seconds:'),
+    ('failure-run-restarts-each-poll', 'daemon/custody_watch.py', 'since, failures = self._failing.get(source.name, (now, 0))', 'since, failures = now, self._failing.get(source.name, (now, 0))[1]'),
+    ('success-leaves-the-source-failing', 'daemon/custody_watch.py', '        self._failing.pop(source.name, None)\n', ''),
+    ('deadman-pinged-while-failing', 'daemon/custody_watch.py', 'stale or self._failing or now', 'stale or now'),
+    ('failing-source-polled-every-interval', 'daemon/custody_watch.py', 'retry = min(source.poll_seconds * 2.0 ** failures, max(source.poll_seconds, RETRY_CAP))', 'retry = source.poll_seconds'),
+    ('failing-source-retry-uncapped', 'daemon/custody_watch.py', 'max(source.poll_seconds, RETRY_CAP))', 'math.inf)'),
+    ('blind-recovery-unpaged', 'daemon/custody_watch.py', 'store.get(f"health:{name}:stale-since"), store.get(f"health:{name}:blind-since")', 'store.get(f"health:{name}:stale-since"),'),
+    ('blind-threshold-unchecked', 'daemon/custody_rules.py', 'if blind_seconds <= 0:', 'if False:'),
+    ('blind-threshold-not-read', 'daemon/custody_rules.py', 'source_blind_seconds=blind_seconds,', ''),
+]
 SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS), (CHECKPOINT_TESTS, CHECKPOINT_MUTANTS),
-          (EVIDENCE_TESTS, EVIDENCE_MUTANTS), (MAINNET_TESTS, MAINNET_MUTANTS)]
+          (EVIDENCE_TESTS, EVIDENCE_MUTANTS), (MAINNET_TESTS, MAINNET_MUTANTS), (BLIND_TESTS, BLIND_MUTANTS)]
 
 
 def in_copy(tests, filename=None, before=None, after=None):

@@ -180,7 +180,7 @@ A mainnet config refuses to load, naming everything still missing, until it has:
 
 `deadman_ping_file` names a file holding the ping URL of a dead-man check
 (Healthchecks or anything that takes a GET on a URL). After every cycle in which
-no source is stale the watcher pings it, at most once a minute, so the check pages
+no source is stale or failing the watcher pings it, at most once a minute, so the check pages
 on its own rail when the watcher stops, hangs, loses its host or goes blind. A page,
 or a due digest, that Discord has not taken for five minutes also stops the pings
 until it goes out, so a webhook someone deleted or revoked, which leaves the watcher
@@ -295,6 +295,7 @@ The configuration lives on the host that runs the watcher, never in this reposit
   "state_db": "/var/lib/custody-watch/state.db",
   "digest_hour_utc": 13,
   "source_stale_seconds": 900,
+  "source_blind_seconds": 60,
   "discord_webhook_file": "discord-webhook",
   "materios": {"name": "materios-preprod", "rpc_url": "ws://<node>:9945", "poll_seconds": 6},
   "cardano": [
@@ -431,8 +432,14 @@ message through the webhook to prove delivery end to end.
 - **Its own death is visible.** The daily digest is also the liveness signal, and it
   names every stale source instead of reporting the watcher alive. With a
   `deadman_ping_file` the watcher also pings a dead-man check after every cycle in
-  which no source is stale and nothing has waited five minutes for Discord, which
-  pages from elsewhere when the pings stop. A source that has
+  which no source is stale or failing and nothing has waited five minutes for Discord,
+  which pages from elsewhere when the pings stop. A source whose polls have failed for
+  `source_blind_seconds` (default 60) is paged CRITICAL at once, "custody-watch blind
+  on <source> since <time>", and ALERT when it recovers. A failing source is polled
+  again after its poll interval, doubling on each failure up to a minute; the Materios
+  client dials once per call, so a dead websocket is dropped and dialled again on the
+  next poll and no poll sleeps through a reconnect backoff while the other sources
+  wait. A source that has
   not been read up to its head for `source_stale_seconds` is paged CRITICAL, again
   every hour it stays that way, and once more (ALERT) when it recovers. That covers a
   source whose reads fail and one read without error that stays behind, as when its

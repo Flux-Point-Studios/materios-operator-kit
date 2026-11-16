@@ -272,6 +272,9 @@ GROUPED_INTERVAL = 5 * PAGE_INTERVAL
 MAX_GROUP_MESSAGES = 3
 # The dead-man check is pinged at most this often; its grace period must be longer.
 DEADMAN_INTERVAL = 60.0
+# A failing source is polled again after its poll interval, doubling on each failure up
+# to this, so a node that is down is dialled once a minute rather than every poll.
+RETRY_CAP = 60.0
 # A page, or a due digest, that Discord has not taken for this long stops the dead-man
 # pings: a deleted or revoked webhook leaves the watcher reading but unable to page.
 # It outlasts the pager's doubling hold after a failure (MAX_HOLD) and a burst's queue
@@ -411,6 +414,8 @@ class Watch:
         self._decimals = {n.name: n.pool.cmatra_decimals for n in config.cardano if n.pool}
         self._ping = ping
         self._pinged = -math.inf
+        # Each failing source's (first failure of the run, failures in a row).
+        self._failing: dict[str, tuple[float, int]] = {}
 
     def cycle(self) -> None:
         """Poll each source that is due, paging what it found and pinging the systemd
@@ -425,16 +430,17 @@ class Watch:
             self._notify("WATCHDOG=1")
         now = self._clock()
         stale = self._check_stale(now)
+        self._check_blind(now)
         self._digest(now)
         self._flush(now)
         self._deadman(now, stale)
 
     def _deadman(self, now: float, stale: bool) -> None:
-        """Ping the dead-man check after a cycle in which no source is stale and nothing
-        has waited DELIVERY_GRACE for Discord, so it pages from elsewhere once the watcher
-        stops, hangs, goes blind or cannot page. A failed ping is retried next cycle; the
-        check's own grace period covers the gap."""
-        if self._ping is None or stale or now - self._pinged < DEADMAN_INTERVAL:
+        """Ping the dead-man check after a cycle in which no source is stale or failing
+        and nothing has waited DELIVERY_GRACE for Discord, so it pages from elsewhere once
+        the watcher stops, hangs, goes blind or cannot page. A failed ping is retried next
+        cycle; the check's own grace period covers the gap."""
+        if self._ping is None or stale or self._failing or now - self._pinged < DEADMAN_INTERVAL:
             return
         waiting = [f.found_at for f in self._store.unsent_pages(held_since=now - GROUP_WINDOW)]
         if self._digest_due(now):
@@ -462,11 +468,15 @@ class Watch:
     def _poll(self, source, now: float) -> None:
         try:
             caught_up = source.poll(now)
-        except Exception as e:  # one unreadable source must not blind the others; staleness pages it
+        except Exception as e:  # one unreadable source must not blind the others; _check_blind pages it
             logger.exception("%s: poll failed", source.name)
             self._store.put(f"health:{source.name}:error", f"{type(e).__name__}: {e}"[:300])
-            self._due[source.name] = now + source.poll_seconds
+            since, failures = self._failing.get(source.name, (now, 0))
+            self._failing[source.name] = (since, failures + 1)
+            retry = min(source.poll_seconds * 2.0 ** failures, max(source.poll_seconds, RETRY_CAP))
+            self._due[source.name] = now + retry
             return
+        self._failing.pop(source.name, None)
         self._due[source.name] = now if not caught_up else now + source.poll_seconds
         if caught_up:
             self._healthy(source, now)
@@ -483,13 +493,16 @@ class Watch:
             store.put(f"health:{name}:ok", repr(now))
             store.put(f"health:{name}:position", source.position)
             store.delete(f"health:{name}:error")
-            since = store.get(f"health:{name}:stale-since")
-            if since is not None:
+            marks = [int(v) for v in (store.get(f"health:{name}:stale-since"), store.get(f"health:{name}:blind-since"))
+                     if v is not None]
+            if marks:
+                since = min(marks)
                 store.add(rules.Finding(
                     rules.ALERT, f"custody-watch:{name}:recovered:{since}",
                     f"custody-watch: {name} recovered, watching again at {source.position}",
-                    details=(f"unreadable since {_utc(float(since))}",), kind="watcher"), now)
+                    details=(f"unreadable since {_utc(since)}",), kind="watcher"), now)
                 store.delete(f"health:{name}:stale-since")
+                store.delete(f"health:{name}:blind-since")
 
     def _check_stale(self, now: float) -> bool:
         """Page a source that has not been read up to its head for ``source_stale_seconds``,
@@ -512,6 +525,24 @@ class Watch:
                     details=(f"last caught up {_utc(last_ok)}", f"last error: {error}"), kind="watcher"), now)
                 store.put(f"health:{name}:stale-since", str(int(last_ok)))
         return stale
+
+    def _check_blind(self, now: float) -> None:
+        """Page a source whose polls have failed for ``source_blind_seconds``, once for
+        each run of failures."""
+        store = self._store
+        for source in self._sources:
+            name = source.name
+            since = self._failing.get(name, (now, 0))[0]
+            if now - since < self._config.source_blind_seconds:
+                continue
+            ok = store.get(f"health:{name}:ok")
+            with store.transaction():
+                store.add(rules.Finding(
+                    rules.CRITICAL, f"custody-watch:{name}:blind:{int(since)}",
+                    f"custody-watch blind on {name} since {_utc(since)}; moves on it are not being watched",
+                    details=(f"last error: {store.get(f'health:{name}:error')}",
+                             f"last caught up {_utc(float(ok))}" if ok else "never caught up"), kind="watcher"), now)
+                store.put(f"health:{name}:blind-since", str(int(since)))
 
     def _digest(self, now: float) -> None:
         if not self._digest_due(now) or not self._pager.ready("digest", now):
@@ -1504,7 +1535,9 @@ def sd_notify(message: str) -> None:
 def build_sources(config: rules.WatchConfig, store: Store, materios_rpc: str | None = None) -> list:
     sources: list = []
     if config.materios:
-        client = SubstrateClient(DaemonConfig(rpc_url=materios_rpc or config.materios.rpc_url))
+        # One dial per call: a reconnect backoff slept inside a poll would hold back the
+        # other sources and the blind check; the next poll dials again.
+        client = SubstrateClient(DaemonConfig(rpc_url=materios_rpc or config.materios.rpc_url), reconnect_attempts=1)
         sources.append(MateriosSource(config.materios, client, store, config.source_stale_seconds))
     for network in config.cardano:
         api = Insight(network.insight_url, network.insight_key_file)

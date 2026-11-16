@@ -180,8 +180,10 @@ class WatchConfig:
     # through DISCORD_WEBHOOK_URL.
     discord_webhook_file: str | None = None
     # A file holding the dead-man check's ping URL, pinged after each cycle in which
-    # no source is stale, so a watcher that stops pages from somewhere else.
+    # no source is stale or failing, so a watcher that stops pages from somewhere else.
     deadman_ping_file: str | None = None
+    # A source whose polls have failed for this long pages CRITICAL: it is blind.
+    source_blind_seconds: int = 60
 
 
 ADDRESS_ROLES = ("custody", "contract")
@@ -205,6 +207,9 @@ def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
         raise ValueError(f"materios.network {network!r} is not one of {', '.join(NETWORKS)}")
     if network == "mainnet":
         _check_mainnet(doc)
+    blind_seconds = int(doc.get("source_blind_seconds", 60))
+    if blind_seconds <= 0:
+        raise ValueError(f"source_blind_seconds {blind_seconds} is not a positive number of seconds")
     return WatchConfig(
         state_db=doc["state_db"],
         digest_hour_utc=int(doc.get("digest_hour_utc", 13)),
@@ -222,6 +227,7 @@ def parse_config(doc: dict, base_dir: Path | None = None) -> WatchConfig:
         cardano=tuple(_parse_network(n, base_dir) for n in doc.get("cardano", [])),
         discord_webhook_file=_relative(webhook_file, base_dir) if webhook_file else None,
         deadman_ping_file=_relative(deadman_file, base_dir) if deadman_file else None,
+        source_blind_seconds=blind_seconds,
     )
 
 
