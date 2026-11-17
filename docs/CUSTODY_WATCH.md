@@ -192,9 +192,9 @@ its next summary do not count.
 
 Give the check a period of one minute and a grace of at least three minutes, and
 longer than the largest `poll_seconds` in the config plus 60 seconds. One failed poll
-stops the pings until the source's next poll, a poll interval later (a minute at
-most for a source polled more often than that), and the pings are a minute apart: a
-shorter grace pages on a single failed read of the slowest source.
+stops the pings until the source's next poll, a poll interval later, and the pings
+are a minute apart: a shorter grace pages on a single failed read of the slowest
+source.
 A failed ping is logged and tried again the next cycle. Like the webhook, the URL
 is a credential: it lives on the host, never in the config or this repository.
 
