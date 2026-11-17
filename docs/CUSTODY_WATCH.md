@@ -180,13 +180,21 @@ A mainnet config refuses to load, naming everything still missing, until it has:
 
 `deadman_ping_file` names a file holding the ping URL of a dead-man check
 (Healthchecks or anything that takes a GET on a URL). After every cycle in which
-no source is stale or failing the watcher pings it, at most once a minute, so the check pages
-on its own rail when the watcher stops, hangs, loses its host or goes blind. A page,
+no source is stale and none has failed a poll since it was last read to its head, the
+watcher pings it, at most once a minute, so the check pages on its own rail when the
+watcher stops, hangs, loses its host or goes blind. A source that fails and reads by
+turns without catching up, and a node that is resyncing below the block the watcher
+has reached, stop the pings like one that fails every poll. A page,
 or a due digest, that Discord has not taken for five minutes also stops the pings
 until it goes out, so a webhook someone deleted or revoked, which leaves the watcher
 reading but unable to page, pages through the check too. A group's findings held for
-its next summary do not count. Give the check a period of one minute and a grace of
-a few minutes.
+its next summary do not count.
+
+Give the check a period of one minute and a grace of at least three minutes, and
+longer than the largest `poll_seconds` in the config plus 60 seconds. One failed poll
+stops the pings until the source's next poll, a poll interval later (a minute at
+most for a source polled more often than that), and the pings are a minute apart: a
+shorter grace pages on a single failed read of the slowest source.
 A failed ping is logged and tried again the next cycle. Like the webhook, the URL
 is a credential: it lives on the host, never in the config or this repository.
 
@@ -432,14 +440,37 @@ message through the webhook to prove delivery end to end.
 - **Its own death is visible.** The daily digest is also the liveness signal, and it
   names every stale source instead of reporting the watcher alive. With a
   `deadman_ping_file` the watcher also pings a dead-man check after every cycle in
-  which no source is stale or failing and nothing has waited five minutes for Discord,
-  which pages from elsewhere when the pings stop. A source whose polls have failed for
-  `source_blind_seconds` (default 60) is paged CRITICAL at once, "custody-watch blind
-  on <source> since <time>", and ALERT when it recovers. A failing source is polled
-  again after its poll interval, doubling on each failure up to a minute; the Materios
-  client dials once per call, so a dead websocket is dropped and dialled again on the
-  next poll and no poll sleeps through a reconnect backoff while the other sources
-  wait. A source that has
+  which no source is stale, none has failed a poll since it was last read to its head
+  and nothing has waited five minutes for Discord, which pages from elsewhere when the
+  pings stop.
+- **A blind source is paged within about a minute.** A source is blind when it has
+  not been read to its head for `source_blind_seconds` (default 60) and at least two
+  of its polls have failed since: CRITICAL, "custody-watch blind on <source> since
+  <time>", once for each time it was last read, and ALERT when it recovers. The time
+  it was last read and the count of failed polls are kept in the state file, so a
+  watcher that restarts while its source is down pages all the same; a source never
+  read to its head is measured from its first failed poll. One failed poll never
+  pages. A source polled less often than `source_blind_seconds` cannot fail twice
+  within it, so it is blind once it has not been read for its own `poll_seconds` and
+  two polls failed, and the watcher says so in its log when it starts. A source that
+  fails and reads by turns is blind too if it never catches up. One that does reach
+  its head between failures is not blind: once at least half its polls of the last ten
+  minutes have failed, at least two of them and the first a blind threshold ago, it
+  raises one ALERT, "<source> failed N of its M polls in the last 10 min", and no
+  other for an hour. A Materios node whose finalized head is more than five blocks
+  below the block the watcher has reached is resyncing: its polls count as failed.
+- **A dead or silent node never stops the loop.** A failing source is polled again
+  after its poll interval, doubling on each failure up to a minute. The Materios
+  client dials once per call, so a dead websocket is dropped and dialled again on a
+  later poll, and no poll sleeps through a reconnect backoff while the other sources
+  wait. A dial ends at the RPC budget (`MATERIOS_RPC_TIMEOUT_SECS`, 30 s): the TCP and
+  TLS handshakes, the websocket upgrade and the first read each time out there. A
+  socket that is replaced is shut down without a closing handshake, which a silent
+  node never answers. So a node that keeps its connections and answers nothing costs a
+  poll at most a call's budget and a dial's, and the other sources, the blind page and
+  the dead-man go on. While the read connection is down its reads run on the write
+  connection, and one background thread dials it again with a backoff of up to 30 s.
+- **A source that stays behind is paged.** A source that has
   not been read up to its head for `source_stale_seconds` is paged CRITICAL, again
   every hour it stays that way, and once more (ALERT) when it recovers. That covers a
   source whose reads fail and one read without error that stays behind, as when its

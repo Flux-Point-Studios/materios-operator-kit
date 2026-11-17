@@ -182,7 +182,8 @@ class WatchConfig:
     # A file holding the dead-man check's ping URL, pinged after each cycle in which
     # no source is stale or failing, so a watcher that stops pages from somewhere else.
     deadman_ping_file: str | None = None
-    # A source whose polls have failed for this long pages CRITICAL: it is blind.
+    # A source not read to its head for this long, two or more of its polls having
+    # failed since, pages CRITICAL: it is blind.
     source_blind_seconds: int = 60
 
 

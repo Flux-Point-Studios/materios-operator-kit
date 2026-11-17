@@ -5,6 +5,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import os
 import ssl
 import threading
@@ -55,6 +56,8 @@ BLOCK_ZERO_PLACEHOLDER = b"\x45" * 32
 # (websocket-client skips the shutdown once it has marked the socket closed),
 # so a waiting call cannot count on that worker leaving.
 REPLACED_CHECK_SECS = 0.05
+# The fewest seconds between two log lines saying that the read conn is down.
+READ_DOWN_LOG_SECS = 300.0
 
 
 class ChainIdRefused(Exception):
@@ -238,7 +241,9 @@ TRANSPORT_DEAD_ERRORS = (
     ConnectionAbortedError,
     WebSocketConnectionClosedException,
     WebSocketTimeoutException,
-    ssl.SSLEOFError,
+    # An EOF, a bad record or any other TLS failure: the stream cannot carry
+    # another frame.
+    ssl.SSLError,
 )
 # A call whose socket another call closed under it fails with EBADF (plain or
 # TLS alike), or ENOTSOCK once the descriptor is reused; a socket no longer
@@ -484,6 +489,25 @@ def _extract_voucher_fields_for_digest(row: dict) -> dict:
     }
 
 
+def _reconnect_delay(failures: int) -> int:
+    """Seconds to wait after the ``failures``-th failed dial in a row: 1, 2, 4,
+    8, 16, then 30."""
+    return min(30, 1 << min(max(failures - 1, 0), 5))
+
+
+def _drop_socket(si: SubstrateInterface) -> None:
+    """Shut ``si``'s socket down without a closing handshake. ``abort`` wakes a
+    call still reading it, and fails on a socket its peer has already reset;
+    ``shutdown`` frees the descriptor either way. websocket-client's ``close()``
+    instead waits for the peer's close frame behind the read lock, which a call
+    abandoned on a silent socket holds for as long as the peer stays silent."""
+    websocket = si.websocket
+    try:
+        websocket.abort()
+    finally:
+        websocket.shutdown()
+
+
 class _FifoLock:
     """A lock granted in arrival order: a release hands it to the longest
     waiter. A caller that releases and asks again at once queues behind the
@@ -621,8 +645,8 @@ class SubstrateClient:
         # ``threading.Thread`` per call is the cheapest correct option:
         # Python threads cost ~8KB each, and the wedged-thread count
         # is bounded by the timeout frequency × the OS's open-fd cap
-        # (i.e. it's self-limiting in practice — the OS reaps the
-        # underlying socket when ``close()`` is called on the SI).
+        # (i.e. it's self-limiting in practice: force-replace shuts the
+        # socket down, which wakes the thread wedged on it).
         #
         # Guards ``self.substrate`` replacement during reconnect. RPC
         # calls take this in shared mode (the bookkeeping is read-then-
@@ -636,6 +660,8 @@ class SubstrateClient:
         self._dialled = False
         # The background reopen of a read conn left without an SI, once started.
         self._read_reopen: Optional[threading.Thread] = None
+        # When the read conn was last logged as down, on the monotonic clock.
+        self._read_down_logged = -math.inf
         # Blocks this signer's attest must trail a receipt's submission while
         # the chain lists it as a backup signer; None until read from the chain.
         self._backup_delay: Optional[int] = None
@@ -675,14 +701,23 @@ class SubstrateClient:
         """Single chokepoint for SubstrateInterface construction.
 
         Tests patch this method to inject fakes / failure modes without
-        dialling a real websocket. Production behavior matches the prior
-        inlined construction (``strict_scale_decode=False`` is required so
-        the daemon stays forgiving of optional / additive SCALE schema
-        fields across chain spec versions).
+        dialling a real websocket. ``strict_scale_decode=False`` is required
+        so the daemon stays forgiving of optional / additive SCALE schema
+        fields across chain spec versions.
+
+        The RPC budget is the socket's timeout while it dials: the TCP and TLS
+        handshakes, the websocket upgrade and the chain-name read the
+        constructor makes each end there, so a node that accepts a connection
+        and answers nothing cannot hold the dialling thread. It is lifted once
+        the node has answered, since a call's own budget bounds every read
+        after that.
         """
-        return SubstrateInterface(
-            url=self.config.rpc_url, config={"strict_scale_decode": False}
+        si = SubstrateInterface(
+            url=self.config.rpc_url, config={"strict_scale_decode": False},
+            ws_options={"timeout": self._rpc_timeout_secs},
         )
+        si.websocket.settimeout(None)
+        return si
 
     @property
     def connected(self) -> bool:
@@ -735,6 +770,8 @@ class SubstrateClient:
             self._dialled = False
         if not hasattr(self, "_read_reopen"):
             self._read_reopen = None
+        if not hasattr(self, "_read_down_logged"):
+            self._read_down_logged = -math.inf
         if not hasattr(self, "_backup_delay"):
             self._backup_delay = None
 
@@ -772,8 +809,8 @@ class SubstrateClient:
         call at a time runs on each SI. The worker holds the SI's lock until
         it leaves the socket. When the call wedges, the wrapper raises
         ``RPCTimeoutError`` and abandons the worker, which keeps the lock: no
-        other call goes onto that socket until the worker exits, when the OS
-        reaps the socket (``close()`` in force-replace) or at process exit.
+        other call goes onto that socket until the worker exits, when
+        force-replace shuts the socket down or at process exit.
         A call waiting for the lock that sees its SI replaced runs once more
         on the replacement, as after a dead socket.
         """
@@ -795,20 +832,25 @@ class SubstrateClient:
         """The conn a call on ``conn`` runs on, its SI, and that SI's call
         lock. A write conn whose last replace gave up is reconnected here.
         A read conn without an SI sends the read to the write conn at once
-        and, once this client has dialled it, starts a background reopen:
-        nothing else reopens it while the write conn stays healthy (#70)."""
+        and, once this client has dialled it, starts a background reopen
+        unless one is running: nothing else reopens it while the write conn
+        stays healthy (#70). The reopen sleeps its backoff after every failed
+        dial, so reads on the write conn start one at most that often."""
         with self._reconnect_lock:
             if conn is self._read and conn.si is None:
                 if self._dialled and (self._read_reopen is None or not self._read_reopen.is_alive()):
-                    logger.error(
-                        "the read conn is down: reads run on the write conn, behind its submits, "
-                        "until a background reopen succeeds"
-                    )
+                    now = time.monotonic()
+                    if now - self._read_down_logged >= READ_DOWN_LOG_SECS:
+                        self._read_down_logged = now
+                        logger.error(
+                            "the read conn is down: reads run on the write conn, behind its submits, "
+                            "until a background reopen succeeds"
+                        )
                     # The reopen holds the replace lock only while it dials: a
                     # read that failed on the conn's old socket takes that lock,
                     # and must not wait out the backoff behind it.
                     self._read_reopen = threading.Thread(
-                        target=self._reconnect, args=(conn, conn.replace_lock),
+                        target=self._reconnect, args=(conn, conn.replace_lock), kwargs={"in_call": False},
                         name="substrate-read-reopen", daemon=True,
                     )
                     self._read_reopen.start()
@@ -879,8 +921,8 @@ class SubstrateClient:
         worker.join(timeout=max(0.0, deadline - time.monotonic()))
         if worker.is_alive():
             # Thread still running past the budget — abandon it and report
-            # timeout. The thread will die when the OS reaps the socket fd
-            # (close() in force-replace) or at process exit.
+            # timeout. The thread leaves when force-replace shuts the socket
+            # down, or at process exit.
             self._on_rpc_timeout(conn, si, method_name)
             raise RPCTimeoutError(
                 f"RPC {method_name!r} exceeded {self._rpc_timeout_secs:.1f}s "
@@ -951,46 +993,49 @@ class SubstrateClient:
                 self._force_replace(conn)
 
     def _force_replace(self, conn: "_WsConn") -> None:
-        """Close a conn's websocket and construct a new one, in isolation,
+        """Drop a conn's socket and construct a new one, in isolation,
         under the conn's replace lock, which the caller holds.
 
         The conn's timeout streak is reset on the way out so the next RPC
         starts clean. The *other* conn is never touched.
         """
         old_si = conn.si
-        # Emptied before the close, so a call that the close wakes, or that is
+        # Emptied before the drop, so a call that the drop wakes, or that is
         # waiting for the old SI's lock, finds it replaced and never runs on it.
         conn.si = None
-        # Best-effort close on the dead WS. Failures here are ignored —
-        # the underlying socket is already in an unknown state.
         if old_si is not None:
             try:
-                old_si.close()
+                _drop_socket(old_si)
             except Exception as e:  # noqa: BLE001
                 logger.info(
-                    f"force-replace[{conn.name}]: old SI close() raised "
+                    f"force-replace[{conn.name}]: dropping the old socket raised "
                     f"{type(e).__name__}: {e}; continuing"
                 )
         # Reset the timeout streak whether or not the reconnect succeeds —
         # we don't want a still-wedged WS to keep stacking force-replace
         # attempts in a single call.
         conn.consecutive_timeouts = 0
-        self._reconnect(conn, contextlib.nullcontext())
+        self._reconnect(conn, contextlib.nullcontext(), in_call=True)
 
-    def _reconnect(self, conn: "_WsConn", attempt_lock: contextlib.AbstractContextManager) -> None:
+    def _reconnect(
+        self, conn: "_WsConn", attempt_lock: contextlib.AbstractContextManager, *, in_call: bool
+    ) -> None:
         """Dial ``conn`` until it holds an SI, each attempt under
         ``attempt_lock`` and each backoff sleep outside it.
 
-        Exponential backoff between failed reconnects: 1, 2, 4, 8, 16, 30
-        (capped), with the streak carried across cycles, and no sleep after
-        the last. An attempt that finds
-        the conn already holding an SI ends the cycle. After
-        ``self._reconnect_max_attempts`` failures we return without a working
+        Exponential backoff after a failed dial: 1, 2, 4, 8, 16, 30 (capped),
+        with the streak carried across cycles. An attempt that finds the conn
+        already holding an SI ends the cycle. After
+        ``self._reconnect_max_attempts`` failures we give up without a working
         SI on that conn: the next call on the write conn starts a fresh cycle
         first, and the next read starts one for the read conn in the background.
+        A cycle that runs ``in_call`` returns at once from its last failed
+        dial, since a sleep there would only delay a caller that gets no SI
+        either way. The background reopen sleeps after that one too: nothing
+        waits for it, and the read that starts the next cycle would otherwise
+        dial at once.
         """
-        attempt = 0
-        while attempt < self._reconnect_max_attempts:
+        for attempt in range(1, self._reconnect_max_attempts + 1):
             with attempt_lock:
                 if conn.si is not None:
                     return
@@ -1004,15 +1049,13 @@ class SubstrateClient:
                         )
                     except Exception:
                         pass
-                    # Backoff: 1, 2, 4, 8, 16, then 30s cap.
-                    # ``2 ** (n-1)`` for n=1..5 = 1, 2, 4, 8, 16; clamped at 30.
-                    delay = min(30, 1 << (conn.consecutive_reconnect_failures - 1))
-                    last = attempt + 1 >= self._reconnect_max_attempts
+                    delay = _reconnect_delay(conn.consecutive_reconnect_failures)
+                    sleeps = not in_call or attempt < self._reconnect_max_attempts
                     logger.warning(
                         f"force-replace[{conn.name}]: SubstrateInterface ctor failed "
-                        f"(attempt {attempt + 1}/{self._reconnect_max_attempts}, "
+                        f"(attempt {attempt}/{self._reconnect_max_attempts}, "
                         f"streak={conn.consecutive_reconnect_failures}): "
-                        f"{type(e).__name__}: {e}" + ("" if last else f"; sleeping {delay}s")
+                        f"{type(e).__name__}: {e}" + (f"; sleeping {delay}s" if sleeps else "")
                     )
                 else:
                     conn.si = new_si
@@ -1030,10 +1073,8 @@ class SubstrateClient:
                         f"(chain={getattr(new_si, 'chain', '?')})"
                     )
                     return
-            if last:
-                break
-            self._backoff_sleep(delay)
-            attempt += 1
+            if attempt < self._reconnect_max_attempts:
+                self._backoff_sleep(delay)
         # Bailed without a working SI. The next user-call enters _call and
         # finds this conn's si is None: a read degrades to the write conn and
         # starts a background reopen, a write runs a fresh reconnect cycle first.
@@ -1052,6 +1093,8 @@ class SubstrateClient:
             f"force-replace[{conn.name}]: gave up after {self._reconnect_max_attempts} attempts; "
             f"{next_step} (streak={conn.consecutive_reconnect_failures})"
         )
+        if not in_call:
+            self._backoff_sleep(_reconnect_delay(conn.consecutive_reconnect_failures))
 
     def rpc(self, method: str, params: list) -> Any:
         """A raw JSON-RPC read on the read conn, under the bounded timeout."""

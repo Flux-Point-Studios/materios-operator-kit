@@ -35,6 +35,7 @@ TRANSPORT_FAILURES = [
     ConnectionAbortedError(103, "Software caused connection abort"),
     WebSocketConnectionClosedException("Connection is closed"),
     ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+    ssl.SSLError(1, "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed or bad record mac"),
     OSError(errno.EPIPE, "Broken pipe"),
     OSError(errno.ECONNRESET, "Connection reset by peer"),
     # A send or recv on a socket another call closed (plain or TLS alike).
@@ -121,6 +122,22 @@ def test_a_dead_read_socket_replaces_the_read_conn_only():
     assert client._write.si is write and write.calls == [] and not write.closed
     client.rpc("system_health", [])
     assert fresh.calls == ["system_health", "system_health"]
+
+
+def test_a_socket_its_peer_already_reset_is_still_freed():
+    """Shutting down a socket the peer has reset fails with ENOTCONN; its
+    descriptor is closed all the same."""
+    client, endpoint = connected_client()
+    read = endpoint.opened[1]
+    read.failure = ConnectionResetError(104, "Connection reset by peer")
+
+    def abort():
+        raise OSError(errno.ENOTCONN, "Transport endpoint is not connected")
+
+    read.websocket.abort = abort
+
+    assert client.rpc("system_health", []) == {"peers": 3, "isSyncing": False}
+    assert client._read.si is endpoint.opened[2] and not read.websocket.connected
 
 
 def test_calls_on_a_socket_that_dies_run_one_at_a_time_and_replace_it_once():

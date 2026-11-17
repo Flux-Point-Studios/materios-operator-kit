@@ -5,18 +5,22 @@ broke (BrokenPipeError on every poll from 18:01:48Z) and the watcher never diall
 again: it was blind for 53 minutes, through a runtime upgrade, and the dead-man had no
 way to tell. A dead socket must be dropped and dialled again on a later poll, a poll
 must never sleep through a reconnect backoff (the other sources wait behind it), a
-source failing for ``source_blind_seconds`` pages CRITICAL by name, and the dead-man
-is not pinged while any source is failing.
+source not read to its head for ``source_blind_seconds`` pages CRITICAL by name, and
+the dead-man is not pinged while any source is failing. The read conn's background
+reopen keeps its backoff: one thread, one dial per backoff step, however many reads
+the write conn serves meanwhile.
 """
 import dataclasses
-from types import SimpleNamespace
+import ssl
+import threading
 
 import pytest
 from websocket import WebSocketConnectionClosedException
 
 from daemon import custody_watch as cw
-from tests.fake_chain import kernel_timeout
+from tests.fake_chain import FakeWebSocket, kernel_timeout
 from tests.test_custody_watch import FakeChain, Posts, StubSource, _at, _watch, config  # noqa: F401
+from tests.test_read_conn_reopens import ReopenBackoff
 
 HEAD = 1829300
 DEAD_SOCKET_ERRORS = {
@@ -24,6 +28,7 @@ DEAD_SOCKET_ERRORS = {
     "reset": lambda: ConnectionResetError(104, "Connection reset by peer"),
     "closed": lambda: WebSocketConnectionClosedException("socket is already closed."),
     "kernel-timeout": kernel_timeout,
+    "tls-bad-record": lambda: ssl.SSLError(1, "[SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed"),
 }
 
 
@@ -34,17 +39,17 @@ class ChainSocket:
     def __init__(self, ledger: FakeChain):
         self.ledger = ledger
         self.chain = "Materios Preprod v6"
-        self.websocket = SimpleNamespace(connected=True)
+        self.websocket = FakeWebSocket()
         self.failure: BaseException | None = None
-        self.closed = False
 
     def rpc_request(self, method, params):
         if self.failure is not None:
             raise self.failure
         return {"jsonrpc": "2.0", "id": 1, "result": self.ledger.rpc(method, params)}
 
-    def close(self):
-        self.closed = True
+    @property
+    def closed(self):
+        return self.websocket.dropped
 
 
 def _endpoint(ledger: FakeChain):
@@ -60,19 +65,20 @@ def _endpoint(ledger: FakeChain):
     return dial
 
 
-def _production_source(config, tmp_path):
+def _production_source(config, tmp_path, reopen_sleeps=2.0):
     """The Materios source and the client ``build_sources`` gives it, dialling a fake
-    endpoint, with every backoff sleep recorded instead of slept."""
+    endpoint. Its backoff records each sleep asked for inside a call instead of
+    sleeping it; the background reopen's sleeps last ``reopen_sleeps`` seconds or
+    until the backoff's ``wake`` is set."""
     store = cw.Store(str(tmp_path / "state.db"))
     [source] = cw.build_sources(dataclasses.replace(config, cardano=()), store, materios_rpc="ws://test-rpc:9945")
     ledger = FakeChain(head=HEAD, blocks={}, state_at={HEAD})
     endpoint = _endpoint(ledger)
     client = source._client
     client._create_substrate_interface = endpoint
-    sleeps = []
-    client._backoff_sleep = sleeps.append
+    backoff = client._backoff_sleep = ReopenBackoff(reopen_sleeps)
     assert client.connect()
-    return source, endpoint, sleeps, store
+    return source, endpoint, backoff, store
 
 
 def _store_past_the_digest(tmp_path):
@@ -89,7 +95,7 @@ def _kill(endpoint, error):
 
 @pytest.mark.parametrize("error", DEAD_SOCKET_ERRORS.values(), ids=DEAD_SOCKET_ERRORS.keys())
 def test_a_dead_socket_is_dialled_again_and_the_next_poll_reads_the_chain(config, tmp_path, error):
-    source, endpoint, sleeps, store = _production_source(config, tmp_path)
+    source, endpoint, backoff, store = _production_source(config, tmp_path)
     assert source.poll(1.0)
     _kill(endpoint, error())
     endpoint.up = False
@@ -101,27 +107,65 @@ def test_a_dead_socket_is_dialled_again_and_the_next_poll_reads_the_chain(config
     assert store.get("cursor:materios-preprod") == str(HEAD)
     write, read = endpoint.opened[:2]
     assert write.closed and read.closed
-    assert sleeps == []
+    assert backoff.in_calls == []
 
 
 def test_a_socket_that_dies_between_polls_is_replaced_within_the_poll(config, tmp_path):
-    source, endpoint, sleeps, _ = _production_source(config, tmp_path)
+    source, endpoint, _, _ = _production_source(config, tmp_path)
     _kill(endpoint, BrokenPipeError(32, "Broken pipe"))
     assert source.poll(1.0)
     assert len(endpoint.opened) > 2 and endpoint.opened[1].closed
 
 
 def test_a_poll_dials_each_conn_at_most_once_and_never_sleeps_through_a_backoff(config, tmp_path):
-    source, endpoint, sleeps, _ = _production_source(config, tmp_path)
+    source, endpoint, backoff, _ = _production_source(config, tmp_path)
     _kill(endpoint, BrokenPipeError(32, "Broken pipe"))
     endpoint.up = False
     before = endpoint.dials
     for now in (1.0, 7.0, 13.0):
         with pytest.raises(Exception):
             source.poll(now)
+    backoff.wake.set()
     source._client._read_reopen.join(5)
-    assert sleeps == []
+    assert backoff.in_calls == []
     assert endpoint.dials - before <= 3 * 2
+
+
+def test_a_catch_up_poll_served_by_the_write_conn_starts_one_reopen_that_dials_once(
+        config, tmp_path, caplog, monkeypatch):
+    """The read conn is down, the write conn is not, and the node takes no new socket
+    (at its connection limit). A poll 300 blocks behind makes 311 reads on the write
+    conn. A reopen that ended after its one dial would be started again by each of
+    them: 311 dials on as many threads, and three log lines apiece."""
+    source, endpoint, backoff, store = _production_source(config, tmp_path, reopen_sleeps=120)
+    assert source.poll(1.0)
+    write, read = endpoint.opened[:2]
+    read.failure = BrokenPipeError(32, "Broken pipe")
+    endpoint.up = False
+    with pytest.raises(BrokenPipeError):
+        source.poll(7.0)
+    write.ledger.head = HEAD + 300
+    write.ledger.state_at = set(range(HEAD, HEAD + 301))
+    reopens, start = [], threading.Thread.start
+
+    def counted_start(thread):
+        if thread.name == "substrate-read-reopen":
+            reopens.append(thread)
+        start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", counted_start)
+    dials = endpoint.dials
+    caplog.clear()
+    try:
+        assert source.poll(13.0)
+        assert backoff.asleep.wait(5), "the reopen never reached its backoff"
+    finally:
+        backoff.wake.set()
+
+    assert store.get("cursor:materios-preprod") == str(HEAD + 300)
+    assert len(reopens) == 1 and endpoint.dials - dials == 1
+    assert caplog.text.count("the read conn is down") == 1
+    assert len([r for r in caplog.records if r.name == "daemon.substrate_client"]) <= 3
 
 
 def test_a_failing_source_is_retried_on_a_doubling_delay_capped_at_a_minute(config, tmp_path):
@@ -149,6 +193,13 @@ def test_a_failing_source_is_retried_on_a_doubling_delay_capped_at_a_minute(conf
         watch.cycle()
         assert source.polls == before + 1
 
+    source.fail = True
+    for _ in range(2):
+        before = source.polls
+        clock[0] += 6
+        watch.cycle()
+        assert source.polls == before + 1, "the delay of an earlier run of failures was carried into this one"
+
 
 def test_a_source_failing_past_the_blind_threshold_pages_critical_once_then_its_recovery(config, tmp_path):
     store = _store_past_the_digest(tmp_path)
@@ -161,7 +212,7 @@ def test_a_source_failing_past_the_blind_threshold_pages_critical_once_then_its_
     source.fail = True
     clock[0] = _at("2026-11-16T18:01:48")
     watch.cycle()
-    while clock[0] < _at("2026-11-16T18:01:48") + config.source_blind_seconds - 1:
+    while clock[0] < _at("2026-11-16T18:01:42") + config.source_blind_seconds - 1:
         clock[0] += 1
         watch.cycle()
     assert posts.payloads == []
@@ -171,16 +222,16 @@ def test_a_source_failing_past_the_blind_threshold_pages_critical_once_then_its_
         watch.cycle()
     [page] = posts.payloads
     assert page["content"].startswith("\U0001f6a8 **CRITICAL** @here")
-    assert "custody-watch blind on materios-preprod since 2026-11-16 18:01:48Z" in page["content"]
+    assert "custody-watch blind on materios-preprod since 2026-11-16 18:01:42Z" in page["content"]
     assert "unreachable" in page["content"]
-    assert "last caught up 2026-11-16 18:01:42Z" in page["content"]
+    assert "4 polls failed since it was last read to its head" in page["content"]
 
     source.fail = False
     clock[0] += 60
     watch.cycle()
     assert len(posts.payloads) == 2
     assert "materios-preprod recovered" in posts.payloads[1]["content"]
-    assert "unreadable since 2026-11-16 18:01:48Z" in posts.payloads[1]["content"]
+    assert "unreadable since 2026-11-16 18:01:42Z" in posts.payloads[1]["content"]
 
 
 def test_a_failure_shorter_than_the_blind_threshold_pages_nothing(config, tmp_path):

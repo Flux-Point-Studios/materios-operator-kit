@@ -27,19 +27,23 @@ SLEEP_CAP = 2.0
 
 class ReopenBackoff:
     """A ``_backoff_sleep`` that returns at once except on the background
-    reopen's thread, where each sleep waits for ``wake``, at most SLEEP_CAP.
-    ``asleep`` is set while the reopen sleeps, and ``slept`` counts the sleeps
-    it has finished."""
+    reopen's thread, where each sleep waits for ``wake``, at most ``cap``.
+    ``asleep`` is set while the reopen sleeps, ``slept`` counts the sleeps
+    it has finished, and ``in_calls`` holds each delay a call was asked to
+    sleep on its own thread."""
 
-    def __init__(self):
+    def __init__(self, cap: float = SLEEP_CAP):
         self.asleep, self.wake = threading.Event(), threading.Event()
+        self.cap = cap
         self.slept = 0
+        self.in_calls: list[float] = []
 
-    def __call__(self, _delay):
+    def __call__(self, delay):
         if threading.current_thread().name != "substrate-read-reopen":
+            self.in_calls.append(delay)
             return
         self.asleep.set()
-        self.wake.wait(SLEEP_CAP)
+        self.wake.wait(self.cap)
         self.asleep.clear()
         self.slept += 1
 
@@ -211,6 +215,53 @@ def test_the_reopen_never_dials_alongside_another_replace_of_the_read_conn():
     assert dialled == ["poll-read"] and not overlap.is_set()
     assert answers == [HEALTH] and client._read.si is endpoint.opened[-1]
     assert client._read.si.calls == ["system_health"]
+
+
+def test_reads_served_by_the_write_conn_start_one_reopen_that_sleeps_after_every_failed_dial(caplog, monkeypatch):
+    """A client told to dial once per call (custody-watch) still backs off in the
+    background. A reopen that ended after its one dial without a sleep would be
+    started again by each of the reads below: 300 threads, dials and log lines."""
+    client, write, endpoint = read_conn_left_empty("replace")
+    client._reconnect_max_attempts = 1
+    backoff = client._backoff_sleep = ReopenBackoff(cap=120)
+    dials, reopens, start = [], [], threading.Thread.start
+
+    def dial():
+        dials.append(threading.current_thread().name)
+        return endpoint()
+
+    def counted_start(thread):
+        if thread.name == "substrate-read-reopen":
+            reopens.append(thread)
+        start(thread)
+
+    client._create_substrate_interface = dial
+    monkeypatch.setattr(threading.Thread, "start", counted_start)
+    caplog.clear()
+    try:
+        for _ in range(300):
+            assert client.rpc("system_health", []) == HEALTH
+        assert backoff.asleep.wait(5), "the reopen never reached its backoff"
+    finally:
+        backoff.wake.set()
+
+    assert dials == ["substrate-read-reopen"] and len(reopens) == 1
+    assert caplog.text.count("the read conn is down") == 1
+    assert "sleeping" in caplog.text, "the reopen's failed dial says it backs off"
+
+
+def test_the_degraded_mode_is_logged_once_a_while_however_many_reopens_end(caplog, monkeypatch):
+    client, _, _ = read_conn_left_empty("replace")
+    caplog.clear()
+    for _ in range(20):
+        assert client.rpc("system_health", []) == HEALTH
+        settled(client)
+    assert caplog.text.count("the read conn is down") == 1
+
+    monkeypatch.setattr(substrate_client, "READ_DOWN_LOG_SECS", 0.0)
+    assert client.rpc("system_health", []) == HEALTH
+    settled(client)
+    assert caplog.text.count("the read conn is down") == 2
 
 
 def test_a_client_that_never_connected_dials_nothing():
