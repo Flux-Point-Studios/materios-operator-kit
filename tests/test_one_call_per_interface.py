@@ -87,13 +87,12 @@ def test_concurrent_reads_on_one_interface_each_get_their_own_reply():
 
 def wedge(si, method):
     """``si`` holds a call to ``method`` until the returned event is set or
-    ``si`` is closed; every other call it answers at once. Closing ``si``
-    wakes the held call and then lingers before returning, as
-    websocket-client's ``close()`` does: the woken reader takes the peer's
-    close frame, which ``close()`` then waits up to 3 s for."""
+    ``si``'s socket is dropped; every other call it answers at once. The
+    abort that wakes the held call lingers before it returns, so the woken
+    call leaves the socket while the conn is still being replaced."""
     leave = threading.Event()
     entered = threading.Event()
-    answer, close = si.rpc_request, si.close
+    answer, abort = si.rpc_request, si.websocket.abort
 
     def rpc_request(name, params):
         if name != method:
@@ -103,13 +102,13 @@ def wedge(si, method):
         leave.wait(10)
         return {"jsonrpc": "2.0", "id": 1, "result": "late"}
 
-    def close_and_linger():
-        close()
+    def abort_and_linger():
+        abort()
         leave.set()
         time.sleep(0.2)
 
     si.rpc_request = rpc_request
-    si.close = close_and_linger
+    si.websocket.abort = abort_and_linger
     return entered, leave
 
 
@@ -133,22 +132,22 @@ def test_a_call_that_timed_out_keeps_the_next_call_off_its_socket_until_it_leave
     assert client._read.si is read and len(endpoint.opened) == 2
 
 
-@pytest.mark.parametrize("close_wakes_the_worker", [True, False], ids=["close-wakes", "close-does-not-wake"])
-def test_a_call_queued_on_a_replaced_interface_runs_on_the_replacement(close_wakes_the_worker):
+@pytest.mark.parametrize("abort_wakes_the_worker", [True, False], ids=["abort-wakes", "abort-does-not-wake"])
+def test_a_call_queued_on_a_replaced_interface_runs_on_the_replacement(abort_wakes_the_worker):
     """A wedged call times out and its socket is replaced. A call that was
     queued behind it moves to the replacement within its own budget, whether
-    or not closing the old socket woke the worker still reading it
-    (websocket-client's close skips the shutdown that wakes a reader when it
+    or not dropping the old socket woke the worker still reading it
+    (websocket-client's abort skips the shutdown that wakes a reader when it
     has already marked the socket closed). A woken worker hands the socket to
-    the queued call while the close still lingers, so the conn must already
+    the queued call while the abort still lingers, so the conn must already
     have let go of the old interface."""
     client, endpoint = connected_client()
     client._rpc_timeout_secs = 1.0
     client._reconnect_after_timeouts = 1
     read = endpoint.opened[1]
     entered, leave = wedge(read, "wedged")
-    if not close_wakes_the_worker:
-        read.close = lambda: setattr(read, "closed", True)
+    if not abort_wakes_the_worker:
+        read.websocket.abort = lambda: None
     outcome = {}
 
     def wedged():

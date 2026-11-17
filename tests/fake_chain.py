@@ -13,6 +13,7 @@ runtime without backup signers. A certification is an AvailabilityCertified
 event in the best block it happened at. Its live state is the best block's;
 ``head`` freezes that state under a block hash a read can pin.
 ``FakeSI`` is one websocket onto it, whose death the test scripts.
+``FakeWebSocket`` is the socket a replaced interface is dropped through.
 ``IncludingSI`` is one websocket onto a node that includes every submit,
 returning substrate-interface's own lazy results.
 """
@@ -71,6 +72,29 @@ def kernel_timeout() -> WebSocketTimeoutException:
     except WebSocketTimeoutException as error:
         return error
     raise AssertionError("websocket-client returned from a timed-out socket")
+
+
+class FakeWebSocket:
+    """What the client drops a replaced interface's socket through: ``abort`` wakes a
+    call reading it and ``shutdown`` frees it. ``close`` waits for the peer's close
+    frame, which a silent peer never sends, so the client must never call it."""
+
+    def __init__(self):
+        self.connected = True
+        self.aborted = False
+
+    def abort(self) -> None:
+        self.aborted = True
+
+    def shutdown(self) -> None:
+        self.connected = False
+
+    def close(self) -> None:
+        raise AssertionError("a replaced socket was closed with a handshake its peer may never answer")
+
+    @property
+    def dropped(self) -> bool:
+        return self.aborted and not self.connected
 
 
 class DecodedList(SimpleNamespace):
@@ -178,7 +202,7 @@ class FakeSI:
     def __init__(self, ledger: FakeChain, idle_limit: float | None = None):
         self.ledger = ledger
         self.chain = "Materios Fake"
-        self.websocket = SimpleNamespace(connected=True)
+        self.websocket = FakeWebSocket()
         self.failure: BaseException | None = None
         self.failing: set[str] | None = None
         self.lose_submit_response = False
@@ -186,7 +210,6 @@ class FakeSI:
         self.last_used = ledger.clock
         self.best: str | None = None
         self.calls: list[str] = []
-        self.closed = False
         self.inclusion = threading.Event()
         self.inclusion.set()
         self.holding = threading.Event()
@@ -203,8 +226,9 @@ class FakeSI:
             raise self.failure
         self.last_used = self.ledger.clock
 
-    def close(self) -> None:
-        self.closed = True
+    @property
+    def closed(self) -> bool:
+        return self.websocket.dropped
 
     def rpc_request(self, method, params):
         self._use(method)

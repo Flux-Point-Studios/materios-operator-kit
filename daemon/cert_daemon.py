@@ -1114,6 +1114,7 @@ class CertDaemon:
         keepalive = asyncio.create_task(self._keep_write_conn_alive())
 
         logger.info(f"Starting poll loop, interval={self.config.poll_interval}s")
+        connection_lost = False
 
         while self._running:
             notifications = []  # defined outside try so adaptive sleep can see it
@@ -1207,16 +1208,16 @@ class CertDaemon:
                     last_poll_timestamp=time.time(),
                     pending_receipts=len(self.pending),
                 )
+                connection_lost = False
 
             except Exception as e:
                 logger.error(f"Poll loop error: {e}", exc_info=True)
-                health_server.update_metrics(substrate_connected=False)
-                # Try to reconnect
-                try:
-                    self.client.connect()
-                    health_server.update_metrics(substrate_connected=True)
-                except Exception:
+                # connect() reports a failed dial by returning False, not by raising.
+                connected = self.client.connect()
+                health_server.update_metrics(substrate_connected=connected)
+                if not connected and not connection_lost:
                     await self.send_discord(f"Connection lost: {e}", "critical")
+                connection_lost = not connected
 
             # Adaptive polling: fast when work pending, idle when not
             has_pending = len(self.pending) > 0 or len(notifications) > 0

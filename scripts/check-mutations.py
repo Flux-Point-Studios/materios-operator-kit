@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Run targeted safety mutants in isolated copies of the test suite: slash
 signing, the attest path's recovery from dead RPC sockets, the checkpoint
-flush schedule, the evidence submitter's handling of pallet refusals, and what
-the mainnet profile changes in the daemon and the custody watcher. Each suite
+flush schedule, the evidence submitter's handling of pallet refusals, what
+the mainnet profile changes in the daemon and the custody watcher, the
+watcher's reconnects, blind pages and dead-man while a source fails, and the
+client against a node that goes silent on real sockets. Each suite
 runs only its own tests, and first proves they pass unmutated in that same
 layout."""
 from concurrent.futures import ThreadPoolExecutor
@@ -128,11 +130,11 @@ TRANSPORT_TESTS = ['tests/test_dead_write_conn.py', 'tests/test_receipt_rpc_retr
                    'tests/test_conn_routing.py', 'tests/test_lazy_results_read_inside_the_call.py',
                    'tests/test_evidence_rows_outlive_rpc_timeouts.py', 'tests/test_one_call_per_interface.py',
                    'tests/test_read_conn_reopens.py', 'tests/test_bond_takes_the_chain_write_lock.py',
-                   'tests/test_backup_signer_delay.py']
+                   'tests/test_backup_signer_delay.py', 'tests/test_poll_loop_reconnect.py']
 TRANSPORT_MUTANTS = [
     ('transport-branch-deleted', 'daemon/substrate_client.py', '                if not is_transport_dead(error):\n                    raise\n                self._replace_dead_conn', '                raise\n                self._replace_dead_conn'),
-    ('transport-set-broken-pipe-only', 'daemon/substrate_client.py', 'TRANSPORT_DEAD_ERRORS = (\n    BrokenPipeError,\n    ConnectionResetError,\n    ConnectionAbortedError,\n    WebSocketConnectionClosedException,\n    WebSocketTimeoutException,\n    ssl.SSLEOFError,\n)', 'TRANSPORT_DEAD_ERRORS = (BrokenPipeError,)'),
-    ('transport-set-websocket-only', 'daemon/substrate_client.py', 'TRANSPORT_DEAD_ERRORS = (\n    BrokenPipeError,\n    ConnectionResetError,\n    ConnectionAbortedError,\n    WebSocketConnectionClosedException,\n    WebSocketTimeoutException,\n    ssl.SSLEOFError,\n)', 'TRANSPORT_DEAD_ERRORS = (WebSocketConnectionClosedException,)'),
+    ('transport-set-broken-pipe-only', 'daemon/substrate_client.py', 'TRANSPORT_DEAD_ERRORS = (\n    BrokenPipeError,\n    ConnectionResetError,\n    ConnectionAbortedError,\n    WebSocketConnectionClosedException,\n    WebSocketTimeoutException,\n    # An EOF, a bad record or any other TLS failure: the stream cannot carry\n    # another frame.\n    ssl.SSLError,\n)', 'TRANSPORT_DEAD_ERRORS = (BrokenPipeError,)'),
+    ('transport-set-websocket-only', 'daemon/substrate_client.py', 'TRANSPORT_DEAD_ERRORS = (\n    BrokenPipeError,\n    ConnectionResetError,\n    ConnectionAbortedError,\n    WebSocketConnectionClosedException,\n    WebSocketTimeoutException,\n    # An EOF, a bad record or any other TLS failure: the stream cannot carry\n    # another frame.\n    ssl.SSLError,\n)', 'TRANSPORT_DEAD_ERRORS = (WebSocketConnectionClosedException,)'),
     ('kernel-timeout-not-transport', 'daemon/substrate_client.py', '    WebSocketConnectionClosedException,\n    WebSocketTimeoutException,\n', '    WebSocketConnectionClosedException,\n'),
     ('fd-errnos-not-transport', 'daemon/substrate_client.py', 'isinstance(e, TRANSPORT_DEAD_ERRORS) or (isinstance(e, OSError) and e.errno in TRANSPORT_DEAD_ERRNOS)', 'isinstance(e, TRANSPORT_DEAD_ERRORS)'),
     ('ebadf-not-transport', 'daemon/substrate_client.py', 'frozenset({errno.EBADF, errno.ENOTSOCK, errno.ENOTCONN})', 'frozenset({errno.ENOTSOCK, errno.ENOTCONN})'),
@@ -247,16 +249,26 @@ TRANSPORT_MUTANTS = [
     ('queued-call-blind-to-replacement', 'daemon/substrate_client.py', 'lambda: conn.si is not si)', 'lambda: False)'),
     ('queued-timeout-not-counted', 'daemon/substrate_client.py', '        if not acquired:\n            self._on_rpc_timeout(conn, si, method_name)\n', '        if not acquired:\n'),
     ('granted-past-the-budget-runs', 'daemon/substrate_client.py', '        if acquired and (conn.si is not si or time.monotonic() >= deadline):\n', '        if acquired and conn.si is not si:\n'),
-    ('replaced-after-the-close', 'daemon/substrate_client.py', '        conn.si = None\n        # Best-effort close on the dead WS. Failures here are ignored —\n        # the underlying socket is already in an unknown state.\n        if old_si is not None:\n            try:\n                old_si.close()\n            except Exception as e:  # noqa: BLE001\n                logger.info(\n                    f"force-replace[{conn.name}]: old SI close() raised "\n                    f"{type(e).__name__}: {e}; continuing"\n                )\n', '        # Best-effort close on the dead WS. Failures here are ignored —\n        # the underlying socket is already in an unknown state.\n        if old_si is not None:\n            try:\n                old_si.close()\n            except Exception as e:  # noqa: BLE001\n                logger.info(\n                    f"force-replace[{conn.name}]: old SI close() raised "\n                    f"{type(e).__name__}: {e}; continuing"\n                )\n        conn.si = None\n'),
+    ('replaced-after-the-drop', 'daemon/substrate_client.py', '        conn.si = None\n        if old_si is not None:\n            try:\n                _drop_socket(old_si)\n            except Exception as e:  # noqa: BLE001\n                logger.info(\n                    f"force-replace[{conn.name}]: dropping the old socket raised "\n                    f"{type(e).__name__}: {e}; continuing"\n                )\n', '        if old_si is not None:\n            try:\n                _drop_socket(old_si)\n            except Exception as e:  # noqa: BLE001\n                logger.info(\n                    f"force-replace[{conn.name}]: dropping the old socket raised "\n                    f"{type(e).__name__}: {e}; continuing"\n                )\n        conn.si = None\n'),
     ('join-gets-a-fresh-budget', 'daemon/substrate_client.py', 'worker.join(timeout=max(0.0, deadline - time.monotonic()))', 'worker.join(timeout=self._rpc_timeout_secs)'),
     ('unstarted-worker-keeps-the-lock', 'daemon/substrate_client.py', '        try:\n            worker.start()\n        except BaseException:\n            lock.release()\n            raise\n', '        worker.start()\n'),
     ('reopen-disabled', 'daemon/substrate_client.py', 'if self._dialled and (', 'if False and ('),
     ('reopen-dials-a-client-never-connected', 'daemon/substrate_client.py', 'if self._dialled and (', 'if ('),
     ('reopen-blocks-the-read', 'daemon/substrate_client.py', 'self._read_reopen.start()', 'self._read_reopen.run()'),
     ('give-up-promises-a-retry', 'daemon/substrate_client.py', '"reads run on the write conn until a background reopen succeeds"', '"Next user-call will retry."'),
-    ('reopen-sleeps-under-the-lock', 'daemon/substrate_client.py', '                    return\n            self._backoff_sleep(delay)\n', '                    return\n                self._backoff_sleep(delay)\n'),
+    ('reopen-sleeps-under-the-lock', 'daemon/substrate_client.py', '                    return\n            if attempt < self._reconnect_max_attempts:\n                self._backoff_sleep(delay)\n', '                    return\n                if attempt < self._reconnect_max_attempts:\n                    self._backoff_sleep(delay)\n'),
     ('reopen-dials-unlocked', 'daemon/substrate_client.py', 'args=(conn, conn.replace_lock),', 'args=(conn, contextlib.nullcontext()),'),
     ('reconnect-overwrites-a-live-conn', 'daemon/substrate_client.py', '                if conn.si is not None:\n                    return\n', ''),
+    ('tls-failure-not-transport', 'daemon/substrate_client.py', '    ssl.SSLError,\n', '    ssl.SSLEOFError,\n'),
+    ('replaced-socket-not-freed', 'daemon/substrate_client.py', '    finally:\n        websocket.shutdown()\n', '    finally:\n        pass\n'),
+    ('reset-socket-not-freed', 'daemon/substrate_client.py', '    try:\n        websocket.abort()\n    finally:\n        websocket.shutdown()\n', '    websocket.abort()\n    websocket.shutdown()\n'),
+    ('reconnect-sleeps-after-last-attempt', 'daemon/substrate_client.py', '            if attempt < self._reconnect_max_attempts:\n                self._backoff_sleep(delay)\n', '            self._backoff_sleep(delay)\n'),
+    ('reopen-ends-without-a-sleep', 'daemon/substrate_client.py', '        if not in_call:\n            self._backoff_sleep(_reconnect_delay(conn.consecutive_reconnect_failures))\n', ''),
+    ('last-failed-dial-says-it-sleeps', 'daemon/substrate_client.py', '(f"; sleeping {delay}s" if sleeps else "")', 'f"; sleeping {delay}s"'),
+    ('read-down-logged-at-every-reopen', 'daemon/substrate_client.py', 'if now - self._read_down_logged >= READ_DOWN_LOG_SECS:', 'if True:'),
+    ('poll-loop-ignores-a-failed-reconnect', 'daemon/cert_daemon.py', 'health_server.update_metrics(substrate_connected=connected)', 'health_server.update_metrics(substrate_connected=True)'),
+    ('connection-lost-sent-every-tick', 'daemon/cert_daemon.py', 'if not connected and not connection_lost:', 'if not connected:'),
+    ('connection-lost-sent-once-ever', 'daemon/cert_daemon.py', '                connection_lost = False\n\n            except Exception as e:', '\n            except Exception as e:'),
     ('bond-without-the-lock', 'daemon/cert_daemon.py', '                async with self._chain_write_lock:\n                    success, tx_hash = await asyncio.to_thread(self.client.submit_bond, delta)\n', '                if True:\n                    success, tx_hash = await asyncio.to_thread(self.client.submit_bond, delta)\n'),
     ('guard-blind-to-unlocked-writes', 'tests/test_conn_routing.py', '(name := reached_write(node, writes)) and not under_lock(function, locked)]', '(name := reached_write(node, writes)) and False]'),
     ('guard-lock-not-inherited', 'tests/test_conn_routing.py', '        held |= more\n', '        break\n'),
@@ -364,8 +376,48 @@ MAINNET_MUTANTS = [
     ('deadman-pinged-while-digest-waits', 'daemon/custody_watch.py', '        if self._digest_due(now):\n            due = ', '        if False:\n            due = '),
     ('digest-wait-counted-before-start', 'daemon/custody_watch.py', 'waiting.append(max(due.timestamp(), self._started))', 'waiting.append(due.timestamp())'),
 ]
+BLIND_TESTS = ['tests/test_custody_watch_reconnect.py', 'tests/test_custody_watch_flaps.py',
+               'tests/test_custody_mainnet.py']
+BLIND_MUTANTS = [
+    ('custody-client-backs-off-in-poll', 'daemon/custody_watch.py', ', reconnect_attempts=1)', ')'),
+    ('blind-never-paged', 'daemon/custody_watch.py', 'if failed < 2 or now - since < self._blind_after[name]:', 'if True:'),
+    ('blind-on-one-failed-poll', 'daemon/custody_watch.py', 'if failed < 2 or now - since', 'if failed < 1 or now - since'),
+    ('blind-at-the-stale-threshold', 'daemon/custody_watch.py', 'now - since < self._blind_after[name]:', 'now - since < self._config.source_stale_seconds:'),
+    ('blind-threshold-under-the-poll-interval', 'daemon/custody_watch.py', 's.name: max(config.source_blind_seconds, s.poll_seconds)', 's.name: config.source_blind_seconds'),
+    ('blind-clock-restarts-with-the-watcher', 'daemon/custody_watch.py', 'since = float(ok) if ok else first_failure', 'since = max(float(ok) if ok else first_failure, self._started)'),
+    ('blind-from-the-first-failure', 'daemon/custody_watch.py', 'since = float(ok) if ok else first_failure', 'since = first_failure'),
+    ('a-poll-behind-its-head-clears-the-failures', 'daemon/custody_watch.py', '        self._failures.pop(source.name, None)\n', '        self._failures.pop(source.name, None)\n        self._store.delete(f"health:{source.name}:failed")\n'),
+    ('failures-kept-at-the-head', 'daemon/custody_watch.py', '            store.delete(f"health:{name}:failed")\n', ''),
+    ('deadman-pinged-while-failing', 'daemon/custody_watch.py', '        if any(self._failed(source.name) for source in self._sources):\n            return\n', ''),
+    ('failing-source-polled-every-interval', 'daemon/custody_watch.py', 'retry = min(source.poll_seconds * 2.0 ** min(self._failures[source.name], 10),\n                        max(source.poll_seconds, RETRY_CAP))', 'retry = source.poll_seconds'),
+    ('failing-source-retry-uncapped', 'daemon/custody_watch.py', 'max(source.poll_seconds, RETRY_CAP))', 'math.inf)'),
+    ('retry-exponent-uncapped', 'daemon/custody_watch.py', '2.0 ** min(self._failures[source.name], 10)', '2.0 ** self._failures[source.name]'),
+    ('retry-delay-kept-across-runs', 'daemon/custody_watch.py', '        self._failures.pop(source.name, None)\n', ''),
+    ('blind-recovery-unpaged', 'daemon/custody_watch.py', 'store.get(f"health:{name}:stale-since"), store.get(f"health:{name}:blind-since")', 'store.get(f"health:{name}:stale-since"),'),
+    ('blind-mark-never-cleared', 'daemon/custody_watch.py', '                store.delete(f"health:{name}:blind-since")\n', ''),
+    ('recovery-names-the-later-mark', 'daemon/custody_watch.py', 'since = min(marks)', 'since = max(marks)'),
+    ('unreliable-never-raised', 'daemon/custody_watch.py', 'if len(errors) < 2 or 2 * len(errors) < len(polls) or now - errors[0][0] < self._blind_after[name]:', 'if True:'),
+    ('unreliable-on-one-failed-poll', 'daemon/custody_watch.py', 'if len(errors) < 2 or', 'if len(errors) < 1 or'),
+    ('unreliable-under-half', 'daemon/custody_watch.py', 'or 2 * len(errors) < len(polls) or', 'or'),
+    ('unreliable-in-its-first-seconds', 'daemon/custody_watch.py', ' or now - errors[0][0] < self._blind_after[name]:', ':'),
+    ('unreliable-on-top-of-blind', 'daemon/custody_watch.py', '            if store.get(f"health:{name}:blind-since") or store.get(f"health:{name}:stale-since"):\n                continue\n', ''),
+    ('unreliable-every-ten-minutes', 'daemon/custody_watch.py', 'if now - float(store.get(f"health:{name}:unreliable-at") or 0) < HOUR:', 'if now - float(store.get(f"health:{name}:unreliable-at") or 0) < UNRELIABLE_WINDOW:'),
+    ('paged-outage-counted-as-unreliable', 'daemon/custody_watch.py', '                self._polls[name].clear()\n', ''),
+    ('resyncing-node-reads-as-caught-up', 'daemon/custody_watch.py', 'if cursor is not None and int(cursor) - head > HEAD_SLACK_BLOCKS:', 'if False:'),
+    ('a-head-just-behind-the-cursor-fails', 'daemon/custody_watch.py', 'int(cursor) - head > HEAD_SLACK_BLOCKS:', 'int(cursor) - head > 0:'),
+    ('blind-threshold-unchecked', 'daemon/custody_rules.py', 'if blind_seconds <= 0:', 'if False:'),
+    ('blind-threshold-not-read', 'daemon/custody_rules.py', 'source_blind_seconds=blind_seconds,', ''),
+]
+SILENT_TESTS = ['tests/test_silent_node.py']
+SILENT_MUTANTS = [
+    ('dial-unbounded', 'daemon/substrate_client.py', '            ws_options={"timeout": self._rpc_timeout_secs},\n', ''),
+    ('dial-timeout-kept-on-the-socket', 'daemon/substrate_client.py', '        si.websocket.settimeout(None)\n', ''),
+    ('replaced-socket-closed-with-a-handshake', 'daemon/substrate_client.py', '                _drop_socket(old_si)\n', '                old_si.close()\n'),
+    ('abandoned-call-never-woken', 'daemon/substrate_client.py', '    try:\n        websocket.abort()\n    finally:', '    try:\n        pass\n    finally:'),
+]
 SUITES = [(SLASH_TESTS, SLASH_MUTANTS), (TRANSPORT_TESTS, TRANSPORT_MUTANTS), (CHECKPOINT_TESTS, CHECKPOINT_MUTANTS),
-          (EVIDENCE_TESTS, EVIDENCE_MUTANTS), (MAINNET_TESTS, MAINNET_MUTANTS)]
+          (EVIDENCE_TESTS, EVIDENCE_MUTANTS), (MAINNET_TESTS, MAINNET_MUTANTS), (BLIND_TESTS, BLIND_MUTANTS),
+          (SILENT_TESTS, SILENT_MUTANTS)]
 
 
 def in_copy(tests, filename=None, before=None, after=None):

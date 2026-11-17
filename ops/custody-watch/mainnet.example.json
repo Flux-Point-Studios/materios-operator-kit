@@ -2,6 +2,7 @@
   "state_db": "/var/lib/custody-watch/state.db",
   "digest_hour_utc": 13,
   "source_stale_seconds": 900,
+  "source_blind_seconds": 60,
   "discord_webhook_file": "discord-webhook",
   "deadman_ping_file": "deadman-ping",
   "materios": {

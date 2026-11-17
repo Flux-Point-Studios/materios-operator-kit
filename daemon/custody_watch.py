@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -272,6 +272,13 @@ GROUPED_INTERVAL = 5 * PAGE_INTERVAL
 MAX_GROUP_MESSAGES = 3
 # The dead-man check is pinged at most this often; its grace period must be longer.
 DEADMAN_INTERVAL = 60.0
+# A failing source is polled again after its poll interval, doubling on each failure up
+# to this, so a node that is down is dialled once a minute rather than every poll.
+RETRY_CAP = 60.0
+# A source that reaches its head between failures is unreliable, not blind: once at
+# least half its polls of the last UNRELIABLE_WINDOW seconds have failed it raises one
+# ALERT, and no other for an hour.
+UNRELIABLE_WINDOW = 600.0
 # A page, or a due digest, that Discord has not taken for this long stops the dead-man
 # pings: a deleted or revoked webhook leaves the watcher reading but unable to page.
 # It outlasts the pager's doubling hold after a failure (MAX_HOLD) and a burst's queue
@@ -411,6 +418,20 @@ class Watch:
         self._decimals = {n.name: n.pool.cmatra_decimals for n in config.cardano if n.pool}
         self._ping = ping
         self._pinged = -math.inf
+        # Each source's failed polls in a row, which set how soon it is polled again.
+        self._failures: dict[str, int] = defaultdict(int)
+        # Each source's polls of the last UNRELIABLE_WINDOW seconds: when, and the
+        # error of one that failed.
+        self._polls: dict[str, deque[tuple[float, str | None]]] = defaultdict(deque)
+        # Two polls are never closer than a source's poll interval, so a source polled
+        # less often than source_blind_seconds is blind after its own interval.
+        self._blind_after = {s.name: max(config.source_blind_seconds, s.poll_seconds) for s in sources}
+        for source in sources:
+            if source.poll_seconds > config.source_blind_seconds:
+                logger.warning(
+                    "%s is polled every %d s, less often than source_blind_seconds %d: it is paged as blind "
+                    "once it has not been read to its head for %d s and two of its polls have failed",
+                    source.name, source.poll_seconds, config.source_blind_seconds, source.poll_seconds)
 
     def cycle(self) -> None:
         """Poll each source that is due, paging what it found and pinging the systemd
@@ -425,16 +446,21 @@ class Watch:
             self._notify("WATCHDOG=1")
         now = self._clock()
         stale = self._check_stale(now)
+        self._check_blind(now)
+        self._check_unreliable(now)
         self._digest(now)
         self._flush(now)
         self._deadman(now, stale)
 
     def _deadman(self, now: float, stale: bool) -> None:
-        """Ping the dead-man check after a cycle in which no source is stale and nothing
-        has waited DELIVERY_GRACE for Discord, so it pages from elsewhere once the watcher
-        stops, hangs, goes blind or cannot page. A failed ping is retried next cycle; the
+        """Ping the dead-man check after a cycle in which no source is stale, none has
+        failed a poll since it last reached its head, and nothing has waited
+        DELIVERY_GRACE for Discord, so it pages from elsewhere once the watcher stops,
+        hangs, goes blind or cannot page. A failed ping is retried next cycle; the
         check's own grace period covers the gap."""
         if self._ping is None or stale or now - self._pinged < DEADMAN_INTERVAL:
+            return
+        if any(self._failed(source.name) for source in self._sources):
             return
         waiting = [f.found_at for f in self._store.unsent_pages(held_since=now - GROUP_WINDOW)]
         if self._digest_due(now):
@@ -462,11 +488,22 @@ class Watch:
     def _poll(self, source, now: float) -> None:
         try:
             caught_up = source.poll(now)
-        except Exception as e:  # one unreadable source must not blind the others; staleness pages it
+        except Exception as e:  # one unreadable source must not blind the others; _check_blind pages it
             logger.exception("%s: poll failed", source.name)
-            self._store.put(f"health:{source.name}:error", f"{type(e).__name__}: {e}"[:300])
-            self._due[source.name] = now + source.poll_seconds
+            error = f"{type(e).__name__}: {e}"[:300]
+            failed, since = self._failed(source.name) or (0, now)
+            with self._store.transaction():
+                self._store.put(f"health:{source.name}:error", error)
+                self._store.put(f"health:{source.name}:failed", json.dumps([failed + 1, since]))
+            self._polls[source.name].append((now, error))
+            # The delay is capped long before the exponent is: 2.0 ** 1024 overflows.
+            retry = min(source.poll_seconds * 2.0 ** min(self._failures[source.name], 10),
+                        max(source.poll_seconds, RETRY_CAP))
+            self._failures[source.name] += 1
+            self._due[source.name] = now + retry
             return
+        self._failures.pop(source.name, None)
+        self._polls[source.name].append((now, None))
         self._due[source.name] = now if not caught_up else now + source.poll_seconds
         if caught_up:
             self._healthy(source, now)
@@ -477,19 +514,33 @@ class Watch:
             self._store.put(f"health:{source.name}:position", source.position)
             self._store.put(f"health:{source.name}:error", f"behind its head at {source.position}")
 
+    def _failed(self, name: str) -> tuple[int, float] | None:
+        """How many of a source's polls have failed since it last reached its head, and
+        when the first of them did; None when none has. Kept in the store, so a restart
+        neither forgets a source that was failing nor starts its count again."""
+        failed = self._store.get(f"health:{name}:failed")
+        return tuple(json.loads(failed)) if failed else None
+
     def _healthy(self, source, now: float) -> None:
         store, name = self._store, source.name
         with store.transaction():
             store.put(f"health:{name}:ok", repr(now))
             store.put(f"health:{name}:position", source.position)
             store.delete(f"health:{name}:error")
-            since = store.get(f"health:{name}:stale-since")
-            if since is not None:
+            store.delete(f"health:{name}:failed")
+            marks = [int(v) for v in (store.get(f"health:{name}:stale-since"), store.get(f"health:{name}:blind-since"))
+                     if v is not None]
+            if marks:
+                since = min(marks)
                 store.add(rules.Finding(
                     rules.ALERT, f"custody-watch:{name}:recovered:{since}",
                     f"custody-watch: {name} recovered, watching again at {source.position}",
-                    details=(f"unreadable since {_utc(float(since))}",), kind="watcher"), now)
+                    details=(f"unreadable since {_utc(since)}",), kind="watcher"), now)
                 store.delete(f"health:{name}:stale-since")
+                store.delete(f"health:{name}:blind-since")
+                # The outage was paged and is over: its failed polls are not also a
+                # reason to call the source unreliable.
+                self._polls[name].clear()
 
     def _check_stale(self, now: float) -> bool:
         """Page a source that has not been read up to its head for ``source_stale_seconds``,
@@ -512,6 +563,56 @@ class Watch:
                     details=(f"last caught up {_utc(last_ok)}", f"last error: {error}"), kind="watcher"), now)
                 store.put(f"health:{name}:stale-since", str(int(last_ok)))
         return stale
+
+    def _check_blind(self, now: float) -> None:
+        """Page a source that has not been read to its head for ``source_blind_seconds``
+        while at least two of its polls failed, once for each time it was last read.
+        Both are measured from what the store holds, so a watcher that restarts while
+        its source is down pages all the same, and one failed poll never pages. A
+        source never read to its head is measured from its first failed poll."""
+        store = self._store
+        for source in self._sources:
+            name = source.name
+            failed, first_failure = self._failed(name) or (0, now)
+            ok = store.get(f"health:{name}:ok")
+            since = float(ok) if ok else first_failure
+            if failed < 2 or now - since < self._blind_after[name]:
+                continue
+            with store.transaction():
+                store.add(rules.Finding(
+                    rules.CRITICAL, f"custody-watch:{name}:blind:{int(since)}",
+                    f"custody-watch blind on {name} since {_utc(since)}; moves on it are not being watched",
+                    details=(f"last error: {store.get(f'health:{name}:error')}",
+                             f"{failed} polls failed since it was last read to its head" if ok
+                             else f"{failed} polls failed and it was never read to its head"),
+                    kind="watcher"), now)
+                store.put(f"health:{name}:blind-since", str(int(since)))
+
+    def _check_unreliable(self, now: float) -> None:
+        """Raise one ALERT an hour for a source at least half of whose polls in the last
+        UNRELIABLE_WINDOW seconds failed, at least two of them, the first as long ago as
+        it takes to call a source blind. A source already paged as blind or stale has
+        been reported."""
+        store = self._store
+        for source in self._sources:
+            name = source.name
+            polls = self._polls[name]
+            while polls and polls[0][0] < now - UNRELIABLE_WINDOW:
+                polls.popleft()
+            errors = [(at, error) for at, error in polls if error is not None]
+            if len(errors) < 2 or 2 * len(errors) < len(polls) or now - errors[0][0] < self._blind_after[name]:
+                continue
+            if store.get(f"health:{name}:blind-since") or store.get(f"health:{name}:stale-since"):
+                continue
+            if now - float(store.get(f"health:{name}:unreliable-at") or 0) < HOUR:
+                continue
+            with store.transaction():
+                store.add(rules.Finding(
+                    rules.ALERT, f"custody-watch:{name}:unreliable:{int(now)}",
+                    f"custody-watch: {name} failed {len(errors)} of its {len(polls)} polls in the last "
+                    f"{int(UNRELIABLE_WINDOW) // 60} min; moves on it are seen late",
+                    details=(f"last error: {errors[-1][1]}",), kind="watcher"), now)
+                store.put(f"health:{name}:unreliable-at", repr(now))
 
     def _digest(self, now: float) -> None:
         if not self._digest_due(now) or not self._pager.ready("digest", now):
@@ -606,6 +707,11 @@ SYSTEM_EVENTS_STORAGE = "0x" + (xxh128(b"System") + xxh128(b"Events")).hex()
 CODE_STORAGE = "0x" + b":code".hex()
 RECOVERY = xxh128(b"Recovery")
 MAX_BLOCKS_PER_POLL = 600
+# A finalized head this far below the cursor is another node behind the same endpoint
+# finalizing a moment later. Further below, the node is resyncing: a failed poll, not
+# one that caught up, and none of the older state it serves is compared with what the
+# watcher last read.
+HEAD_SLACK_BLOCKS = 5
 BLOCK_SECONDS = 6
 KEYS_PAGE = 1000
 
@@ -749,6 +855,10 @@ class MateriosSource:
                               f"{int(now - self._moved[1]) // 60} min")
         if self._reset(head, now):
             return True
+        cursor = self._store.get(self._cursor_key)
+        if cursor is not None and int(cursor) - head > HEAD_SLACK_BLOCKS:
+            raise SourceError(f"{self.name}: finalized head #{head} is behind the cursor #{cursor}: "
+                              f"the node is behind the chain it served before")
         sudo_key = self._sudo_key(head_hash, head, now)
         code = self._code(head_hash, head, now)
         authorities = self._authorities
@@ -760,7 +870,6 @@ class MateriosSource:
                           head, now, lambda raw: self._members(raw, code, head_hash))
         recovering = self._recovery(head_hash, head, sudo_key, authorities, code, now)
 
-        cursor = self._store.get(self._cursor_key)
         if cursor is None:
             start = self._config.start_block
             self.start_at(head if start is None else start - 1)
@@ -1504,7 +1613,9 @@ def sd_notify(message: str) -> None:
 def build_sources(config: rules.WatchConfig, store: Store, materios_rpc: str | None = None) -> list:
     sources: list = []
     if config.materios:
-        client = SubstrateClient(DaemonConfig(rpc_url=materios_rpc or config.materios.rpc_url))
+        # One dial per call: a reconnect backoff slept inside a poll would hold back the
+        # other sources and the blind check; the next poll dials again.
+        client = SubstrateClient(DaemonConfig(rpc_url=materios_rpc or config.materios.rpc_url), reconnect_attempts=1)
         sources.append(MateriosSource(config.materios, client, store, config.source_stale_seconds))
     for network in config.cardano:
         api = Insight(network.insight_url, network.insight_key_file)

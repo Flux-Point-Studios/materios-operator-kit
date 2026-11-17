@@ -52,21 +52,14 @@ class _FakeSI:
     """Simulates a SubstrateInterface for the wrapper tests.
 
     Each public method on a real ``SubstrateInterface`` is mocked here as a
-    plain attribute that the test wires up via ``set_method``. The
-    ``close()`` + ``websocket`` attributes are mimicked so the wrapper's
-    force-replace path can poke them.
+    plain attribute that the test wires up via ``set_method``. ``websocket``
+    is the socket the wrapper's force-replace path drops.
     """
 
     def __init__(self, *, chain: str = "Materios", url: str = "ws://x"):
         self.chain = chain
         self.url = url
         self.websocket = MagicMock()
-        self.close_calls = 0
-        self._closed = False
-
-    def close(self):
-        self.close_calls += 1
-        self._closed = True
 
     def set_method(self, name, fn):
         setattr(self, name, fn)
@@ -204,9 +197,11 @@ def test_consecutive_timeouts_trigger_force_replace_of_substrate_interface():
         # 2nd call: times out, hits reconnect threshold
         with pytest.raises(RPCTimeoutError):
             client._call("foo", conn=client._write)
-        # The wrapper should have closed the first SI and created a new one
+        # The wrapper should have dropped the first SI's socket, without the
+        # close handshake a wedged peer never answers, and created a new one
         # BEFORE returning from the timeout (so the next call uses the new SI).
-        assert old_fakes[0].close_calls == 1, "first SI should have been closed"
+        dropped = old_fakes[0].websocket
+        assert [call[0] for call in dropped.method_calls] == ["abort", "shutdown"]
         assert state["si_count"] == 2, "second SI should have been created"
         # Counter resets after the reconnect.
         assert client._write.consecutive_timeouts == 0
@@ -224,7 +219,7 @@ def test_single_timeout_does_not_trigger_reconnect():
         with pytest.raises(RPCTimeoutError):
             client._call("foo", conn=client._write)
         assert ctor.call_count == 0
-        assert fake.close_calls == 0
+        assert fake.websocket.method_calls == []
         with pytest.raises(RPCTimeoutError):
             client._call("foo", conn=client._write)
         assert ctor.call_count == 0
@@ -309,6 +304,30 @@ def test_reconnect_failures_use_exponential_backoff_with_30s_cap():
     )
     # After successful reconnect, the failure streak is back to 0.
     assert client._write.consecutive_reconnect_failures == 0
+
+
+def test_a_reconnect_cycle_in_a_call_sleeps_between_its_attempts_and_never_after_the_last(caplog):
+    """A sleep after the last failed dial delays only the caller, who gets no SI
+    either way, and the log line of that dial promises none."""
+    client = _make_client()
+    client._reconnect_max_attempts = 3
+    with patch.object(client, "_create_substrate_interface", side_effect=OSError("down")):
+        client._reconnect(client._write, sc_module.contextlib.nullcontext(), in_call=True)
+    assert [c.args[0] for c in client._backoff_sleep.call_args_list] == [1, 2]
+    assert client._write.si is None
+    failed = [r.getMessage() for r in caplog.records if "ctor failed" in r.getMessage()]
+    assert ["sleeping" in line for line in failed] == [True, True, False]
+    assert failed[0].endswith("OSError: down; sleeping 1s") and failed[2].endswith("OSError: down")
+
+
+def test_a_background_reconnect_cycle_sleeps_after_every_failed_attempt():
+    """Nothing waits for it, and the sleep after its last attempt is what keeps
+    the next cycle from dialling at once."""
+    client = _make_client()
+    client._reconnect_max_attempts = 3
+    with patch.object(client, "_create_substrate_interface", side_effect=OSError("down")):
+        client._reconnect(client._read, sc_module.contextlib.nullcontext(), in_call=False)
+    assert [c.args[0] for c in client._backoff_sleep.call_args_list] == [1, 2, 4]
 
 
 def test_reconnect_failure_gauge_surfaces_streak():
